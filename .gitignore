@@ -1,0 +1,14 @@
+/target/
+/.venv/
+/dist/
+/.pytest_cache/
+**/__pycache__/
+*.pyc
+*.pyd
+*.so
+*.egg-info/
+/data/
+/.env
+/.pai/
+/OPTIMIZATION_REPORT.md
+

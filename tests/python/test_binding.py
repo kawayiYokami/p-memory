@@ -1,0 +1,372 @@
+"""Python 绑定契约测试。
+
+Rust 侧 `tests/core.rs` 覆盖核心语义；这里保护的是绑定自己的契约：
+返回结构是扁平 dict（不是对象）、异常按 `code` 映射、作用域与分页在 Python 侧可用、
+以及四条存储域与导入器的端到端路径。
+"""
+import asyncio
+import sqlite3
+
+import pytest
+
+from p_memory import (
+    AsyncKnowledgeBase,
+    ClosedError,
+    ConflictError,
+    InvalidVectorError,
+    KnowledgeBase,
+    LockedError,
+    NotFoundError,
+    StaleRevisionError,
+    ValidationError,
+    import_legacy,
+)
+
+
+# ── 记忆 ──────────────────────────────────────────────────────────────
+
+def test_memory_roundtrip_is_a_flat_dict(kb):
+    """写回、取回、检索三处拿到的都是同一个扁平 dict，记录头字段已平铺。"""
+    receipt = kb.memories.upsert_by_judgment(judgment="用户偏好简短回答", tags=["偏好"])
+    memory = receipt["value"]
+
+    assert isinstance(memory, dict)
+    assert isinstance(memory["id"], int)
+    assert memory["judgment"] == "用户偏好简短回答"
+    assert memory["kind"] == "memory"
+    assert memory["memory_type"] == "knowledge"
+    assert memory["tags"] == ["偏好"]
+    # 记录头平铺：没有嵌套的 header 对象
+    for field in ("namespace", "scope", "revision", "created_at_us", "updated_at_us"):
+        assert field in memory, f"记录头字段 {field} 未平铺"
+
+    assert kb.memories.get(memory["id"]) == memory
+    assert receipt["index_ready"] is True
+    assert receipt["index_error"] is None
+
+    hits = kb.search("简短回答")["hits"]
+    assert [h["record"]["judgment"] for h in hits] == ["用户偏好简短回答"]
+    assert set(hits[0]) == {"key", "record", "score", "text_score", "vector_scores"}
+
+
+def test_upsert_by_judgment_deduplicates_within_scope(kb):
+    """同一句论断重复写入合并成一条，不产生第二行。"""
+    first = kb.memories.upsert_by_judgment(judgment="同一句论断")
+    second = kb.memories.upsert_by_judgment(judgment="同一句论断")
+
+    assert first["value"]["id"] == second["value"]["id"]
+    assert kb.health()["record_count"] == 1
+
+
+def test_scope_filter_hides_records_written_to_other_scopes(open_kb):
+    """只读 public 的句柄看不到写入 private 的记录；两个 scope 都给才读得到。"""
+    public_only = open_kb("a", scopes=("public",))
+    public_only.memories.upsert_by_judgment(judgment="公开内容")
+    public_only.memories.upsert_by_judgment(judgment="私密内容", scope="private")
+
+    assert kb_judgments(public_only) == ["公开内容"]
+    assert [m["scope"] for m in public_only.memories.list(limit=10)["items"]] == ["public"]
+
+    both = open_kb("b", scopes=("public", "private"))
+    both.memories.upsert_by_judgment(judgment="公开内容", scope="public")
+    both.memories.upsert_by_judgment(judgment="私密内容", scope="private")
+    assert sorted(kb_judgments(both)) == ["公开内容", "私密内容"]
+
+
+def test_tags_filter_is_conjunctive(kb):
+    """多标签是 AND：只带其中一个标签的记录不会被 tags=[a,b] 选中。"""
+    kb.memories.upsert_by_judgment(judgment="带两个标签", tags=["a", "b"])
+    kb.memories.upsert_by_judgment(judgment="只带一个标签", tags=["a"])
+
+    hits = kb.search("标签", filter={"tags": ["a", "b"]})["hits"]
+    assert [h["record"]["judgment"] for h in hits] == ["带两个标签"]
+
+
+def test_pagination_cursor_walks_every_record_once(kb):
+    """游标翻页走完整个集合，不重不漏且按 id 升序。"""
+    for i in range(5):
+        kb.memories.upsert_by_judgment(judgment=f"分页记录 {i}")
+
+    seen, cursor, pages = [], None, 0
+    while True:
+        page = kb.memories.list(limit=2, after=cursor)
+        seen += [m["id"] for m in page["items"]]
+        pages += 1
+        cursor = page["next_cursor"]
+        assert pages <= 10, "游标未收敛"
+        if cursor is None:
+            break
+
+    assert len(seen) == 5
+    assert seen == sorted(seen)
+    assert len(set(seen)) == 5
+
+
+# ── 图谱 ──────────────────────────────────────────────────────────────
+
+def test_graph_batch_traversal_aliases_and_components(kb):
+    """批量写入后，别名解析、一跳邻接、N 跳邻域、桥接与连通分量都可用。"""
+    batch = kb.graph.apply_batch(
+        entities=[
+            {"name": "张三", "entity_type": "person", "aliases": ["小张"], "attributes": {"城市": ["杭州"]}},
+            {"name": "李四", "entity_type": "person"},
+            {"name": "王五", "entity_type": "person"},
+        ],
+    )
+    zhang, li, wang = [e["id"] for e in batch["value"]["entities"]]
+
+    kb.graph.apply_batch(relations=[
+        {"subject_id": zhang, "predicate": "同事", "object_id": li},
+        {"subject_id": li, "predicate": "同事", "object_id": wang},
+    ])
+
+    # 别名解析回同一个实体，属性与别名都在
+    resolved = kb.graph.resolve("小张")
+    assert [e["id"] for e in resolved] == [zhang]
+    assert resolved[0]["attributes"] == {"城市": ["杭州"]}
+
+    # 一跳邻接
+    assert {e["id"] for e in kb.graph.neighbors(zhang)["entities"]} == {li}
+
+    # N 跳邻域不含起点
+    assert [e["id"] for e in kb.graph.ego(zhang, 1)] == [li]
+    assert {e["id"] for e in kb.graph.ego(zhang, 2)} == {li, wang}
+
+    # 桥接含两端
+    assert [e["id"] for e in kb.graph.path(zhang, wang)] == [zhang, li, wang]
+
+    # 单向链既是 1 个连通分量，也没有强连通环
+    assert kb.graph.component_count() == 1
+    assert kb.graph.strongly_connected() == []
+
+
+def test_deleting_a_referenced_entity_reports_conflict(kb):
+    """被关系引用的实体不能删；解除引用后可以删。"""
+    batch = kb.graph.apply_batch(entities=[{"name": "甲"}, {"name": "乙"}])
+    jia, yi = [e["id"] for e in batch["value"]["entities"]]
+    kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
+
+    with pytest.raises(ConflictError):
+        kb.graph.delete("entity", jia)
+
+    standalone = kb.graph.apply_batch(entities=[{"name": "丙"}])["value"]["entities"][0]["id"]
+    assert kb.graph.delete("entity", standalone)["value"] is True
+    with pytest.raises(NotFoundError):
+        kb.graph.get("entity", standalone)
+
+
+# ── 笔记 ──────────────────────────────────────────────────────────────
+
+def test_note_chunks_are_line_ranges_and_reuse_ids(kb):
+    """切片行号从 1 起；同一来源追加内容时复用未变切片的 id，并删掉失效切片。"""
+    first = kb.notes.upsert(source="docs/a.md", content="A段\n\nB段\n\nC段")
+    note_id = first["value"]["id"]
+    chunks = kb.notes.chunks(note_id)
+
+    assert first["value"]["chunk_count"] == len(chunks) == 3
+    assert [(c["ordinal"], c["offset"], c["limit"]) for c in chunks] == [(0, 1, 1), (1, 3, 1), (2, 5, 1)]
+    assert all(c["note_id"] == note_id for c in chunks)
+
+    second = kb.notes.upsert(source="docs/a.md", content="A段\n\nB段\n\nC段\n\nD段")
+    assert second["value"]["id"] == note_id, "同一 (namespace, scope, source) 应复用同一条笔记"
+
+    grown = kb.notes.chunks(note_id)
+    assert [c["ordinal"] for c in grown] == [0, 1, 2, 3]
+    assert [c["id"] for c in grown][:3] == [c["id"] for c in chunks], "未变切片应复用原 id"
+
+
+def test_note_rejects_out_of_range_chunk_size(kb):
+    """切片大小超范围由核心拒绝。"""
+    with pytest.raises(ValidationError):
+        kb.notes.upsert(source="docs/x.md", content="正文", chunk_chars=5)
+
+
+# ── 向量 ──────────────────────────────────────────────────────────────
+
+def test_embedding_pending_put_and_vector_search(kb):
+    """pending 给待向量化清单，put 写回后该条从 pending 消失且向量可检索。"""
+    kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 4})
+    assert kb.embeddings.spaces() == [
+        {"id": "e5", "model": "e5-base", "dimension": 4, "text_version": 1, "encoding": "sq8"}
+    ]
+
+    target = kb.memories.upsert_by_judgment(judgment="需要向量化的记忆")["value"]["id"]
+    pending = kb.embeddings.pending("e5", limit=50)
+    item = next(i for i in pending["items"] if i["key"]["id"] == target)
+    assert item["text"] and item["fingerprint"]
+
+    assert kb.embeddings.put("e5", [
+        {"key": item["key"], "fingerprint": item["fingerprint"], "values": [1.0, 0.0, 0.0, 0.0]}
+    ])["value"] == 1
+
+    assert target not in [i["key"]["id"] for i in kb.embeddings.pending("e5", limit=50)["items"]]
+
+    hits = kb.search("", vectors=[{"space_id": "e5", "values": [1.0, 0.0, 0.0, 0.0]}])["hits"]
+    assert hits[0]["key"]["id"] == target
+    assert hits[0]["vector_scores"] == {"e5": pytest.approx(1.0)}
+
+
+def test_embedding_rejects_wrong_dimension_and_stale_fingerprint(kb):
+    """维度不符与指纹过期分别映射到 invalid_vector / stale_revision，且整批不写入。"""
+    kb.embeddings.register_space({"id": "v", "model": "m", "dimension": 3})
+    kb.memories.upsert_by_judgment(judgment="待向量化的记忆")
+    item = kb.embeddings.pending("v", limit=1)["items"][0]
+
+    with pytest.raises(InvalidVectorError):
+        kb.embeddings.put("v", [{"key": item["key"], "fingerprint": item["fingerprint"], "values": [1.0, 2.0]}])
+
+    with pytest.raises(StaleRevisionError):
+        kb.embeddings.put("v", [{"key": item["key"], "fingerprint": "deadbeef", "values": [1.0, 2.0, 3.0]}])
+
+    # 两次都被拒绝，该记录仍在待向量化清单里
+    assert item["key"]["id"] in [i["key"]["id"] for i in kb.embeddings.pending("v", limit=50)["items"]]
+
+
+# ── 生命周期 ──────────────────────────────────────────────────────────
+
+def test_lifecycle_reports_candidates_without_deleting(kb):
+    """衰减只产出候选，不删数据；固定保留项不进候选，强度也不变。"""
+    ordinary = kb.memories.upsert_by_judgment(judgment="普通记忆")["value"]["id"]
+    pinned = kb.memories.upsert_by_judgment(judgment="固定保留的记忆", state={"pinned": True})["value"]["id"]
+    before = kb.health()["record_count"]
+
+    far_future = 1_900_000_000_000_000  # 微秒
+    report = kb.memories.decay(now_us=far_future)["value"]
+
+    candidates = [c["id"] for c in report["retirement_candidates"]]
+    assert ordinary in candidates
+    assert pinned not in candidates
+    assert kb.health()["record_count"] == before, "衰减不得删除记录"
+    assert kb.memories.get(pinned)["state"]["strength"] == 1
+    assert kb.memories.get(ordinary)["state"]["strength"] == 0
+
+
+def test_feedback_boosts_useful_recall(kb):
+    """被标记为有用的召回项提升强度与计数。"""
+    target = kb.memories.upsert_by_judgment(judgment="被反馈的记忆")["value"]["id"]
+    report = kb.memories.feedback([target], [target])["value"]
+
+    assert report == {"recalled": 1, "boosted": 1, "penalized": 0}
+    state = kb.memories.get(target)["state"]
+    assert state["strength"] == 2
+    assert state["useful_count"] == 1
+    assert state["useful_score"] == pytest.approx(2.5)
+
+
+# ── 健康、备份与错误映射 ──────────────────────────────────────────────
+
+def test_health_exposes_core_counters(kb):
+    """健康报告含库归属、修订号、索引进度与完整性检查。"""
+    kb.memories.upsert_by_judgment(judgment="一条记忆")
+    report = kb.health()
+
+    assert report["schema_version"] == 4
+    assert report["revision"] >= 1
+    assert report["indexed_revision"] == report["revision"]
+    assert report["pending_index_updates"] == 0
+    assert report["record_count"] == 1
+    assert report["counts"]["memory"] == 1
+    assert report["sqlite_integrity"] == "ok"
+    assert report["foreign_key_errors"] == 0
+
+
+def test_backup_and_restore_roundtrip(kb, tmp_path):
+    """备份出独立快照，restore 到新目录后数据与索引都可用。"""
+    kb.memories.upsert_by_judgment(judgment="备份里的记忆")
+    snapshot = tmp_path / "snapshot.sqlite3"
+    kb.backup(str(snapshot))
+    assert snapshot.exists()
+
+    restored = KnowledgeBase.restore(str(snapshot), str(tmp_path / "restored"))
+    try:
+        assert [h["record"]["judgment"] for h in restored.search("备份")["hits"]] == ["备份里的记忆"]
+        assert restored.health()["record_count"] == 1
+    finally:
+        restored.close()
+
+
+def test_error_codes_map_to_exception_classes(open_kb, tmp_path):
+    """锁定、未找到、参数非法、已关闭四类错误都映射到对应异常，并带稳定 code。"""
+    kb = open_kb("locked")
+
+    with pytest.raises(LockedError) as locked:
+        KnowledgeBase(str(tmp_path / "locked"))
+    assert locked.value.code == "locked"
+
+    with pytest.raises(NotFoundError) as missing:
+        kb.memories.get(424242)
+    assert missing.value.code == "not_found"
+
+    with pytest.raises(ValidationError) as invalid:
+        open_kb("bad", scopes=[])
+    assert invalid.value.code == "validation"
+
+    kb.close()
+    with pytest.raises(ClosedError) as closed:
+        kb.health()
+    assert closed.value.code == "closed"
+
+
+def test_search_rejects_empty_query_without_vectors(kb):
+    """既无关键词也无向量时由核心拒绝。"""
+    with pytest.raises(ValidationError):
+        kb.search("")
+
+
+# ── 异步封装与导入器 ──────────────────────────────────────────────────
+
+def test_async_facade_mirrors_the_sync_store(tmp_path):
+    """异步封装的读写走同一套核心，语义与同步一致。"""
+
+    async def scenario() -> list[str]:
+        async with await AsyncKnowledgeBase.open(str(tmp_path / "async")) as kb:
+            await kb.memories.upsert_by_judgment(judgment="异步写入的记忆")
+            hits = await kb.search("异步")
+            assert (await kb.health())["record_count"] == 1
+            return [h["record"]["judgment"] for h in hits["hits"]]
+
+    assert asyncio.run(scenario()) == ["异步写入的记忆"]
+
+
+def test_import_legacy_dry_run_then_apply(tmp_path):
+    """导入器默认只预览、不落盘；--apply 后才生成目标库。"""
+    source = tmp_path / "memory_store.db"
+    conn = sqlite3.connect(source)
+    conn.executescript("""
+        CREATE TABLE memory_record(id TEXT PRIMARY KEY, memory_type TEXT, judgment TEXT, reasoning TEXT,
+            strength INTEGER, is_active INTEGER, memory_scope TEXT, useful_count INTEGER, useful_score REAL,
+            last_recalled_at TEXT, last_decay_at TEXT, created_at TEXT, updated_at TEXT, owner_agent_id TEXT);
+        CREATE TABLE global_tag(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE memory_tag_rel(memory_id TEXT, tag_id INTEGER);
+        INSERT INTO memory_record VALUES('m1','knowledge','Rust 是系统编程语言','因为内存安全',5,1,'public',3,0.5,
+            NULL,NULL,'2026-02-21T13:11:40.51375Z','2026-06-13T09:26:45Z',NULL);
+        INSERT INTO global_tag VALUES(1,'rust');
+        INSERT INTO memory_tag_rel VALUES('m1',1);
+    """)
+    conn.close()
+
+    destination = tmp_path / "imported"
+    preview = import_legacy(source="p_ai", source_id="fixture", database=str(source), destination=str(destination))
+    assert preview["applied"] is False
+    assert preview["counts"]["memory"] == 1
+    assert not preview["conflicts"]
+    assert not destination.exists(), "dry run 不得创建目标目录"
+
+    applied = import_legacy(source="p_ai", source_id="fixture", database=str(source),
+                            destination=str(destination), dry_run=False)
+    assert applied["applied"] is True
+    assert destination.exists()
+
+    imported = KnowledgeBase(str(destination))
+    try:
+        hits = imported.search("系统编程语言")["hits"]
+        assert [h["record"]["judgment"] for h in hits] == ["Rust 是系统编程语言"]
+        assert hits[0]["record"]["tags"] == ["rust"]
+        assert hits[0]["record"]["state"]["strength"] == 5
+    finally:
+        imported.close()
+
+
+def kb_judgments(kb) -> list[str]:
+    """当前 filter 下可见的全部记忆论断，按 id 升序。"""
+    return [m["judgment"] for m in kb.memories.list(limit=100)["items"]]
