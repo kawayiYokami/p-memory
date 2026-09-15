@@ -34,6 +34,18 @@ with KnowledgeBase("./data/app") as kb:
 - **As small as possible.** Text lives in normalized tables — one shared string dictionary, tag links as plain integer ids, nothing stored twice. For personal scale, keeping the store minimal is a deliberate goal.
 - **Memory, graph, and notes in a single search.** They share one index, so one query returns all three, fused with RRF.
 - **Fast.** For LLM memory, responsiveness comes first: local, single-file, no network round trips.
+- **Vectorization and reranking live inside.** The host registers an embedder (one model = one space) and a reranker, then hands over content and search terms; the library batches, truncates, retries, and degrades on its own.
+
+## Try the demo
+
+One small set of memories and notes, an offline embedder and reranker, and one search — no keys, no network, reproducible. Vectors and reranking both happen inside the library:
+
+```sh
+cargo run --example minimal_demo
+python -m p_memory.demo
+```
+
+Both print the hit count, which paths ran, and whether reranking truncated. The same fixture is the end-to-end acceptance sample for this interface.
 
 ## Memory, the graph, and notes
 
@@ -121,7 +133,7 @@ p-memory import --source p_ai --source-id my-host `
 # Review the report, then add --apply. The default is a dry run that creates no destination.
 ```
 
-Supports importing snapshots from other memory systems; run `p-memory import --help` for the available sources. Original fields, lifecycle, scopes, and stable ID mappings are preserved; the source database is read-only. Graph lookup and note roots can be set explicitly. Old vector / FAISS / Tantivy caches are rebuilt, and the report lists the text still pending embedding.
+Supports importing snapshots from other memory systems; run `p-memory import --help` for the available sources. Original fields, lifecycle, scopes, and stable ID mappings are preserved; the source database is read-only. Graph lookup and note roots can be set explicitly. Old vector / FAISS / Tantivy caches are rebuilt; register an embedder afterward and run `embeddings.sync` to fill vectors — the import itself stays offline.
 
 ## Documentation and testing
 

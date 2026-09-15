@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .api import KnowledgeBase
-from .errors import PMemoryError, ValidationError
+from .errors import EmbedCallbackError, PMemoryError, ValidationError
 
 
 class AgentError(Exception):
@@ -236,23 +236,26 @@ class SimpleAgent:
                  read_only: bool = False, max_rounds: int = 8, max_tools_per_round: int = 8,
                  max_tool_output_chars: int = 24_000, embedding_model: str | None = None,
                  embedding_dimension: int | None = None, embedding_space: str = "simple-agent-v1",
-                 max_embedding_records: int = 256):
+                 embedding_batch_size: int = 50):
         if not 1 <= max_rounds <= 64 or not 1 <= max_tools_per_round <= 32 or max_tool_output_chars < 1000:
             raise ValidationError("invalid agent round, tool count or output limit")
         if (embedding_model is None) != (embedding_dimension is None):
             raise ValidationError("embedding_model and embedding_dimension must be supplied together")
-        if max_embedding_records < 1:
-            raise ValidationError("max_embedding_records must be positive")
+        if embedding_batch_size < 1:
+            raise ValidationError("embedding_batch_size must be positive")
         self.kb, self.client = kb, client
         self._namespace, self._scopes, self._write_scope = kb.namespace, list(kb.scopes), kb.write_scope
         self.max_rounds, self.max_tools_per_round = max_rounds, max_tools_per_round
         self.max_tool_output_chars = max_tool_output_chars
         self.embedding_model, self.embedding_space = embedding_model, embedding_space
-        self.max_embedding_records = max_embedding_records
+        self.embedding_batch_size = embedding_batch_size
         self.tools = copy.deepcopy([t for t in _TOOLS if not read_only or t["function"]["name"] in _READ_TOOLS])
         self._schemas = {t["function"]["name"]: t["function"]["parameters"] for t in self.tools}
         if embedding_model:
+            # 向量化是库的职责：宿主只注册「文本 → 向量」的回调与它的批次上限，
+            # 补齐、检索嵌入都由库内部完成，agent 不接触向量。
             kb.embeddings.register_space(id=embedding_space, model=embedding_model, dimension=embedding_dimension)
+            kb.embeddings.register_embedder(embedding_space, self._embed, max_batch=embedding_batch_size)
         self.reset()
 
     def reset(self) -> None:
@@ -264,25 +267,32 @@ class SimpleAgent:
     def _input(self, args: dict) -> dict:
         return {**args, "namespace": self._namespace, "scope": self._write_scope}
 
-    def _embedding_search(self, query: str) -> tuple[list[dict], bool]:
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        """宿主嵌入回调。类别由宿主这里显式给出，库不解析错误文案。"""
+        try:
+            return self.client.embed(texts, model=self.embedding_model)
+        except ProviderError as exc:
+            text = str(exc)
+            if "HTTP 413" in text:
+                raise EmbedCallbackError.too_large(text) from exc
+            if "HTTP 429" in text:
+                raise EmbedCallbackError.rate_limited(text) from exc
+            raise EmbedCallbackError.other(text) from exc
+
+    def _sync_embeddings(self) -> bool:
+        """库内部补齐缺失向量；返回是否仍有未补齐的记录。"""
         if not self.embedding_model:
-            return [], False
-        embedded = 0
-        while embedded < self.max_embedding_records:
-            pending = self.kb.embeddings.pending(self.embedding_space, filter=self._filter(), limit=min(32, self.max_embedding_records - embedded))["items"]
-            if not pending:
-                break
-            vectors = self.client.embed([p["text"] for p in pending], model=self.embedding_model)
-            self.kb.embeddings.put(self.embedding_space, [{"key": p["key"], "fingerprint": p["fingerprint"], "values": v} for p, v in zip(pending, vectors)])
-            embedded += len(pending)
-        still_pending = bool(self.kb.embeddings.pending(self.embedding_space, filter=self._filter(), limit=1)["items"])
-        query_vector = self.client.embed([query], model=self.embedding_model)[0]
-        return [{"space_id": self.embedding_space, "values": query_vector}], still_pending
+            return False
+        report = self.kb.embeddings.sync(self.embedding_space, batch=self.embedding_batch_size)
+        return report["value"]["interrupted"] is not None
 
     def _execute(self, name: str, args: dict) -> Any:
         if name == "memory_search":
-            vectors, pending = self._embedding_search(args["query"])
-            result = self.kb.search(args["query"], filter=self._filter(args.get("tags")), limit=args.get("limit", 5), vectors=vectors)
+            pending = self._sync_embeddings()
+            options: dict[str, Any] = {"vector": False}
+            if self.embedding_model:
+                options = {"embed_space": self.embedding_space}
+            result = self.kb.search(args["query"], filter=self._filter(args.get("tags")), limit=args.get("limit", 5), **options)
             result["more_embeddings_pending"] = pending
             return result
         if name == "record_get":

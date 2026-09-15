@@ -71,7 +71,38 @@ pub(crate) fn keyword_terms(query: &str) -> Vec<String> {
     normalize_text(query).split_whitespace().filter(|w| seen.insert(w.to_string())).map(|w| w.to_string()).collect()
 }
 
-pub(crate) fn digest(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }
-pub(crate) fn normalized_tag(text: &str) -> String {
+/// 按与 `tokenize` 同源的规则，把文本截断到不超过 `budget` 个 token。
+///
+/// 计数方式是分词规则的直接映射：一个 CJK 字算 1 个 token，它与前一个字的
+/// 相邻二元组再算 1 个；连续的字母数字串整体算 1 个。宿主不必自己数 token，
+/// 也不必知道库用的是哪套切分。返回的是原文前缀，不改写内容。
+pub(crate) fn truncate_to_tokens(text: &str, budget: usize) -> String {
+    if budget == 0 { return String::new(); }
+    let mut count = 0usize;
+    let mut end = 0usize;
+    let mut in_word = false;
+    let mut run = 0usize;
+    for (index, ch) in text.char_indices() {
+        let mut added = 0usize;
+        if is_cjk(ch) {
+            if in_word { added += 1; in_word = false; }
+            run += 1;
+            added += 1;
+            if run >= 2 { added += 1; }
+        } else if ch.is_alphanumeric() || ch == '_' {
+            if run > 0 { added += run + run.saturating_sub(1); run = 0; }
+            in_word = true;
+        } else {
+            if in_word { added += 1; in_word = false; }
+            if run > 0 { added += run + run.saturating_sub(1); run = 0; }
+        }
+        if count + added > budget { break; }
+        count += added;
+        end = index + ch.len_utf8();
+    }
+    text[..end].to_string()
+}
+
+pub(crate) fn digest(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }pub(crate) fn normalized_tag(text: &str) -> String {
     normalize_text(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }

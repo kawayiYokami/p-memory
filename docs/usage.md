@@ -19,8 +19,8 @@ let kb = KnowledgeBase::open("./data")?;   // 目录不存在会自动创建，�
 | 存 / 取论断式记忆 | `kb.memories()` | `upsert` / `list` / `feedback` / `decay` |
 | 存 / 取知识图谱 | `kb.graph()` | `apply_batch` / `resolve` / `neighbors` / `ego` / `path` |
 | 存 / 取长文档 | `kb.notes()` | `upsert` / `chunks` |
-| 写入向量（宿主生成） | `kb.embeddings()` | `register_space` / `pending` / `put` |
-| 统一检索 | `kb.search(&req)` | 关键词 / 向量 / 混合 |
+| 写入向量 / 重排（宿主提供模型回调） | `kb.embeddings()` / `kb` | `register_space` / `register_embedder` / `sync` / `register_reranker` |
+| 统一检索 | `kb.search(&req)` | 关键词 / 向量 / 混合 / 重排 |
 
 五个域共享一个数据库与事务基础：写入返回 `WriteReceipt`，读取带 `ReadFilter`。
 
@@ -56,7 +56,7 @@ for hit in kb.search(&req)?.hits {
 }
 ```
 
-- `query` 走关键词（严格 + 宽松两轮）；`vectors` 走向量；两者都给就是混合，用 RRF 融合。详见 [search](search.md)。
+- `query` 走关键词（严格 + 宽松两轮）；给了 `embed_space` 走向量（库自己嵌入查询词）；两者都开就是混合，用 RRF 融合，可选重排。详见 [search](search.md)。
 - 过滤在截取 Top-K **之前**生效。
 
 ## 图谱
@@ -94,22 +94,27 @@ kb.notes().upsert(NoteInput::new("docs/readme.md", "正文……"))?;
 
 写入正文时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。
 
-## 向量（宿主生成，库只存取）
+## 向量与重排（宿主提供模型接口，库内部执行）
 
 ```rust
-use p_memory::embeddings::EmbeddingSpace;
+use p_memory::{EmbeddingSpace, EmbedderOptions};
 
 kb.embeddings().register_space(EmbeddingSpace {
     id: "e5".into(), model: "e5-base".into(), dimension: 768, text_version: 1, encoding: "sq8".into(),
 })?;
 
-let page = PageRequest { filter: filter.clone(), ..Default::default() };
-let todo = kb.embeddings().pending("e5", &page, &[])?;   // 当前缺向量的记录（含过期的）
-// 宿主用模型算 embedding，构造 Vec<EmbeddingWrite>
-kb.embeddings().put("e5", &writes)?;                     // 原子写回，任一条过期则整批拒绝
+// 一个向量模型 = 一个向量空间；注册即用样本校验，不符即拒绝绑定。
+kb.embeddings().register_embedder_with("e5", my_embed_fn, EmbedderOptions {
+    max_batch: 50, max_tokens_per_text: Some(512),
+})?;
+
+// 库拿该回调把缺失向量分批补齐；写入路径也会「写入即向量化」。
+kb.embeddings().sync("e5", 50)?;
+
+// 检索：宿主只给搜索词与目标空间，库自己嵌入查询词。
 ```
 
-库不调用任何模型：`pending` 给「要向量化的清单」，宿主算完 `put` 回来。
+宿主只提供「内容 + 模型接口」，向量化与重排全程在库内发生：`register_embedder` 回调算向量、`register_reranker` 回调做重排，库负责分批、截断、重试与多档降级。回调是运行时状态、不进数据库，宿主启动时注册一次即可。
 
 ## 多宿主共存
 

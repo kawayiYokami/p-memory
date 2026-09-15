@@ -117,12 +117,20 @@ pub(crate) fn as_input(memory: &Memory, at: i64) -> MemoryInput {
 }
 
 impl MemoryStore {
-    pub fn upsert(&self, input: MemoryInput) -> Result<WriteReceipt<Memory>> { self.0.mutate(|tx| upsert(tx, &input)) }
+    pub fn upsert(&self, input: MemoryInput) -> Result<WriteReceipt<Memory>> {
+        let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
+        // 写入即向量化：库内部补齐，宿主只给正文。
+        self.0.vectorize(&[receipt.value.header.id]);
+        Ok(receipt)
+    }
     pub fn upsert_many(&self, inputs: &[MemoryInput]) -> Result<WriteReceipt<Vec<Memory>>> {
-        self.0.mutate(|tx| inputs.iter().map(|input| upsert(tx, input)).collect())
+        let receipt: WriteReceipt<Vec<Memory>> = self.0.mutate(|tx| inputs.iter().map(|input| upsert(tx, input)).collect())?;
+        let ids: Vec<i64> = receipt.value.iter().map(|memory| memory.header.id).collect();
+        self.0.vectorize(&ids);
+        Ok(receipt)
     }
     pub fn upsert_by_judgment(&self, mut input: MemoryInput) -> Result<WriteReceipt<Memory>> {
-        self.0.mutate(|tx| {
+        let receipt = self.0.mutate(|tx| {
             let mut stmt = tx.prepare("SELECT id FROM records WHERE namespace_id=(SELECT id FROM strings WHERE text=?1)
                 AND scope_id=(SELECT id FROM strings WHERE text=?2) AND kind=?3 AND json_extract(payload_json,'$.judgment_key')=?4 ORDER BY id LIMIT 2")?;
             let ids = stmt.query_map(params![text::normalized_tag(&input.record.namespace), text::normalized_tag(&input.record.scope),
@@ -139,7 +147,9 @@ impl MemoryStore {
                 if input.record.evidence.is_empty() { input.record.evidence = existing.header.evidence; }
             }
             upsert(tx, &input)
-        })
+        })?;
+        self.0.vectorize(&[receipt.value.header.id]);
+        Ok(receipt)
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory> {
         let state = self.0.read()?;

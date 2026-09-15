@@ -170,7 +170,12 @@ pub(crate) fn upsert(conn: &Connection, input: &NoteInput) -> Result<Note> {
 #[derive(Clone)]
 pub struct NoteStore(pub(crate) KnowledgeBase);
 impl NoteStore {
-    pub fn upsert(&self, input: NoteInput) -> Result<WriteReceipt<Note>> { self.0.mutate(|tx| upsert(tx, &input)) }
+    pub fn upsert(&self, input: NoteInput) -> Result<WriteReceipt<Note>> {
+        let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
+        // 笔记与其切片一同交给内部向量化；默认关闭时这一步直接跳过。
+        self.0.vectorize_note(receipt.value.header.id);
+        Ok(receipt)
+    }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note> {
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)
     }

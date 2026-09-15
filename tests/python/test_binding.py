@@ -17,7 +17,6 @@ from p_memory import (
     KnowledgeBase,
     LockedError,
     NotFoundError,
-    StaleRevisionError,
     ValidationError,
     import_legacy,
 )
@@ -46,7 +45,7 @@ def test_memory_roundtrip_is_a_flat_dict(kb):
 
     hits = kb.search("简短回答")["hits"]
     assert [h["record"]["judgment"] for h in hits] == ["用户偏好简短回答"]
-    assert set(hits[0]) == {"key", "record", "score", "text_score", "vector_scores"}
+    assert set(hits[0]) == {"key", "record", "score", "text_score", "vector_scores", "rerank_score"}
 
 
 def test_upsert_by_judgment_deduplicates_within_scope(kb):
@@ -181,45 +180,77 @@ def test_note_rejects_out_of_range_chunk_size(kb):
         kb.notes.upsert(source="docs/x.md", content="正文", chunk_chars=5)
 
 
-# ── 向量 ──────────────────────────────────────────────────────────────
+# ── 向量与重排 ────────────────────────────────────────────────────────
 
-def test_embedding_pending_put_and_vector_search(kb):
-    """pending 给待向量化清单，put 写回后该条从 pending 消失且向量可检索。"""
+def test_embedder_registers_validates_and_search_embeds_query(kb):
+    """注册即校验；写入即向量化；检索只给搜索词，库用该空间回调嵌入查询词。"""
     kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 4})
     assert kb.embeddings.spaces() == [
         {"id": "e5", "model": "e5-base", "dimension": 4, "text_version": 1, "encoding": "sq8"}
     ]
 
+    calls: list[int] = []
+
+    def embedder(texts):
+        calls.append(len(texts))
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    kb.embeddings.register_embedder("e5", embedder, max_batch=4)
+    assert calls and max(calls) <= 4, "注册即用样本真跑一遍校验"
+
     target = kb.memories.upsert_by_judgment(judgment="需要向量化的记忆")["value"]["id"]
-    pending = kb.embeddings.pending("e5", limit=50)
-    item = next(i for i in pending["items"] if i["key"]["id"] == target)
-    assert item["text"] and item["fingerprint"]
 
-    assert kb.embeddings.put("e5", [
-        {"key": item["key"], "fingerprint": item["fingerprint"], "values": [1.0, 0.0, 0.0, 0.0]}
-    ])["value"] == 1
-
-    assert target not in [i["key"]["id"] for i in kb.embeddings.pending("e5", limit=50)["items"]]
-
-    hits = kb.search("", vectors=[{"space_id": "e5", "values": [1.0, 0.0, 0.0, 0.0]}])["hits"]
+    hits = kb.search("向量化", embed_space="e5", text=False, rerank=False)["hits"]
     assert hits[0]["key"]["id"] == target
-    assert hits[0]["vector_scores"] == {"e5": pytest.approx(1.0)}
+    assert hits[0]["vector_scores"]["e5"] == pytest.approx(1.0)
+    assert kb.embeddings.embedder_space("e5")["dimension"] == 4
+    assert kb.health()["embedder_spaces"] == ["e5"]
+    assert kb.embeddings.unregister_embedder("e5") is True
+    assert kb.embeddings.unregister_embedder("e5") is False
 
 
-def test_embedding_rejects_wrong_dimension_and_stale_fingerprint(kb):
-    """维度不符与指纹过期分别映射到 invalid_vector / stale_revision，且整批不写入。"""
+def test_embedder_registration_rejects_wrong_dimension(kb):
+    """回调产出维度与空间契约不符时拒绝绑定，并映射到 invalid_vector。"""
     kb.embeddings.register_space({"id": "v", "model": "m", "dimension": 3})
-    kb.memories.upsert_by_judgment(judgment="待向量化的记忆")
-    item = kb.embeddings.pending("v", limit=1)["items"][0]
-
     with pytest.raises(InvalidVectorError):
-        kb.embeddings.put("v", [{"key": item["key"], "fingerprint": item["fingerprint"], "values": [1.0, 2.0]}])
+        kb.embeddings.register_embedder("v", lambda texts: [[1.0, 2.0] for _ in texts])
 
-    with pytest.raises(StaleRevisionError):
-        kb.embeddings.put("v", [{"key": item["key"], "fingerprint": "deadbeef", "values": [1.0, 2.0, 3.0]}])
 
-    # 两次都被拒绝，该记录仍在待向量化清单里
-    assert item["key"]["id"] in [i["key"]["id"] for i in kb.embeddings.pending("v", limit=50)["items"]]
+def test_namespace_vectorization_switch_is_per_namespace(kb):
+    """一个知识域关掉向量化不影响另一个；开关落盘可读。"""
+    kb.embeddings.register_space({"id": "v", "model": "m", "dimension": 4})
+    kb.embeddings.register_embedder("v", lambda texts: [[1.0, 0.0, 0.0, 0.0] for _ in texts])
+    assert kb.embeddings.namespace_vectorization("default") is True
+
+    kb.memories.upsert_by_judgment(judgment="另一个域的内容", namespace="other")
+    kb.embeddings.set_namespace_vectorization("other", False)
+    assert kb.embeddings.namespace_vectorization("other") is False
+
+    result = kb.search("另一个域的内容", filter={"namespace": "other"}, embed_space="v")
+    assert "namespace_disabled" in result["diagnostics"]["degraded"]
+    assert result["diagnostics"]["vector_used"] is False
+    assert result["hits"], "关掉向量化后全文路仍然给结果"
+
+
+def test_reranker_reorders_and_reports_diagnostics(kb):
+    """重排回调在融合之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
+    for i in range(4):
+        kb.memories.upsert_by_judgment(judgment=f"重排对象 {i}")
+
+    baseline = [h["key"]["id"] for h in kb.search("重排对象", vector=False, rerank=False)["hits"]]
+    assert len(baseline) == 4
+
+    kb.register_reranker(lambda query, documents: [float(i) for i in range(len(documents))], max_docs=2)
+    result = kb.search("重排对象", vector=False, rerank=True)
+    assert result["diagnostics"]["reranked"] is True
+    assert result["diagnostics"]["rerank_candidates"] == 2
+    assert result["diagnostics"]["rerank_truncated"] == 2
+    assert result["hits"][0]["key"]["id"] == baseline[1], "截到 2 条候选中，给后者更高分者排最前"
+    assert result["hits"][0]["rerank_score"] is not None
+
+    counted = kb.search("重排对象", vector=False, rerank=False, limit=1, with_total=True)
+    assert len(counted["hits"]) == 1
+    assert counted["total"] == 4
 
 
 # ── 生命周期 ──────────────────────────────────────────────────────────

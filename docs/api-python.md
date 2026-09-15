@@ -13,6 +13,7 @@ kb.graph           # GraphStore
 kb.notes           # NoteStore
 kb.embeddings      # EmbeddingStore
 kb.search("关键词") # -> SearchResult
+kb.register_reranker(callback, max_docs=64)
 kb.health()        # -> dict
 kb.rebuild_indexes()
 kb.backup(target)
@@ -27,6 +28,41 @@ p_memory.KnowledgeBase.restore(snapshot, directory)  # 类方法
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
 **谓词元规则 `set_predicate_rule` 仅在 Rust 侧提供，Python 未暴露**；用法示例见 [graph-search](graph-search.md#python)。
+
+## 向量与重排回调
+
+向量化与重排都在库内部完成。宿主只注册模型接口并提供内容，不自己算向量、不自己重排：
+
+```python
+kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 768})
+kb.embeddings.register_embedder("e5", my_embed_fn, max_batch=50)   # 注册即用样本校验
+kb.embeddings.sync("e5", batch=50)                                # 库调回调补齐缺失向量
+kb.memories.upsert_by_judgment(judgment="……")                      # 写入即向量化
+kb.search("偏好", embed_space="e5")                                # 库嵌入查询词，宿主只给词
+kb.register_reranker(my_rerank_fn, max_docs=64)                    # 进程内单例重排回调
+```
+
+- `register_embedder(space_id, callback, *, max_batch=32, max_tokens_per_text=None)`：`callback(texts: list[str]) -> list[list[float]]`。一个向量模型对应一个向量空间，注册即校验，产出不符即拒绝绑定并报 `InvalidVectorError`。
+- `register_reranker(callback, *, max_docs=64, max_tokens_per_doc=1024, max_tokens_query=None)`：`callback(query: str, documents: list[str]) -> list[float]`。
+- `EmbeddingStore` 另有 `unregister_embedder` / `embedder_space` / `spaces` / `namespace_vectorization` / `set_namespace_vectorization` / `delete_space`。
+- 回调是运行时状态，不进数据库：宿主启动时注册一次即可。
+- 检索时宿主只给 `embed_space`，库用它注册的回调嵌入查询词；`search` 的 `text` / `vector` / `rerank` / `with_total` 各自独立开关，未给 `embed_space` 时向量路自动让位（不是错误）。
+
+### 回调错误分类
+
+嵌入回调在失败时抛出 `EmbedCallbackError`，用 `kind` 显式声明类别，库不解析错误文案：
+
+```python
+from p_memory.errors import EmbedCallbackError
+
+def my_embed_fn(texts):
+    try:
+        return provider.embed(texts)
+    except ProviderTooLarge as exc:
+        raise EmbedCallbackError.too_large(str(exc)) from exc   # 库把 batch 减半后重试
+```
+
+`too_large` → 减半重试；`rate_limited` → 退避重试；`other`（缺省）→ 不重试、直接降级。异常上的 `kind` 属性由绑定读取，普通异常按 `other` 处理。
 
 ## 类型映射
 
@@ -70,6 +106,7 @@ PMemoryError                 # 基类，code = "unknown"
 
 - 绑定必须把 Rust 错误转成上述类型，**不得退化为通用 `RuntimeError`**。
 - 异常携带稳定 `code` 属性，便于宿主分支处理。
+- 宿主嵌入回调抛出的 `EmbedCallbackError`（`code = "embed_callback"`）不由原生层产生，它带 `kind`（`too_large` / `rate_limited` / `other`），供库判定重试与降级；见「回调错误分类」。
 - `__init__.py` 的 `__all__` 导出 `PMemoryError` 与上面除 `IndexError`、`IOError` 之外的全部子类；
   这两个类仍可从 `p_memory.errors` 导入并按 `code` 捕获，但未进顶层导出列表。
 

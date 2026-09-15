@@ -91,24 +91,31 @@ class EmbeddingSpace(TypedDict):
     encoding: str
 
 
-class EmbeddingInput(TypedDict):
-    key: RecordKey
-    text: str
-    fingerprint: str
-    revision: int
+class EmbedderOptions(TypedDict, total=False):
+    max_batch: int
+    max_tokens_per_text: int | None
 
 
-class EmbeddingWrite(TypedDict):
-    key: RecordKey
-    fingerprint: str
-    values: list[float]
+class RerankerOptions(TypedDict, total=False):
+    max_docs: int
+    max_tokens_per_doc: int
+    max_tokens_query: int | None
 
 
-class QueryVector(TypedDict, total=False):
-    space_id: str
-    values: list[float]
-    weight: float
-    min_score: float | None
+class SyncReport(TypedDict):
+    scanned: int
+    written: int
+    batches: int
+    interrupted: str | None
+
+
+class SearchDiagnostics(TypedDict, total=False):
+    text_used: bool
+    vector_used: bool
+    reranked: bool
+    rerank_candidates: int
+    rerank_truncated: int
+    degraded: list[str]
 
 
 class WriteReceipt(TypedDict):
@@ -128,6 +135,7 @@ class SearchHit(TypedDict):
     score: float
     text_score: float | None
     vector_scores: dict[str, float]
+    rerank_score: float | None
     record: dict[str, Any]
 
 
@@ -135,3 +143,5 @@ class SearchResult(TypedDict):
     hits: list[SearchHit]
     revision: int
     indexed_revision: int
+    total: int | None
+    diagnostics: SearchDiagnostics

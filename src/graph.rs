@@ -131,17 +131,25 @@ pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<Even
     Ok(Event { header, name: input.name.clone(), summary: input.summary.clone(), participants, confidence: input.confidence, reason: input.reason.clone() })
 }
 
-pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<GraphBatchResult> {
+pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(GraphBatchResult, Vec<i64>)> {
     // Entities first permits references to entities created in this transaction.
     let entities = batch.entities.iter().map(|v| upsert_entity(conn, v)).collect::<Result<Vec<_>>>()?;
     let relations = batch.relations.iter().map(|v| upsert_relation(conn, v)).collect::<Result<Vec<_>>>()?;
     let events = batch.events.iter().map(|v| upsert_event(conn, v)).collect::<Result<Vec<_>>>()?;
-    refresh_dependents(conn, &entities)?;
-    Ok(GraphBatchResult { entities, relations, events })
+    // 改名会改写引用它的关系与事件正文，这些记录的向量必须一并重算。
+    let refreshed = refresh_dependents(conn, &entities)?;
+    let mut ids: Vec<i64> = entities.iter().map(|e| e.header.id)
+        .chain(relations.iter().map(|r| r.header.id)).chain(events.iter().map(|e| e.header.id)).collect();
+    ids.extend(refreshed);
+    ids.sort_unstable();
+    ids.dedup();
+    Ok((GraphBatchResult { entities, relations, events }, ids))
 }
 
-fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<()> {
+/// 返回因引用正文变化而被重写的记录 id。
+fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>> {
     let mut keys = BTreeSet::new();
+    let mut rewritten = Vec::new();
     for entity in entities {
         let mut stmt = conn.prepare("SELECT record_id FROM relations WHERE subject_id=?1 OR object_id=?1
             UNION SELECT event_id FROM event_participants WHERE entity_id=?1")?;
@@ -167,13 +175,23 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<()> {
             conn.execute("UPDATE records SET search_text=?2,embedding_text=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
                 params![key.id, body, text::digest(&format!("text-v1\n{body}")), revision, storage::now_us()])?;
             conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
+            rewritten.push(key.id);
         }
     }
-    Ok(())
+    Ok(rewritten)
 }
 
 impl GraphStore {
-    pub fn apply_batch(&self, batch: &GraphBatch) -> Result<WriteReceipt<GraphBatchResult>> { self.0.mutate(|tx| apply_batch(tx, batch)) }
+    pub fn apply_batch(&self, batch: &GraphBatch) -> Result<WriteReceipt<GraphBatchResult>> {
+        let mut ids: Vec<i64> = Vec::new();
+        let receipt = self.0.mutate(|tx| {
+            let (result, written) = apply_batch(tx, batch)?;
+            ids = written;
+            Ok(result)
+        })?;
+        self.0.vectorize(&ids);
+        Ok(receipt)
+    }
     pub fn get(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<serde_json::Value> {
         if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)

@@ -19,6 +19,7 @@ test = ["pytest>=8"]
 
 [project.scripts]
 p-memory = "p_memory.cli:main"
+p-memory-demo = "p_memory.demo:main"
 
 [tool.maturin]
 manifest-path = "bindings/python/Cargo.toml"

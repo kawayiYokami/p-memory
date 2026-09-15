@@ -41,6 +41,11 @@ pub(crate) struct Engine {
     /// 不销毁就无法释放，目录也重开不了。
     pub index: RwLock<Option<Arc<TextIndex>>>,
     pub vectors: VectorCache,
+    /// 宿主注册的模型能力。它们是运行时状态（闭包 / Python 函数无法序列化），不落盘。
+    pub embedders: crate::embeddings::EmbedderRegistry,
+    pub rerankers: crate::search::RerankerRegistry,
+    /// 最近观察到的降级档位，供健康检查读出「结果为什么变差」。
+    pub degraded: Mutex<Vec<Degrade>>,
     pub root: PathBuf,
 }
 
@@ -85,7 +90,10 @@ impl KnowledgeBase {
         Ok(Self { engine: Arc::new(Engine {
             writer: Mutex::new(Some(Writer { conn: write_conn, _file_lock: file_lock })),
             readers: Mutex::new(Some(Readers { idle: vec![reader] })),
-            index: RwLock::new(Some(index)), vectors: VectorCache::new(), root,
+            index: RwLock::new(Some(index)), vectors: VectorCache::new(),
+            embedders: crate::embeddings::EmbedderRegistry::new(),
+            rerankers: crate::search::RerankerRegistry::new(),
+            degraded: Mutex::new(Vec::new()), root,
         }) })
     }
 
@@ -189,6 +197,44 @@ impl KnowledgeBase {
         Ok(value)
     }
 
+    /// 记下一个降级档位，去重保留少量，供健康检查读出。
+    pub(crate) fn note_degrade(&self, degrade: Degrade) {
+        let mut observed = self.engine.degraded.lock();
+        if !observed.contains(&degrade) {
+            observed.push(degrade);
+            if observed.len() > 8 { observed.remove(0); }
+        }
+    }
+
+    /// 写入后的内部向量化：库自己取文本 → 调宿主回调 → 短事务写回，宿主全程不碰向量。
+    ///
+    /// 这条路径**绝不阻塞写入**：拿不到该空间的回调（另一个线程正在同步）就跳过，
+    /// 记录留在待补状态，交给后续写入或 `sync` 补。失败只记降级档位，不向上抛错。
+    pub(crate) fn vectorize(&self, ids: &[i64]) {
+        if ids.is_empty() || self.engine.embedders.is_empty() { return; }
+        for degrade in crate::embeddings::vectorize_records(self, ids) {
+            self.note_degrade(degrade);
+        }
+    }
+
+    /// 笔记写入后连同它在本次写入中更新的切片一起向量化（切片是独立记录）。
+    pub(crate) fn vectorize_note(&self, note_id: i64) {
+        if self.engine.embedders.is_empty() { return; }
+        let ids = match self.read() {
+            Ok(state) => {
+                let mut ids = vec![note_id];
+                match state.conn().prepare("SELECT record_id FROM chunks WHERE note_id=?1").and_then(|mut stmt|
+                    stmt.query_map([note_id], |r| r.get::<_, i64>(0)).map(|rows| rows.filter_map(|row| row.ok()).collect::<Vec<_>>())) {
+                    Ok(chunks) => ids.extend(chunks),
+                    Err(_) => return,
+                }
+                ids
+            }
+            Err(_) => return,
+        };
+        self.vectorize(&ids);
+    }
+
     pub fn rebuild_indexes(&self) -> Result<HealthReport> {
         {
             let mut guard = self.engine.writer.lock();
@@ -222,6 +268,9 @@ impl KnowledgeBase {
             pending_index_updates: conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get::<_, i64>(0))? as usize,
             sqlite_integrity: conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?,
             foreign_key_errors, counts,
+            embedder_spaces: self.engine.embedders.space_ids(),
+            reranker_registered: self.engine.rerankers.is_registered(),
+            last_degraded: self.engine.degraded.lock().clone(),
         })
     }
 
@@ -476,8 +525,28 @@ pub(crate) fn filter_sql(filter: &ReadFilter, kinds: &[RecordKind], by_ids: bool
     Ok((query, values))
 }
 
-pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {
-    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;
+/// 过滤条件下的匹配总数（截断之前）。`with_total` 打开时才调用。
+pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<usize> {
+    let (condition, values) = filter_sql(filter, kinds, false)?;
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM records r WHERE {condition}"), params_from_iter(values), |r| r.get(0))?;
+    Ok(count as usize)
+}
+
+/// 批量取回一批记录参与全文检索的文本，供重排回调作为 `documents`。
+pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() { return Ok(out); }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+    let mut stmt = conn.prepare(&format!("SELECT id,search_text FROM records WHERE id IN ({placeholders})"))?;
+    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, text_value) = row?;
+        out.insert(id, text_value);
+    }
+    Ok(out)
+}
+
+pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;
     if let Some(cursor) = after {
         let id: i64 = cursor.parse().map_err(|_| Error::Validation("invalid page cursor".into()))?;
         condition.push_str(" AND r.id>?");

@@ -241,14 +241,20 @@ struct TextChunk { ordinal, offset, limit, content }
 - 超长段落按字符边界切分，同一物理行可能被多个切片共享行号。
 - 标题来自笔记层，仍进正文；`source` 路径作为精确整词关键字进 `keywords` 字段（含各级父目录名），不进正文参与切分。
 
-## 领域四：向量（EmbeddingSpace / Embedding）
+## 领域四：向量与重排（EmbeddingSpace / Embedder / Reranker）
 
 ```rust
 struct EmbeddingSpace { id: String, model: String, dimension: usize, text_version: u32 /* 恒为 1 */, encoding: String /* "f32" 或 "sq8" */ }
-struct EmbeddingInput { key: RecordKey, text: String, fingerprint: String, revision: i64 }
-struct EmbeddingWrite { key: RecordKey, fingerprint: String, values: Vec<f32> }
+
+// 宿主注册的模型接口；一个向量模型对应一个向量空间。
+trait Embedder  { fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedCallbackError>; }
+trait Reranker  { fn rerank(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>, String>; }
+
+struct EmbedderOptions  { max_batch: usize, max_tokens_per_text: Option<usize> }
+struct RerankerOptions  { max_docs: usize, max_tokens_per_doc: usize, max_tokens_query: Option<usize> }
 ```
 
+- **一个向量模型 = 一个向量空间**，一个空间只接受它自己模型的回调。向量化全程在库内发生：宿主只提供内容与模型接口，不自己算向量，也不自己重排。
 - 向量空间**不可变**：重复注册相同定义是幂等的，改动 model/dimension 必须换新 `id`，否则 `conflict`。
 - `encoding` 决定向量落盘格式：`"f32"`（4 字节/维，无损）或 `"sq8"`（1 字节/维，逐条对称量化，体积约 -75%、召回约 99%）。新空间默认 `"sq8"`。
 - `sq8` 空间在内存里同样保留 i8 码与逐条 scale，不展开回 f32，因此常驻内存也随体积一起下降。打分时查询向量做一次相同的量化，两侧都用 i8 做整数乘累加；x86_64 上按运行时检测走 AVX2，没有该指令集时自动退回标量路径。
@@ -257,10 +263,35 @@ struct EmbeddingWrite { key: RecordKey, fingerprint: String, values: Vec<f32> }
 - 写回时校验维度、数值有限性、与记录的 `fingerprint` 一致；过期结果报 `stale_revision`，不写入。
 - 向量在库内以归一化 `f32` 小端字节存储。
 
-两步流程：
+### 注册即校验
 
-1. `pending(space_id, page, kinds)` → 分页返回待向量化文本、记录键与指纹。
-2. 宿主机外生成向量后 `put(space_id, writes)` → 原子批量写回。
+注册嵌入回调时，库用样本真跑一遍完整链路，按该空间的 `dimension` 与写回同一套规则（维度、有限性、非零范数、条数与输入一致）逐项检查，任一不符即拒绝绑定并报 `invalid_vector`，空间定义不落盘。这样能挡住「回调绑错空间」「换模型忘改 dimension」——它们若不在这里拒掉，要等第一次写回时才炸，那时空间已建好、离原因很远。
+
+### 回调错误的类别
+
+回调失败必须**可分类**，类别由宿主显式给出，库不解析错误文案：
+
+- `too_large`：单次请求条数超上限。库把 batch 减半（最小 1）后重试，减半值在进程内持久生效。
+- `rate_limited`：限流 / 配额。库退避后重试有限次。
+- `other`：其它。不重试，直接降级。
+
+### 约束由宿主声明、库执行
+
+- 嵌入：`EmbedderOptions.max_batch` 是单批条数上限；`max_tokens_per_text` 是单条文本 token 预算（`None` 不截断）。库永远不把超出声明的文本送出去。
+- 重排：`RerankerOptions.max_docs` 是送入重排的候选数上限，`max_tokens_per_doc` / `max_tokens_query` 是文档与查询词的 token 预算。重排模型普遍有硬上限，库在调用前按声明强制截断。
+- token 计数与全文分词同源（CJK 字 + 相邻二元组），宿主不必自己数 token。
+
+### 默认值与命名空间开关
+
+- 记忆正文与 tags 默认启用向量化；笔记与切片默认关闭；图谱记录沿用现状。
+- 开关粒度到 `namespace`，落盘在 `meta` 表（键 `vectorize:<namespace>`），配置一次即生效。
+- 某 namespace 关闭向量化后，该域记录不生成向量，但全文路仍能命中。
+
+### 多档降级
+
+- 写入侧：模型可用则正常生成；模型不可用或该 namespace 关了向量化时，**记录照常写入**、向量留待补齐，不抛错。
+- 检索侧：全档是文本 + 向量融合；往下依次是「关向量化的 namespace → 纯全文」「回调挂了 → 纯全文」「全文索引坏了 → 退 SQLite 直查」。任一档都返回结果、不抛错、不返回空，当前落在哪一档见 `SearchDiagnostics.degraded` 与 `HealthReport.last_degraded`。
+
 
 ## 错误码
 

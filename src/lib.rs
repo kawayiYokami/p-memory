@@ -24,6 +24,6 @@ pub use types::*;
 pub use memory::{Memory, MemoryInput, MemoryState, DecayPolicy, FeedbackRequest};
 pub use graph::{Entity, EntityInput, Relation, RelationInput, Event, EventInput, GraphBatch};
 pub use notes::{Note, NoteInput, Chunk};
-pub use embeddings::{EmbeddingSpace, EmbeddingInput, EmbeddingWrite};
-pub use search::{SearchRequest, SearchResult, SearchHit, QueryVector, GraphPrune, ContextualHit};
+pub use embeddings::{EmbeddingSpace, Embedder, EmbedderOptions, EmbedCallbackError, EmbedErrorKind, SyncReport};
+pub use search::{SearchRequest, SearchResult, SearchHit, GraphPrune, ContextualHit, Reranker, RerankerOptions};
 

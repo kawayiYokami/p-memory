@@ -1,5 +1,5 @@
 //! Read-only, repeatable migration into a separate p-memory directory.
-use crate::{embeddings::EmbeddingInput, graph::{self, *}, memory::{self, *}, notes::{self, NoteInput},
+use crate::{graph::{self, *}, memory::{self, *}, notes::{self, NoteInput},
     schema, storage::{self, KnowledgeBase}, text, types::*, Error, Result};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,6 @@ pub struct ImportReport {
     pub applied: bool, pub already_imported: bool,
     pub counts: BTreeMap<String,usize>, pub id_map: Vec<IdMapping>,
     pub conflicts: Vec<String>, pub missing_sources: Vec<String>, pub warnings: Vec<String>,
-    pub pending_embeddings: Vec<EmbeddingInput>,
     pub index_ready: bool, pub index_error: Option<String>,
 }
 
@@ -354,7 +353,7 @@ fn build(req:&ImportRequest)->Result<Plan>{
     let raw=raw_graph(req,&mut plan)?;
     if let Some(path)=&req.lookup_database{lookup_graph(req,&mut plan,path)?;attach_evidence(req,&mut plan,&raw)?;}else{extraction_graph(req,&mut plan,&raw)?;}
     import_notes(req,&mut plan,note_rows,&raw)?;
-    plan.warnings.push("Legacy Tantivy/FAISS/vector caches are not copied. Generate new embeddings from pending_embeddings.".into());
+    plan.warnings.push("Legacy Tantivy/FAISS/vector caches are not copied. Vectors are generated inside the library: register an embedder and run embeddings.sync to fill them.".into());
     Ok(plan)
 }
 /// 两阶段写入：先建被引用方拿到内部 id，再按逻辑键把引用翻译成内部 id。
@@ -383,17 +382,6 @@ fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id}); }
     Ok(())
 }
-fn embedding_inputs(conn:&Connection)->Result<Vec<EmbeddingInput>>{
-    let mut stmt=conn.prepare("SELECT id,kind,embedding_text,fingerprint,revision FROM records ORDER BY id")?;
-    let mut rows=stmt.query([])?;let mut inputs=Vec::new();while let Some(row)=rows.next()?{
-        let kind_code:i64=row.get(1)?;
-        let kind=RecordKind::from_code(kind_code).ok_or_else(||Error::Validation("invalid stored record kind".into()))?;
-        // Notes are indexed through chunks by default. Hosts may embed full notes separately.
-        if kind==RecordKind::Note{continue}
-        inputs.push(EmbeddingInput{key:RecordKey{id:row.get(0)?},text:row.get(2)?,fingerprint:row.get(3)?,revision:row.get(4)?});
-    }Ok(inputs)
-}
-
 /// Dry run validates in an in-memory database without creating the destination.
 /// Applying requires an empty directory. Repeating an identical import returns
 /// its receipt; changed sources never overwrite data previously imported.
@@ -401,15 +389,15 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     let plan=build(req)?;
     let fingerprint=text::digest(&serde_json::to_string(&plan)?);
     let mut report=ImportReport{source_id:req.source_id.clone(),source_fingerprint:fingerprint.clone(),applied:false,already_imported:false,
-        counts:BTreeMap::new(),id_map:vec![],conflicts:vec![],missing_sources:plan.missing.iter().cloned().collect(),warnings:plan.warnings.clone(),pending_embeddings:vec![],index_ready:false,index_error:None};
+        counts:BTreeMap::new(),id_map:vec![],conflicts:vec![],missing_sources:plan.missing.iter().cloned().collect(),warnings:plan.warnings.clone(),index_ready:false,index_error:None};
     let mut preview=Connection::open_in_memory()?;schema::initialize(&mut preview)?;
     let tx=preview.transaction()?;
     let mut mappings=Vec::new();
     let mut preview_conflicts=Vec::new();
     if let Err(e)=apply(&tx,&plan,&mut mappings,&mut preview_conflicts){preview_conflicts.push(e.to_string());report.conflicts=preview_conflicts;return Ok(report)}
     report.id_map=mappings;
-    report.pending_embeddings=embedding_inputs(&tx)?;
-    {let mut stmt=tx.prepare("SELECT kind,COUNT(*) FROM records GROUP BY kind")?;for row in stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))?{
+    {
+        let mut stmt=tx.prepare("SELECT kind,COUNT(*) FROM records GROUP BY kind")?;for row in stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))?{
         let(code,count)=row?;let name=RecordKind::from_code(code).map(|k|k.as_str().to_string()).unwrap_or_else(||code.to_string());report.counts.insert(name,count as usize);}}
     drop(tx);
     if req.destination.exists()&&std::fs::read_dir(&req.destination)?.next().is_some(){
@@ -432,7 +420,7 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     let receipt=kb.mutate(|tx|{
         let count:i64=tx.query_row("SELECT COUNT(*) FROM records",[],|r|r.get(0))?;
         if count!=0{return Err(Error::Conflict("destination became nonempty during import".into()))}
-        let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts)?;report.id_map=mappings;report.pending_embeddings=embedding_inputs(tx)?;report.applied=true;
+        let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts)?;report.id_map=mappings;report.applied=true;
         tx.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES (?1,?2,?3)",params![req.source_id,fingerprint,serde_json::to_string(&report)?])?;
         Ok(())
     })?;

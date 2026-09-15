@@ -163,6 +163,36 @@ pub struct WriteReceipt<T> {
     pub index_error: Option<String>,
 }
 
+/// 一次检索实际落在了哪一档。多档降级要求「结果为什么变差」可被宿主读到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Degrade {
+    /// 该 namespace 关闭了向量化：只走全文。
+    NamespaceDisabled,
+    /// 目标空间没有注册嵌入回调：只走全文。
+    NoEmbedder,
+    /// 嵌入回调调用失败：只走全文。
+    EmbedFailed,
+    /// 重排回调调用失败或返回不符：按融合分排序。
+    RerankFailed,
+    /// 全文派生索引不可用：退到 SQLite 直查。
+    TextIndexUnavailable,
+}
+
+/// 一次检索的可观测信息：走了哪几条路、是否重排、重排截断了几条、落在了哪一档。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchDiagnostics {
+    pub text_used: bool,
+    pub vector_used: bool,
+    pub reranked: bool,
+    /// 实际送入重排回调的候选数。
+    pub rerank_candidates: usize,
+    /// 因重排回调声明的 `max_docs` 而未送入重排的候选数。
+    pub rerank_truncated: usize,
+    #[serde(default)]
+    pub degraded: Vec<Degrade>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
     pub schema_version: i64,
@@ -174,4 +204,9 @@ pub struct HealthReport {
     pub sqlite_integrity: String,
     pub foreign_key_errors: usize,
     pub counts: std::collections::BTreeMap<String, usize>,
+    /// 已注册嵌入回调的向量空间。
+    pub embedder_spaces: Vec<String>,
+    pub reranker_registered: bool,
+    /// 最近观察到的降级档位，去重后保留少量。
+    pub last_degraded: Vec<Degrade>,
 }

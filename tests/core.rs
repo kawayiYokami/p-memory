@@ -3,6 +3,7 @@ use p_memory::graph::{EntityInput, EventInput, RelationInput};
 use p_memory::notes::chunk_text;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 fn memory(text: &str, scope: &str) -> MemoryInput {
     let mut value = MemoryInput::new(text);
@@ -12,11 +13,59 @@ fn entity(name: &str) -> EntityInput {
     EntityInput { record: RecordInput::default(), name: name.into(), entity_type: "person".into(),
         aliases: vec![], attributes: BTreeMap::new(), summary: String::new() }
 }
-fn space(kb: &KnowledgeBase) {
-    kb.embeddings().register_space(EmbeddingSpace { id: "test".into(), model: "fixture/v1".into(), dimension: 2, text_version: 1, encoding: "f32".into() }).unwrap();
+
+// ── 假嵌入回调 ────────────────────────────────────────────────────────
+
+/// 确定性兜底向量：同一文本永远得到同一向量，且不为零。
+fn fallback_vector(text: &str, dimension: usize) -> Vec<f32> {
+    let mut values = vec![0f32; dimension];
+    for (index, byte) in text.bytes().enumerate() {
+        values[(index + usize::from(byte)) % dimension] += 1.0 + f32::from(byte % 7) * 0.1;
+    }
+    if values.iter().all(|value| *value == 0.0) { values[0] = 1.0; }
+    values
 }
-fn pending(kb: &KnowledgeBase, filter: ReadFilter) -> Vec<EmbeddingInput> {
-    kb.embeddings().pending("test", &PageRequest { filter, ..Default::default() }, &[]).unwrap().items
+
+fn attempt_error() -> EmbedCallbackError { EmbedCallbackError::other("boom") }
+
+/// 假嵌入：可以指定「文本 → 向量」表，未列出的走确定性兜底；并记录每批实收条数。
+struct FakeEmbedder {
+    dimension: usize,
+    table: Arc<Mutex<BTreeMap<String, Vec<f32>>>>,
+    calls: Arc<Mutex<Vec<usize>>>,
+}
+
+impl FakeEmbedder {
+    fn new(dimension: usize) -> Self {
+        Self { dimension, table: Arc::new(Mutex::new(BTreeMap::new())), calls: Arc::new(Mutex::new(Vec::new())) }
+    }
+    fn with_table(dimension: usize, entries: &[(&str, Vec<f32>)]) -> Self {
+        let embedder = Self::new(dimension);
+        {
+            let mut table = embedder.table.lock().unwrap();
+            for (text, vector) in entries { table.insert((*text).to_string(), vector.clone()); }
+        }
+        embedder
+    }
+    fn lengths(&self) -> Arc<Mutex<Vec<usize>>> { self.calls.clone() }
+}
+
+impl Embedder for FakeEmbedder {
+    fn embed(&mut self, texts: &[String]) -> std::result::Result<Vec<Vec<f32>>, EmbedCallbackError> {
+        self.calls.lock().unwrap().push(texts.len());
+        if texts.iter().any(|text| text.contains("触发降级")) { return Err(attempt_error()); }
+        let table = self.table.lock().unwrap();
+        Ok(texts.iter().map(|text| table.get(text).cloned().unwrap_or_else(|| fallback_vector(text, self.dimension))).collect())
+    }
+}
+
+/// 注册空间与它的假嵌入回调。
+fn space(kb: &KnowledgeBase, id: &str, dimension: usize) {
+    kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension, text_version: 1, encoding: "f32".into() }).unwrap();
+    kb.embeddings().register_embedder(id, FakeEmbedder::new(dimension)).unwrap();
+}
+fn vector_query(space_id: &str, query: &str, kinds: Vec<RecordKind>) -> SearchRequest {
+    SearchRequest { query: query.into(), kinds, embed_space: Some(space_id.into()), text: false, ..Default::default() }
 }
 
 #[test]
@@ -55,62 +104,306 @@ fn transactions_scopes_pagination_and_persistence() {
 }
 
 #[test]
-fn vectors_are_atomic_stale_safe_and_filtered_before_top_k() {
+fn registration_binds_validates_and_unbinds() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
-    space(&kb);
-    for _ in 0..110 { kb.memories().upsert(memory("private target", "private")).unwrap(); }
-    let visible_id = kb.memories().upsert(memory("public target", "public")).unwrap().value.header.id;
-    let inputs = pending(&kb, ReadFilter::default()); let visible = &inputs[0];
-    let write = EmbeddingWrite { key: visible.key, fingerprint: visible.fingerprint.clone(), values: vec![1.0, 1.0] };
-    assert!(matches!(kb.embeddings().put("test", &[EmbeddingWrite { values: vec![0.0,0.0], ..write.clone() }]), Err(Error::InvalidVector(_))));
-    assert!(kb.embeddings().put("test", &[write.clone(), EmbeddingWrite { values: vec![f32::NAN,1.0], ..write.clone() }]).is_err());
-    assert_eq!(pending(&kb, ReadFilter::default()).len(), 1);
-    let mut writes = vec![write.clone()];
-    let private = kb.embeddings().pending("test", &PageRequest { filter: ReadFilter { scopes: vec!["private".into()], ..Default::default() }, limit: 200, ..Default::default() }, &[]).unwrap();
-    writes.extend(private.items.into_iter().map(|i| EmbeddingWrite { key:i.key, fingerprint:i.fingerprint, values:vec![1.0,0.0] }));
-    kb.embeddings().put("test", &writes).unwrap();
-    let req = SearchRequest { query: "target".into(), limit:1, candidate_limit:Some(1), vectors: vec![QueryVector { space_id:"test".into(), values:vec![1.0,0.0], weight:1.0,min_score:None }], ..Default::default() };
-    let hits = kb.search(&req).unwrap().hits;
-    assert_eq!(hits.len(),1); assert_eq!(hits[0].key.id, visible_id);
-    assert!(hits[0].text_score.is_some()); assert!((hits[0].score-2.0/61.0).abs()<1e-9);
-    let mut changed = memory("changed", "public"); changed.record.id = Some(visible_id);
-    kb.memories().upsert(changed).unwrap();
-    assert!(matches!(kb.embeddings().put("test", &[write]), Err(Error::StaleRevision(_))));
-    let vector_only = SearchRequest {query:String::new(), ..req};
-    assert!(kb.search(&vector_only).unwrap().hits.is_empty());
-    assert_eq!(pending(&kb, ReadFilter::default()).len(),1);
-    assert!(matches!(kb.embeddings().register_space(EmbeddingSpace { id:"test".into(),model:"different".into(),dimension:2,text_version:1,encoding:"f32".into() }), Err(Error::Conflict(_))));
+    let embeddings = kb.embeddings();
+    // 空间没登记过就绑定回调：配置错误，直接报 not_found。
+    assert!(matches!(embeddings.register_embedder("ghost", FakeEmbedder::new(2)), Err(Error::NotFound(_))));
+    embeddings.register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
+    // 回调绑错空间：注册即校验，维度对不上直接拒绝，并报出实际维度。
+    let wrong = embeddings.register_embedder("v", FakeEmbedder::new(3)).unwrap_err();
+    assert!(matches!(wrong, Error::InvalidVector(_)), "{wrong}");
+    assert!(wrong.to_string().contains("expected dimension 4"), "{wrong}");
+    assert!(!kb.health().unwrap().embedder_spaces.contains(&"v".to_string()));
+    // 条数不符、非有限值、零范数同样拒绝。
+    assert!(embeddings.register_embedder("v", |texts: &[String]| Ok(vec![vec![1.0f32, 0.0, 0.0, 0.0]; texts.len() - 1])).is_err());
+    assert!(embeddings.register_embedder("v", |texts: &[String]| Ok(vec![vec![f32::NAN; 4]; texts.len()])).is_err());
+    assert!(embeddings.register_embedder("v", |texts: &[String]| Ok(vec![vec![0.0f32; 4]; texts.len()])).is_err());
+    // 合格的回调绑定成功，且可被读出与注销。
+    embeddings.register_embedder("v", FakeEmbedder::new(4)).unwrap();
+    assert_eq!(embeddings.embedder_space("v").unwrap().unwrap().dimension, 4);
+    assert_eq!(kb.health().unwrap().embedder_spaces, vec!["v".to_string()]);
+    assert!(embeddings.unregister_embedder("v").unwrap());
+    assert!(!embeddings.unregister_embedder("v").unwrap());
+    assert!(kb.health().unwrap().embedder_spaces.is_empty());
+    assert!(embeddings.embedder_space("ghost").unwrap().is_none());
 }
 
 #[test]
-fn vector_partitions_are_isolated_by_scope_and_cached_per_scope() {
-    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb);
+fn sync_fills_missing_vectors_incrementally_and_aborts_on_failure() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for i in 0..5 { kb.memories().upsert(memory(&format!("待向量化 {i}"), "public")).unwrap(); }
+    kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
+    // 没有注册回调时 sync 是配置错误。
+    assert!(matches!(kb.embeddings().sync("v", 4), Err(Error::Validation(_))));
+    let embedder = FakeEmbedder::new(4);
+    let lengths = embedder.lengths();
+    kb.embeddings().register_embedder_with("v", embedder, EmbedderOptions { max_batch: 4, max_tokens_per_text: None }).unwrap();
+    let report = kb.embeddings().sync("v", 32).unwrap().value;
+    assert_eq!((report.scanned, report.written, report.batches), (5, 5, 2));
+    assert!(report.interrupted.is_none());
+    assert!(lengths.lock().unwrap().iter().all(|length| *length <= 4), "每批不得超过声明的 max_batch");
+    // 已补齐再 sync：增量为零，回调不再被调用。
+    let calls_after_fill = lengths.lock().unwrap().len();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0);
+    assert_eq!(lengths.lock().unwrap().len(), calls_after_fill);
+    // 检索只给搜索词：库自己嵌入查询词。
+    let hits = kb.search(&vector_query("v", "待向量化 1", vec![RecordKind::Memory])).unwrap();
+    assert!(hits.diagnostics.vector_used && !hits.diagnostics.text_used, "向量路自行嵌入查询词");
+    assert!(hits.hits.iter().any(|hit| hit.record["judgment"] == json!("待向量化 1")), "查询词命中它对应的记录");
+}
+
+#[test]
+fn sync_stops_after_the_first_failing_batch() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
+    // 先把记录留下待补（此刻还没回调），再注册；这样 sync 才能逐批推进并卡在第二批。
+    kb.memories().upsert(memory("第一批 甲", "public")).unwrap();
+    kb.memories().upsert(memory("第一批 乙", "public")).unwrap();
+    kb.memories().upsert(memory("第二批 丙", "public")).unwrap();
+    // 样本能过、真实语料会挂：注册成功，但 sync 到第二批中断。
+    kb.embeddings().register_embedder_with("v", |texts: &[String]| {
+        if texts.iter().any(|text| text.contains("第二批")) { return Err(attempt_error()); }
+        Ok(texts.iter().map(|text| fallback_vector(text, 4)).collect())
+    }, EmbedderOptions { max_batch: 2, max_tokens_per_text: None }).unwrap();
+    let report = kb.embeddings().sync("v", 2).unwrap().value;
+    // 第一批已入库，第二批未入库：中断不影响已完成的部分。
+    assert_eq!(report.written, 2);
+    assert!(report.interrupted.is_some());
+    let mut requests = vector_query("v", "甲", vec![RecordKind::Memory]);
+    requests.limit = 10;
+    assert_eq!(kb.search(&requests).unwrap().hits.len(), 2, "只应有第一批的向量");
+}
+
+#[test]
+fn writes_vectorize_in_place_and_notes_stay_out_by_default() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 4);
+    let mut tagged = memory("记住她喜欢苹果", "public");
+    tagged.record.tags = vec!["偏好".into()];
+    let id = kb.memories().upsert(tagged).unwrap().value.header.id;
+    // 写入即向量化：不需要宿主调 sync，直接就能被向量路命中。
+    let hits = kb.search(&vector_query("v", "记住她喜欢苹果", vec![RecordKind::Memory])).unwrap().hits;
+    assert_eq!(hits[0].key.id, id);
+    // tags 进该记录的向量文本：换一个只出现在 tags 里的词也能召回。
+    let by_tag = kb.search(&SearchRequest { text: false, embed_space: Some("v".into()),
+        kinds: vec![RecordKind::Memory], ..SearchRequest { query: "偏好".into(), ..Default::default() } }).unwrap().hits;
+    assert_eq!(by_tag[0].key.id, id);
+    // 笔记与切片默认不进向量：向量路看不到，全文路仍能看到。
+    let note = kb.notes().upsert(NoteInput::new("docs/a.md", "笔记正文里的独有措辞")).unwrap().value;
+    let vector_hits = kb.search(&vector_query("v", "笔记正文里的独有措辞", vec![RecordKind::Note, RecordKind::Chunk])).unwrap().hits;
+    assert!(vector_hits.is_empty(), "笔记默认不应生成向量");
+    let text_hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Note, RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert!(text_hits.iter().any(|hit| hit.record["source"] == json!("docs/a.md")));
+    assert_eq!(note.chunk_count, 1);
+}
+
+#[test]
+fn namespace_switch_disables_vectorization_and_degrades() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 4);
+    let mut other = memory("另一个知识域的内容", "public"); other.record.namespace = "other".into();
+    let other_id = kb.memories().upsert(other).unwrap().value.header.id;
+    // 另一个 namespace 先关掉向量化，再写入：不生成向量，但全文照常命中。
+    kb.embeddings().set_namespace_vectorization("other", false).unwrap();
+    let mut muted = memory("被关闭向量化的内容", "public"); muted.record.namespace = "other".into();
+    kb.memories().upsert(muted).unwrap();
+    let request = SearchRequest { query: "被关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
+        embed_space: Some("v".into()), ..Default::default() };
+    let result = kb.search(&request).unwrap();
+    assert!(result.diagnostics.degraded.contains(&Degrade::NamespaceDisabled));
+    assert_eq!(result.hits.len(), 1, "关掉向量化之后全文路仍然给结果");
+    // 同库另一 namespace 不受影响。
+    let default_scope = SearchRequest { query: "被关闭".into(),
+        filter: ReadFilter { namespace: "default".into(), ..Default::default() }, embed_space: Some("v".into()), ..Default::default() };
+    assert!(kb.search(&default_scope).unwrap().hits.is_empty());
+    let mut restored = SearchRequest { ..default_scope };
+    restored.filter = ReadFilter { namespace: "other".into(), ..Default::default() };
+    kb.embeddings().set_namespace_vectorization("other", true).unwrap();
+    assert!(kb.embeddings().namespace_vectorization("other").unwrap());
+    assert_eq!(kb.embeddings().namespace_vectorization("default").unwrap(), true);
+    assert_eq!(kb.memories().get(other_id, &ReadFilter { namespace: "other".into(), ..Default::default() }).unwrap().judgment, "另一个知识域的内容");
+}
+
+#[test]
+fn callback_failures_still_commit_and_degrade_to_text() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
+    kb.embeddings().register_embedder("v", FakeEmbedder::new(4)).unwrap();
+    // 写入侧：回调挂掉，记录照常写入，向量留待补齐，不抛错。
+    let id = kb.memories().upsert(memory("触发降级的记忆", "public")).unwrap().value.header.id;
+    assert!(kb.health().unwrap().last_degraded.contains(&Degrade::EmbedFailed));
+    // 检索侧：查询词嵌入失败就退纯全文，不报错、不返回空。
+    let result = kb.search(&SearchRequest { query: "触发降级".into(), embed_space: Some("v".into()), ..Default::default() }).unwrap();
+    assert!(result.diagnostics.degraded.contains(&Degrade::EmbedFailed));
+    assert!(!result.diagnostics.vector_used);
+    assert_eq!(result.hits[0].key.id, id);
+    // 目标空间没有登记过是配置错误；登记过但没绑回调才降级。
+    assert!(matches!(kb.search(&SearchRequest { query: "任意".into(), embed_space: Some("ghost".into()), ..Default::default() }), Err(Error::NotFound(_))));
+    kb.embeddings().unregister_embedder("v").unwrap();
+    let degraded = kb.search(&SearchRequest { query: "触发降级".into(), embed_space: Some("v".into()), ..Default::default() }).unwrap();
+    assert!(degraded.diagnostics.degraded.contains(&Degrade::NoEmbedder));
+    assert_eq!(degraded.hits.len(), 1);
+}
+
+#[test]
+fn search_parameters_control_paths_and_totals() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 4);
+    for i in 0..3 { kb.memories().upsert(memory(&format!("参数 目标 {i}"), "public")).unwrap(); }
+    kb.memories().upsert(memory("无关内容", "public")).unwrap();
+    let kinds = vec![RecordKind::Memory];
+
+    let both = kb.search(&SearchRequest { query: "参数 目标".into(), kinds: kinds.clone(), limit: 3, embed_space: Some("v".into()), ..Default::default() }).unwrap();
+    assert!(both.diagnostics.text_used && both.diagnostics.vector_used);
+    assert_eq!(both.hits.len(), 3);
+    assert_eq!(both.total, None);
+
+    // 纯全文、不重排。
+    let text_only = kb.search(&SearchRequest { query: "参数 目标".into(), kinds: kinds.clone(), limit: 3, vector: false, ..Default::default() }).unwrap();
+    assert!(text_only.diagnostics.text_used && !text_only.diagnostics.vector_used);
+    assert_eq!(text_only.hits.len(), 3);
+    assert!(text_only.hits.iter().all(|hit| hit.rerank_score.is_none()));
+
+    // 纯向量。
+    let mut vector_only_request = vector_query("v", "参数 目标", kinds.clone());
+    vector_only_request.limit = 3;
+    let vector_only = kb.search(&vector_only_request).unwrap();
+    assert!(!vector_only.diagnostics.text_used && vector_only.diagnostics.vector_used);
+    assert_eq!(vector_only.hits.len(), 3);
+
+    // 两条路都关掉：无路可走。
+    assert!(kb.search(&SearchRequest { query: "参数".into(), text: false, vector: false, ..Default::default() }).is_err());
+    // 走向量路却没给目标空间：向量路自动让位，退纯全文，不算错误。
+    let no_space = kb.search(&SearchRequest { query: "参数 目标".into(), kinds: kinds.clone(), ..Default::default() }).unwrap();
+    assert!(no_space.diagnostics.text_used && !no_space.diagnostics.vector_used);
+    // 没有搜索词一律拒绝：宿主给的是词，不是向量。
+    assert!(kb.search(&SearchRequest { query: "  ".into(), ..Default::default() }).is_err());
+
+    // 总量是过滤之后、截断之前的匹配数：库里 4 条记忆，取 1 条命中但总量仍为 4。
+    let counted = kb.search(&SearchRequest { query: "参数 目标".into(), kinds: kinds.clone(), limit: 1, with_total: true, ..Default::default() }).unwrap();
+    assert_eq!(counted.hits.len(), 1);
+    assert_eq!(counted.total, Some(4));
+    let page = kb.memories().list(&PageRequest { filter: ReadFilter { tags: vec![], ..Default::default() }, limit: 100, ..Default::default() }).unwrap();
+    assert_eq!(page.items.len(), 4, "总量与同条件分页计数一致");
+}
+
+#[test]
+fn reranker_reorders_candidates_and_enforces_length_limits() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for tag in ["甲", "乙", "丙", "丁", "戊"] { kb.memories().upsert(memory(&format!("重排目标 {tag}"), "public")).unwrap(); }
+    let request = SearchRequest { query: "重排目标".into(), limit: 5, kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
+    let baseline: Vec<i64> = kb.search(&request).unwrap().hits.iter().map(|hit| hit.key.id).collect();
+    assert_eq!(baseline.len(), 5);
+
+    // 定长约束：候选按 RRF 顺序截到 max_docs，文档按 token 预算截断。
+    let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    kb.register_reranker_with(move |_: &str, documents: &[String]| {
+        recorder.lock().unwrap().push((documents.len(), documents.iter().map(|d| d.chars().count()).max().unwrap_or(0)));
+        // 故意倒序给分：最后一个候选拿最高分。
+        Ok((0..documents.len()).map(|i| i as f32).collect())
+    }, RerankerOptions { max_docs: 2, max_tokens_per_doc: 6, max_tokens_query: None }).unwrap();
+    // 注册校验已经调用过回调一次，清掉只留检索那次。
+    seen.lock().unwrap().clear();
+    let reranked = kb.search(&SearchRequest { rerank: true, ..request.clone() }).unwrap();
+    assert!(reranked.diagnostics.reranked);
+    assert_eq!(reranked.diagnostics.rerank_candidates, 2);
+    assert_eq!(reranked.diagnostics.rerank_truncated, 3);
+    assert_eq!(reranked.hits[0].key.id, baseline[1], "倒序给分后原来的第二名排到最前");
+    assert!(reranked.hits.iter().all(|hit| hit.rerank_score.is_some()));
+    assert_eq!(*seen.lock().unwrap(), vec![(2, 3)], "回调实收 2 条候选、每条按 6 token 预算截断");
+
+    // 注销之后 rerank 开关被忽略，结果与不重排一致。
+    assert!(kb.unregister_reranker());
+    let ignored = kb.search(&SearchRequest { rerank: true, ..request.clone() }).unwrap();
+    assert!(!ignored.diagnostics.reranked);
+    assert_eq!(ignored.hits.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), baseline);
+}
+
+#[test]
+fn reranker_registration_validates_and_failures_degrade() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for i in 0..3 { kb.memories().upsert(memory(&format!("降级目标 {i}"), "public")).unwrap(); }
+    // 返回条数与输入不符、分数非有限值都拒绝绑定。
+    assert!(kb.register_reranker(|_: &str, _: &[String]| Ok(vec![1.0f32])).is_err());
+    assert!(kb.register_reranker(|_: &str, documents: &[String]| Ok(vec![f32::NAN; documents.len()])).is_err());
+    assert!(!kb.reranker_registered());
+    kb.register_reranker(|_: &str, _: &[String]| Err("重排服务不可用".to_string())).unwrap();
+    assert!(kb.reranker_registered());
+    let request = SearchRequest { query: "降级目标".into(), kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
+    let result = kb.search(&request).unwrap();
+    assert!(!result.diagnostics.reranked);
+    assert!(result.diagnostics.degraded.contains(&Degrade::RerankFailed));
+    assert_eq!(result.hits.len(), 3, "重排挂了也要给结果，只是按融合分排序");
+}
+
+#[test]
+fn oversized_batches_shrink_to_fit() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
+    for i in 0..8 { kb.memories().upsert(memory(&format!("批次 {i}"), "public")).unwrap(); }
+    let lengths: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = lengths.clone();
+    // 声明 8 条，但真实模型只吃 4 条：库应当自己减半并沿用。
+    kb.embeddings().register_embedder_with("v", move |texts: &[String]| {
+        recorder.lock().unwrap().push(texts.len());
+        if texts.len() > 4 { return Err(EmbedCallbackError::too_large("at most 4")); }
+        Ok(texts.iter().map(|text| fallback_vector(text, 4)).collect())
+    }, EmbedderOptions { max_batch: 8, max_tokens_per_text: None }).unwrap();
+    let report = kb.embeddings().sync("v", 32).unwrap().value;
+    assert_eq!(report.written, 8);
+    let calls = lengths.lock().unwrap().clone();
+    assert_eq!(&calls[calls.len() - 2..], &[4, 4], "减半后沿用 4，不再从 8 重试");
+}
+
+#[test]
+fn swapping_models_keeps_the_old_space_usable() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for i in 0..3 { kb.memories().upsert(memory(&format!("换模型 {i}"), "public")).unwrap(); }
+    space(&kb, "old", 4);
+    kb.embeddings().sync("old", 32).unwrap();
+    // 换模型：新建空间 + 新回调 + sync；旧空间不动，退回只是检索改回旧空间。
+    kb.embeddings().register_space(EmbeddingSpace { id: "new".into(), model: "fixture/v2".into(), dimension: 8, text_version: 1, encoding: "sq8".into() }).unwrap();
+    kb.embeddings().register_embedder("new", FakeEmbedder::new(8)).unwrap();
+    assert_eq!(kb.embeddings().sync("new", 32).unwrap().value.written, 3);
+    let kinds = vec![RecordKind::Memory];
+    let old_hits = kb.search(&vector_query("old", "换模型 1", kinds.clone())).unwrap().hits;
+    let new_hits = kb.search(&vector_query("new", "换模型 1", kinds.clone())).unwrap().hits;
+    assert_eq!(old_hits.len(), 3); assert_eq!(new_hits.len(), 3);
+    assert_eq!(old_hits[0].key.id, new_hits[0].key.id);
+    let mut request = vector_query("new", "换模型 1", kinds);
+    request.limit = 10;
+    let mut ids: Vec<i64> = kb.search(&request).unwrap().hits.iter().map(|hit| hit.key.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+    // 空间不可变：同 id 改模型直接冲突，旧向量永远对得上旧模型。
+    assert!(kb.embeddings().register_space(EmbeddingSpace { id: "old".into(), model: "fixture/v9".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).is_err());
+}
+
+#[test]
+fn vector_partitions_are_isolated_by_scope() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    // 两个 scope 各写一条方向不同的向量，用分数判断命中的是哪个分区。
+    // 记忆的向量文本是「论断\n标签」，所以表按这个形状给。
+    kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 2, text_version: 1, encoding: "f32".into() }).unwrap();
+    kb.embeddings().register_embedder("v", FakeEmbedder::with_table(2, &[
+        ("public vector\n", vec![1.0, 0.0]),
+        ("private vector\n", vec![0.0, 1.0]),
+        ("probe", vec![1.0, 0.0]),
+    ])).unwrap();
     let public_id = kb.memories().upsert(memory("public vector", "public")).unwrap().value.header.id;
     let private_id = kb.memories().upsert(memory("private vector", "private")).unwrap().value.header.id;
-    // 两个 scope 各写一条方向不同的向量，用分数就能判断命中的是哪个分区。
-    for (scope, values) in [("public", vec![1.0, 0.0]), ("private", vec![0.0, 1.0])] {
-        let filter = ReadFilter { scopes: vec![scope.into()], ..Default::default() };
-        let inputs = pending(&kb, filter);
-        assert_eq!(inputs.len(), 1);
-        kb.embeddings().put("test", &inputs.iter().map(|v| EmbeddingWrite { key: v.key, fingerprint: v.fingerprint.clone(), values: values.clone() }).collect::<Vec<_>>()).unwrap();
-    }
     let query = |scope: &str| SearchRequest {
-        query: String::new(),
+        query: "probe".into(), text: false, embed_space: Some("v".into()),
         filter: ReadFilter { scopes: vec![scope.into()], ..Default::default() },
-        vectors: vec![QueryVector { space_id: "test".into(), values: vec![1.0, 0.0], weight: 1.0, min_score: Some(0.5) }],
         ..Default::default()
     };
     let public = kb.search(&query("public")).unwrap().hits;
     assert_eq!(public.len(), 1); assert_eq!(public[0].key.id, public_id);
-    // 不限分数时 private 查询只能看到 private 分区的向量，public 的不能串进来。
-    let mut all_scores = query("private");
-    all_scores.vectors[0].min_score = None;
-    let private = kb.search(&all_scores).unwrap().hits;
-    assert!(private.iter().all(|h| h.key.id == private_id), "public 分区的向量混进了 private 查询");
-    let mut flipped = query("private");
-    flipped.vectors[0].values = vec![0.0, 1.0];
-    let private = kb.search(&flipped).unwrap().hits;
-    assert_eq!(private.len(), 1); assert_eq!(private[0].key.id, private_id);
+    // private 查询只能看到 private 分区，public 的向量不能串进来。
+    let private = kb.search(&query("private")).unwrap().hits;
+    assert!(private.iter().all(|hit| hit.key.id == private_id), "public 分区的向量混进了 private 查询");
     // 空分区（无任何向量的 scope）按空结果缓存，不应报错，也不该回退到别的分区。
     assert!(kb.search(&query("empty")).unwrap().hits.is_empty());
 }
@@ -118,30 +411,18 @@ fn vector_partitions_are_isolated_by_scope_and_cached_per_scope() {
 #[test]
 fn packed_and_precise_spaces_rank_the_same_vectors_together() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for i in 0..8 { kb.memories().upsert(memory(&format!("记录{i}"), "public")).unwrap(); }
     for (id, encoding) in [("precise", "f32"), ("packed", "sq8")] {
         kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension: 8, text_version: 1, encoding: encoding.into() }).unwrap();
+        kb.embeddings().register_embedder(id, FakeEmbedder::new(8)).unwrap();
+        assert_eq!(kb.embeddings().sync(id, 50).unwrap().value.written, 8);
     }
-    for i in 0..8 { kb.memories().upsert(memory(&format!("记录{i}"), "public")).unwrap(); }
-    let vector = |i: usize| (0..8).map(|d| ((i as f32) * 0.7 + (d as f32) * 0.3).sin() + i as f32 * 0.2).collect::<Vec<f32>>();
-    for space in ["precise", "packed"] {
-        let inputs = kb.embeddings().pending(space, &PageRequest { limit: 50, ..Default::default() }, &[]).unwrap().items;
-        assert_eq!(inputs.len(), 8);
-        let writes: Vec<_> = inputs.iter().enumerate()
-            .map(|(i, v)| EmbeddingWrite { key: v.key, fingerprint: v.fingerprint.clone(), values: vector(i) })
-            .collect();
-        kb.embeddings().put(space, &writes).unwrap();
-    }
-    // 查询取第 3 条的向量，两个空间用的向量完全相同，只有打分路径不同。
-    let request = |space: &str| SearchRequest {
-        query: String::new(),
-        vectors: vec![QueryVector { space_id: space.into(), values: vector(3), weight: 1.0, min_score: None }],
-        limit: 8,
-        ..Default::default()
-    };
-    let precise = kb.search(&request("precise")).unwrap().hits;
-    let packed = kb.search(&request("packed")).unwrap().hits;
+    let kinds = vec![RecordKind::Memory];
+    let precise = kb.search(&vector_query("precise", "记录3", kinds.clone())).unwrap().hits;
+    let packed = kb.search(&vector_query("packed", "记录3", kinds)).unwrap().hits;
     let precise_ids: Vec<i64> = precise.iter().map(|h| h.key.id).collect();
     let packed_ids: Vec<i64> = packed.iter().map(|h| h.key.id).collect();
+    assert_eq!(precise_ids.len(), 8);
     assert_eq!(precise_ids, packed_ids, "sq8 空间的名次应与 f32 空间一致");
     // 分数只允许有量化误差量级的偏差：库侧与查询侧各量化一次，8 维下步长约百分之一。
     for (a, b) in precise.iter().zip(packed.iter()) {
@@ -232,7 +513,7 @@ fn concurrent_readers_are_not_blocked_by_a_writer() {
 
 #[test]
 fn graph_integrity_aliases_and_rename_propagation() {
-    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb);
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
     let mut alice = entity("Alice"); alice.aliases = vec!["小艾".into()];
     let mut bob = entity("Bob"); bob.aliases = vec!["小艾".into()];
     let entities = kb.graph().apply_batch(&GraphBatch { entities: vec![alice, bob], ..Default::default() }).unwrap().value.entities;
@@ -244,12 +525,13 @@ fn graph_integrity_aliases_and_rename_propagation() {
     assert_eq!(kb.graph().neighbors(a, &ReadFilter::default(), 10).unwrap().entities[0].name, "Bob");
     assert_eq!(kb.graph().events_for_entity(a, &ReadFilter::default(), 10).unwrap().len(), 1);
     assert!(matches!(kb.graph().delete(RecordKind::Entity, a, &ReadFilter::default()), Err(Error::Conflict(_))));
-    let inputs = pending(&kb, ReadFilter::default());
-    kb.embeddings().put("test", &inputs.iter().map(|v| EmbeddingWrite { key:v.key, fingerprint:v.fingerprint.clone(), values:vec![1.0,0.0] }).collect::<Vec<_>>()).unwrap();
+    // 改名会改写引用它的关系与事件正文，这些记录必须重新生成向量（旧向量已随指纹作废）。
     let mut renamed = entity("Carol"); renamed.record.id = Some(a);
     kb.graph().apply_batch(&GraphBatch { entities: vec![renamed], ..Default::default() }).unwrap();
-    let kinds: Vec<_> = pending(&kb, ReadFilter::default()).into_iter().map(|v|v.key).collect();
-    assert_eq!(kinds.len(), 3);
+    let mut request = vector_query("v", "Carol", vec![RecordKind::Relation, RecordKind::Event]);
+    request.limit = 10;
+    let hits = kb.search(&request).unwrap().hits;
+    assert_eq!(hits.len(), 2, "关系与事件在改名后应当带着新向量回到向量路");
     let search = SearchRequest {query:"Carol".into(),kinds:vec![RecordKind::Relation,RecordKind::Event],..Default::default()};
     assert_eq!(kb.search(&search).unwrap().hits.len(), 2);
     let bad = RelationInput { object_id: 9_999_999, ..relation };
@@ -258,7 +540,7 @@ fn graph_integrity_aliases_and_rename_propagation() {
 
 #[test]
 fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
-    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb);
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     let input = NoteInput::new("docs/tea.md", "# 茶\n\n上海喝茶\n\n```rust\nlet x = 1;\n```\n\n最后一段");
     let note = kb.notes().upsert(input).unwrap().value;
     let note_id = note.header.id;
@@ -298,13 +580,17 @@ fn explicit_lifecycle_has_no_hidden_deletion() {
 #[test]
 fn backup_restore_and_derived_index_recovery() {
     let root=tempfile::tempdir().unwrap();let data=root.path().join("data");let kb=KnowledgeBase::open(&data).unwrap();
-    kb.memories().upsert(memory("recoverable","public")).unwrap();space(&kb);
-    let i=pending(&kb,ReadFilter::default()).remove(0);kb.embeddings().put("test",&[EmbeddingWrite {key:i.key,fingerprint:i.fingerprint,values:vec![1.0,0.0]}]).unwrap();
+    kb.memories().upsert(memory("recoverable","public")).unwrap();space(&kb,"v",2);
+    let vector_id = kb.memories().upsert(memory("带向量的记录","public")).unwrap().value.header.id;
+    assert_eq!(kb.search(&vector_query("v", "带向量的记录", vec![RecordKind::Memory])).unwrap().hits[0].key.id, vector_id);
     let backup=root.path().join("backup.sqlite3");kb.backup(&backup).unwrap();assert!(kb.backup(&backup).is_err());kb.close().unwrap();
     std::fs::write(data.join("text-v2/meta.json"),b"broken index metadata").unwrap();
     let reopened=KnowledgeBase::open(&data).unwrap();assert_eq!(reopened.search(&SearchRequest {query:"recoverable".into(),..Default::default()}).unwrap().hits.len(),1);
     let restored=KnowledgeBase::restore(&backup,root.path().join("restored")).unwrap();
-    assert!(pending(&restored,ReadFilter::default()).is_empty());assert_eq!(restored.health().unwrap().record_count,1);
+    assert_eq!(restored.health().unwrap().record_count,2);
+    // 快照里带着 embeddings：恢复后重新注册同一回调，向量路立刻可用。
+    space(&restored,"v",2);
+    assert_eq!(restored.search(&vector_query("v", "带向量的记录", vec![RecordKind::Memory])).unwrap().hits[0].key.id, vector_id);
     assert!(KnowledgeBase::restore(&backup,&data).is_err());
     assert_eq!(json!(restored.health().unwrap())["sqlite_integrity"],"ok");
 }
@@ -342,13 +628,13 @@ fn sq8_encoding_roundtrips_through_storage() {
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.embeddings().register_space(EmbeddingSpace { id: "q".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "sq8".into() }).unwrap();
     assert!(kb.embeddings().register_space(EmbeddingSpace { id: "bad".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "q4".into() }).is_err());
-    let id = kb.memories().upsert(memory("quantized target", "public")).unwrap().value.header.id;
-    let inputs = kb.embeddings().pending("q", &PageRequest::default(), &[]).unwrap().items;
-    assert_eq!(inputs.len(), 1);
     // 归一化后 [0.6, 0.8, 0, 0]；sq8 往返后仍应被同一查询命中。
-    kb.embeddings().put("q", &[EmbeddingWrite { key: inputs[0].key, fingerprint: inputs[0].fingerprint.clone(), values: vec![3.0, 4.0, 0.0, 0.0] }]).unwrap();
-    let req = SearchRequest { query: String::new(), vectors: vec![QueryVector { space_id: "q".into(), values: vec![0.6, 0.8, 0.0, 0.0], weight: 1.0, min_score: None }], ..Default::default() };
-    let hits = kb.search(&req).unwrap().hits;
+    kb.embeddings().register_embedder("q", FakeEmbedder::with_table(4, &[
+        ("quantized target\n", vec![3.0, 4.0, 0.0, 0.0]),
+        ("probe", vec![0.6, 0.8, 0.0, 0.0]),
+    ])).unwrap();
+    let id = kb.memories().upsert(memory("quantized target", "public")).unwrap().value.header.id;
+    let hits = kb.search(&vector_query("q", "probe", vec![RecordKind::Memory])).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
     assert!((hits[0].score - 1.0 / 61.0).abs() < 1e-9);
@@ -358,7 +644,7 @@ fn sq8_encoding_roundtrips_through_storage() {
 fn graph_prune_limits_vector_scoring_to_neighborhood() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
-    space(&kb);
+    space(&kb, "v", 2);
     let ents = kb
         .graph()
         .apply_batch(&GraphBatch { entities: vec![entity("A"), entity("B"), entity("C")], ..Default::default() })
@@ -371,18 +657,12 @@ fn graph_prune_limits_vector_scoring_to_neighborhood() {
         .apply_batch(&GraphBatch { relations: vec![RelationInput { record: RecordInput::default(), subject_id: a, predicate: "knows".into(), object_id: b, confidence: 1.0, reason: String::new() }], ..Default::default() })
         .unwrap();
     // 三个实体写同一向量：全量检索会命中 3 条
-    let inputs = pending(&kb, ReadFilter::default());
-    kb.embeddings().put("test", &inputs.iter().map(|i| EmbeddingWrite { key: i.key, fingerprint: i.fingerprint.clone(), values: vec![1.0, 0.0] }).collect::<Vec<_>>()).unwrap();
-
-    let base = SearchRequest {
-        query: String::new(), kinds: vec![RecordKind::Entity], limit: 10,
-        vectors: vec![QueryVector { space_id: "test".into(), values: vec![1.0, 0.0], weight: 1.0, min_score: None }],
-        ..Default::default()
-    };
-    assert_eq!(kb.search(&base).unwrap().hits.len(), 3);
+    let base = vector_query("v", "probe", vec![RecordKind::Entity]);
+    let mut wide = base.clone(); wide.limit = 10;
+    assert_eq!(kb.search(&wide).unwrap().hits.len(), 3);
 
     // 剪枝到 A 的 1 跳邻域：只剩 A（起点）与 B，孤立的 C 被排除
-    let pruned = SearchRequest { prune: Some(GraphPrune { root: a, depth: 1, limit: 64 }), ..base.clone() };
+    let pruned = SearchRequest { prune: Some(GraphPrune { root: a, depth: 1, limit: 64 }), limit: 10, ..base.clone() };
     let hits = kb.search(&pruned).unwrap().hits;
     let ids: Vec<i64> = hits.iter().map(|h| h.key.id).collect();
     assert_eq!(hits.len(), 2);

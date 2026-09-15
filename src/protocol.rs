@@ -48,8 +48,11 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "notes.get_chunk"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get_chunk(r.id,&r.filter)?)},
         "embeddings.register_space"=>encode(kb.embeddings().register_space(decode(args)?)?),
         "embeddings.spaces"=>encode(kb.embeddings().spaces()?),
-        "embeddings.pending"=>encode(kb.embeddings().pending(&field::<String>(&args,"space_id")?,&optional::<PageRequest>(&args,"page")?,&args.get("kinds").cloned().map(decode).transpose()?.unwrap_or_else(crate::search::default_kinds))?),
-        "embeddings.put"=>encode(kb.embeddings().put(&field::<String>(&args,"space_id")?,&field::<Vec<_>>(&args,"writes")?)?),
+        "embeddings.embedder_space"=>encode(kb.embeddings().embedder_space(&field::<String>(&args,"space_id")?)?),
+        "embeddings.sync"=>encode(kb.embeddings().sync(&field::<String>(&args,"space_id")?,field(&args,"batch")?)?),
+        "embeddings.unregister_embedder"=>encode(kb.embeddings().unregister_embedder(&field::<String>(&args,"space_id")?)?),
+        "embeddings.namespace_vectorization"=>encode(kb.embeddings().namespace_vectorization(&field::<String>(&args,"namespace")?)?),
+        "embeddings.set_namespace_vectorization"=>encode(kb.embeddings().set_namespace_vectorization(&field::<String>(&args,"namespace")?,field(&args,"enabled")?)?),
         "embeddings.delete_space"=>encode(kb.embeddings().delete_space(&field::<String>(&args,"id")?)?),
         _=>Err(Error::Validation(format!("unknown operation: {operation}"))),
     }

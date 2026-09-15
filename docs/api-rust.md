@@ -17,6 +17,10 @@ impl KnowledgeBase {
 
     fn search(&self, request: &SearchRequest) -> Result<SearchResult>;
     fn search_with_context(&self, request: &SearchRequest, limit: usize) -> Result<Vec<ContextualHit>>;
+    fn register_reranker<F: Reranker + 'static>(&self, reranker: F) -> Result<()>;
+    fn register_reranker_with<F: Reranker + 'static>(&self, reranker: F, options: RerankerOptions) -> Result<()>;
+    fn unregister_reranker(&self) -> bool;
+    fn reranker_registered(&self) -> bool;
     fn health(&self) -> Result<HealthReport>;
     fn rebuild_indexes(&self) -> Result<HealthReport>;
 
@@ -48,8 +52,13 @@ impl KnowledgeBase {
 
 ### 健康检查
 
-- `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、`pending_index_updates`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数。
+- `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、`pending_index_updates`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
 - `rebuild_indexes()` 强制重建全文索引并清空向量缓存，随后返回新的健康报告。
+
+### 注册模型回调
+
+- `register_reranker` / `register_reranker_with` 注册重排回调：进程内单例，不绑定向量空间。库在调用前按 `RerankerOptions` 强制截断候选与文本。注册时用样本真跑一遍校验产出条数与有限性；回调当场不可用时无从校验形状，允许绑定，可用性留到检索时降级。
+- 嵌入回调在 `EmbeddingStore` 上注册（见下）。
 
 ## MemoryStore
 
@@ -154,15 +163,22 @@ impl NoteStore {
 impl EmbeddingStore {
     fn register_space(&self, space: EmbeddingSpace) -> Result<WriteReceipt<EmbeddingSpace>>;
     fn spaces(&self) -> Result<Vec<EmbeddingSpace>>;
-    fn pending(&self, space_id: &str, page: &PageRequest, kinds: &[RecordKind]) -> Result<Page<EmbeddingInput>>;
-    fn put(&self, space_id: &str, writes: &[EmbeddingWrite]) -> Result<WriteReceipt<usize>>;
+    fn register_embedder<F: Embedder + 'static>(&self, space_id: &str, embedder: F) -> Result<()>;
+    fn register_embedder_with<F: Embedder + 'static>(&self, space_id: &str, embedder: F, options: EmbedderOptions) -> Result<()>;
+    fn unregister_embedder(&self, space_id: &str) -> Result<bool>;
+    fn embedder_space(&self, space_id: &str) -> Result<Option<EmbeddingSpace>>;
+    fn namespace_vectorization(&self, namespace: &str) -> Result<bool>;
+    fn set_namespace_vectorization(&self, namespace: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
+    fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>>;
     fn delete_space(&self, id: &str) -> Result<WriteReceipt<bool>>;
 }
 ```
 
 - 空间定义不可变；重复注册相同定义幂等。
-- `pending` 只返回**当前缺少有效向量**的记录（含因文本变化而过期的）。
-- `put` 是**原子批量**：任意一条维度不符、非有限值或指纹过期，整批不写入。
+- `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
+- `sync(space_id, batch)` 是**内部同步**：库拿该空间注册的回调，把缺失向量的记录分批补齐，宿主不参与向量计算。循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留。
+- 写入路径也是「写入即向量化」：`upsert` 一条记忆或笔记时，库在写入路径里补齐向量，拿不到回调就跳过留待下次补齐，不阻塞写入、不抛错。
+- `namespace_vectorization` / `set_namespace_vectorization` 控制某知识域是否启用向量化，落盘在 `meta` 表。
 
 ## 类型与常量
 
@@ -172,7 +188,7 @@ fn default_namespace() -> String;   // "default"
 fn public_scope() -> String;        // "public"
 ```
 
-`SearchRequest`、`SearchHit`、`SearchResult`、`ContextualHit`、`QueryVector`、`GraphPrune`、`DecayPolicy`、`FeedbackRequest`、`Page`/`PageRequest`/`ReadFilter` 等见 [data-model](data-model.md)；检索流程见 [search](search.md)。
+`SearchRequest`、`SearchHit`、`SearchResult`、`SearchDiagnostics`、`Degrade`、`ContextualHit`、`GraphPrune`、`EmbedderOptions`、`RerankerOptions`、`SyncReport`、`DecayPolicy`、`FeedbackRequest`、`Page`/`PageRequest`/`ReadFilter` 等见 [data-model](data-model.md)；检索流程见 [search](search.md)。
 
 ## 错误处理
 

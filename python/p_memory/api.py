@@ -9,9 +9,9 @@ from typing import Any
 
 from . import _native
 from .errors import ClosedError, ValidationError, from_native
-from .models import (EmbeddingSpace, EmbeddingWrite, EntityInput, EventInput,
-                     MemoryInput, NoteInput, Page, QueryVector, ReadFilter,
-                     RecordKind, RelationInput, SearchResult, WriteReceipt)
+from .models import (EmbeddingSpace, EntityInput, EventInput, MemoryInput,
+                     NoteInput, Page, ReadFilter, RecordKind, RelationInput,
+                     SearchResult, WriteReceipt)
 
 
 def _json(value: Any) -> str:
@@ -29,6 +29,10 @@ def _unwrap(encoded: str) -> Any:
 
 
 def _open_native(factory: Callable, *args: str):
+    return _native_call(factory, *args)
+
+
+def _native_call(factory: Callable, *args: Any) -> Any:
     try:
         return factory(*args)
     except RuntimeError as exc:
@@ -86,13 +90,28 @@ class KnowledgeBase:
 
     def search(self, query: str = "", *, filter: ReadFilter | None = None,
                kinds: Sequence[RecordKind] | None = None, limit: int = 10,
-               candidate_limit: int | None = None, vectors: Sequence[QueryVector] = (),
-               text_weight: float = 1.0) -> SearchResult:
+               candidate_limit: int | None = None, embed_space: str | None = None,
+               text: bool = True, vector: bool = True, rerank: bool = True,
+               with_total: bool = False, text_weight: float = 1.0) -> SearchResult:
+        """检索。向量能力由库内部完成：给出 `embed_space`，库用该空间注册的
+        回调嵌入查询词；宿主只给搜索词，不给向量。`text` / `vector` / `rerank`
+        / `with_total` 各自独立开关。"""
         payload = {"query": query, "filter": self._filter(filter), "limit": limit,
-                   "candidate_limit": candidate_limit, "vectors": list(vectors), "text_weight": text_weight}
+                   "candidate_limit": candidate_limit, "text_weight": text_weight,
+                   "text": text, "vector": vector, "rerank": rerank, "with_total": with_total}
+        if embed_space is not None:
+            payload["embed_space"] = embed_space
         if kinds is not None:
             payload["kinds"] = list(kinds)
         return self.invoke("search", payload)
+
+    def register_reranker(self, callback: Callable, *, max_docs: int = 64,
+                          max_tokens_per_doc: int = 1024,
+                          max_tokens_query: int | None = None) -> None:
+        """注册重排回调：`callback(query: str, documents: list[str]) -> list[float]`。
+        库在调用前按声明的定长约束强制截断。"""
+        _native_call(self._native.register_reranker, callback, max_docs,
+                     max_tokens_per_doc, max_tokens_query)
 
     def health(self) -> dict[str, Any]:
         return self.invoke("health")
@@ -219,18 +238,30 @@ class EmbeddingStore:
     def register_space(self, data: EmbeddingSpace | None = None, **fields: Any) -> WriteReceipt:
         return self._kb.invoke("embeddings.register_space", {"text_version": 1, "encoding": "sq8", **(data or {}), **fields})
 
+    def register_embedder(self, space_id: str, callback: Callable, *, max_batch: int = 32,
+                          max_tokens_per_text: int | None = None) -> None:
+        """注册嵌入回调：`callback(texts: list[str]) -> list[list[float]]`。
+        一个向量模型对应一个向量空间，注册即用样本校验，产出不符该空间契约就拒绝绑定。"""
+        _native_call(self._kb._native.register_embedder, space_id, callback, max_batch, max_tokens_per_text)
+
+    def unregister_embedder(self, space_id: str) -> bool:
+        return self._kb.invoke("embeddings.unregister_embedder", {"space_id": space_id})
+
+    def embedder_space(self, space_id: str) -> EmbeddingSpace | None:
+        return self._kb.invoke("embeddings.embedder_space", {"space_id": space_id})
+
     def spaces(self) -> list[EmbeddingSpace]:
         return self._kb.invoke("embeddings.spaces")
 
-    def pending(self, space_id: str, *, filter: ReadFilter | None = None, kinds: Sequence[RecordKind] | None = None,
-                limit: int = 50, after: str | None = None) -> Page:
-        payload = {"space_id": space_id, "page": {"filter": self._kb._filter(filter), "limit": limit, "after": after}}
-        if kinds is not None:
-            payload["kinds"] = list(kinds)
-        return self._kb.invoke("embeddings.pending", payload)
+    def namespace_vectorization(self, namespace: str) -> bool:
+        return self._kb.invoke("embeddings.namespace_vectorization", {"namespace": namespace})
 
-    def put(self, space_id: str, writes: Sequence[EmbeddingWrite]) -> WriteReceipt:
-        return self._kb.invoke("embeddings.put", {"space_id": space_id, "writes": list(writes)})
+    def set_namespace_vectorization(self, namespace: str, enabled: bool) -> WriteReceipt:
+        return self._kb.invoke("embeddings.set_namespace_vectorization", {"namespace": namespace, "enabled": enabled})
+
+    def sync(self, space_id: str, *, batch: int = 32) -> WriteReceipt:
+        """库拿该空间注册的回调，把缺失向量的记录分批补齐；宿主不参与向量计算。"""
+        return self._kb.invoke("embeddings.sync", {"space_id": space_id, "batch": batch})
 
     def delete_space(self, id: str) -> WriteReceipt:
         return self._kb.invoke("embeddings.delete_space", {"id": id})
@@ -300,6 +331,10 @@ class AsyncKnowledgeBase:
     async def health(self) -> dict:
         kb = await self._ensure_open()
         return await asyncio.to_thread(kb.health)
+
+    async def register_reranker(self, callback: Callable, **options: Any) -> None:
+        kb = await self._ensure_open()
+        await asyncio.to_thread(kb.register_reranker, callback, **options)
 
     async def invoke(self, operation: str, payload: Any = None) -> Any:
         kb = await self._ensure_open()
