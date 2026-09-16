@@ -137,10 +137,12 @@ def main() -> int:
                 ("笔记默认关闭向量化，但仍进全文召回", ["记忆"]),
             ]:
                 kb.memories.upsert_by_judgment(judgment=judgment, tags=tags)
-            kb.notes.upsert(
-                source="docs/real.md",
-                content="档案：真实模型验证只用一小份样本。\n\n它直接完成搜索，不做多余处理。",
+            note_path = Path(directory) / "real.md"
+            note_path.write_text(
+                "档案：真实模型验证只用一小份样本。\n\n它直接完成搜索，不做多余处理。",
+                encoding="utf-8",
             )
+            kb.notes.upsert_file(path=str(note_path))
 
             report = kb.embeddings.sync("real-v1", batch=batch)["value"]
             print(f"内部同步：scanned={report['scanned']} written={report['written']} "
