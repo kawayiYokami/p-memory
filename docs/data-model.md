@@ -221,15 +221,18 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 
 ```rust
 struct NoteInput { source: String, title: String, content: String, chunk_chars: usize /* 默认 220 */ }
+struct NoteFileInput { record, source, path, chunk_chars }   // 库自己读 path
 struct Note   { header, source, title, content, source_revision, chunk_chars, chunk_count }
 struct Chunk  { header, note_id, ordinal, offset, limit, content }
 struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 ```
 
 - `source` 必填；`(namespace, scope, source)` 唯一，重复写入按来源定位到同一笔记。
+- `upsert_file` 按 `path` 读文件：正文取文件原文，标题取文件名（去扩展名）；`source` 仍是定位键。
 - 笔记正文的权威副本存在库内（`payload_json.content`）；`source` 只是宿主路径的快照，核心不去读写它。
 - **路径与标题只存在笔记这一层**；切片不重复存 `source`/`title`，需要时经 `note_id` 关联取回。
 - **切片正文也不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由笔记原文按字符区间取出。
+- 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文与切片照旧保留原文。
 - 切片规则见 [笔记切片](#笔记切片)。
 - `source_revision = sha256(content)`。
 - 正文替换时在同一事务内原子重建切片投影：`chunks` 存内容指纹 `fingerprint`，`ordinal` 与内容都未变的切片保留其整数 `record_id`，向量继续有效；失效的旧切片连同向量一并删除。

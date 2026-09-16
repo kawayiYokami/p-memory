@@ -83,6 +83,14 @@ class NoteInput(RecordInput, total=False):
     chunk_chars: int
 
 
+class NoteFileInput(RecordInput, total=False):
+    """按文件路径同步一篇笔记：库自己读文件，标题取文件名（去扩展名）。"""
+
+    source: str
+    path: str
+    chunk_chars: int
+
+
 class EmbeddingSpace(TypedDict):
     id: str
     model: str

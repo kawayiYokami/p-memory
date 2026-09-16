@@ -774,3 +774,31 @@ fn text_gate_excludes_records_that_do_not_match_the_query() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, target);
 }
+
+#[test]
+fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let path = dir.path().join("世界观.md");
+    let raw = "# 标题\n\n这里有 **独有措辞** 正文。";
+    std::fs::write(&path, raw).unwrap();
+
+    let note = kb.notes().upsert_file(NoteFileInput::new("docs/世界观.md", &path)).unwrap().value;
+    assert_eq!(note.title, "世界观", "标题取文件名");
+    assert_eq!(note.content, raw, "正文是文件原文，清洗不改动正文");
+
+    // 索引在分词前清洗：标记符不干扰，正文词照常命中切片。
+    let hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert!(!hits.is_empty(), "清洗后的文本仍可检索");
+
+    // 同一 source 重新同步：定位到同一笔记、更新正文、重建切片。
+    std::fs::write(&path, "改过的正文 **新词** 在这里。").unwrap();
+    let updated = kb.notes().upsert_file(NoteFileInput::new("docs/世界观.md", &path)).unwrap().value;
+    assert_eq!(updated.header.id, note.header.id, "同一 source 复用同一笔记");
+    assert_eq!(updated.content, "改过的正文 **新词** 在这里。");
+
+    // 文件不存在与非 UTF-8 都直接报错，不落库。
+    assert!(kb.notes().upsert_file(NoteFileInput::new("missing", dir.path().join("nope.md"))).is_err());
+    let bad = dir.path().join("bad.md");
+    std::fs::write(&bad, [0xffu8, 0xfe, 0xfd]).unwrap();
+    assert!(kb.notes().upsert_file(NoteFileInput::new("bad", &bad)).is_err());
+}

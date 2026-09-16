@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 
 fn default_chunk_chars() -> usize { 220 }
 
@@ -18,6 +19,23 @@ pub struct NoteInput {
 impl NoteInput {
     pub fn new(source: impl Into<String>, content: impl Into<String>) -> Self {
         Self { record: RecordInput::default(), source: source.into(), title: String::new(), content: content.into(), chunk_chars: default_chunk_chars() }
+    }
+}
+
+/// 按文件路径同步一篇笔记的入参：库自己读文件，标题取文件名（去扩展名）。
+/// 正文仍是文件原文；清洗只作用于送进索引的文本，不改动正文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteFileInput {
+    #[serde(flatten)] pub record: RecordInput,
+    /// 写入 `(namespace, scope, source)` 的定位键，由调用方给出。
+    pub source: String,
+    /// 要读取的文件路径。
+    pub path: PathBuf,
+    #[serde(default = "default_chunk_chars")] pub chunk_chars: usize,
+}
+impl NoteFileInput {
+    pub fn new(source: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self { record: RecordInput::default(), source: source.into(), path: path.into(), chunk_chars: default_chunk_chars() }
     }
 }
 
@@ -211,6 +229,13 @@ impl NoteStore {
         // 笔记与其切片一同交给内部向量化；默认关闭时这一步直接跳过。
         self.0.vectorize_note(receipt.value.header.id);
         Ok(receipt)
+    }
+    /// 读文件后同步一篇笔记：正文取文件原文，标题取文件名（去扩展名）。
+    /// 监听与对账在使用方；库只按给定路径处理这一个文件。
+    pub fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>> {
+        let content = std::fs::read_to_string(&input.path)?;
+        let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+        self.upsert(NoteInput { record: input.record, source: input.source, title, content, chunk_chars: input.chunk_chars })
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note> {
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)

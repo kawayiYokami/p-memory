@@ -741,6 +741,7 @@ dependencies = [
  "fs4",
  "parking_lot",
  "petgraph",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

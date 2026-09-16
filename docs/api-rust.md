@@ -144,6 +144,7 @@ impl GraphView {
 ```rust
 impl NoteStore {
     fn upsert(&self, input: NoteInput) -> Result<WriteReceipt<Note>>;
+    fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>>;
     fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note>;
     fn list(&self, page: &PageRequest) -> Result<Page<Note>>;
     fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk>;
@@ -153,6 +154,7 @@ impl NoteStore {
 ```
 
 - `upsert` 按 `(namespace, scope, source)` 定位：来源已存在则替换正文，否则新建。
+- `upsert_file` 按给定文件路径同步一篇笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；`source` 仍是定位键。监听与对账在使用方，库只处理给到的这一个文件。
 - 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
 - 切片只在 payload 里存 `note_id` 与行/字符区间，正文不落 SQLite；`get_chunk` / `chunks` 返回的 `Chunk.content` 由笔记原文按 `char_start`/`char_end` 取出。
 - `delete` 先删切片再删笔记。

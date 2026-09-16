@@ -86,10 +86,13 @@ kb.graph().path(a, b, &filter)?;           // 桥接
 ## 笔记
 
 ```rust
-use p_memory::notes::NoteInput;
+use p_memory::notes::{NoteFileInput, NoteInput};
 
 // source 是宿主自管的路径 / URI，库只存不读写它
 kb.notes().upsert(NoteInput::new("docs/readme.md", "正文……"))?;
+
+// 只给路径：库自己读文件，标题取文件名（去扩展名）
+kb.notes().upsert_file(NoteFileInput::new("docs/readme.md", "docs/readme.md"))?;
 ```
 
 写入正文时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。切片正文不单独落库，由笔记原文按字符区间取出；可检索正文交给全文索引承载。

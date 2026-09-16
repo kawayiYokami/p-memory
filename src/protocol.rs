@@ -41,6 +41,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "graph.strongly_connected"=>encode(kb.graph().strongly_connected(&optional::<ReadFilter>(&args,"filter")?)?),
         "graph.component_count"=>encode(kb.graph().build_graph(&optional::<ReadFilter>(&args,"filter")?)?.component_count()),
         "notes.upsert"=>encode(kb.notes().upsert(decode(args)?)?),
+        "notes.upsert_file"=>encode(kb.notes().upsert_file(decode(args)?)?),
         "notes.get"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get(r.id,&r.filter)?)},
         "notes.list"=>encode(kb.notes().list(&decode(args)?)?),
         "notes.delete"=>{let r:IdRequest=decode(args)?;encode(kb.notes().delete(r.id,&r.filter)?)},

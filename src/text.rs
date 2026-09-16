@@ -1,4 +1,6 @@
+use regex::Regex;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use sha2::{Digest, Sha256};
 
 pub fn normalize_text(text: &str) -> String {
@@ -105,4 +107,68 @@ pub(crate) fn truncate_to_tokens(text: &str, budget: usize) -> String {
 
 pub(crate) fn digest(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }pub(crate) fn normalized_tag(text: &str) -> String {
     normalize_text(text).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ── 统一 Markdown 清洗 ────────────────────────────────────────────────
+//
+// 规则与 story 的 clean_markdown 一致：去掉标记、只留可读文本。切片与正文
+// 照旧保留原文，清洗只作用于送进全文索引的文本，检索命中因此不被标记符干扰。
+
+fn pattern(source: &str) -> Regex { Regex::new(source).expect("static markdown pattern compiles") }
+
+static MD_HTML: LazyLock<Regex> = LazyLock::new(|| pattern(r"<[^>]+>"));
+static MD_HEADING: LazyLock<Regex> = LazyLock::new(|| pattern(r"#+\s?"));
+static MD_BOLD: LazyLock<Regex> = LazyLock::new(|| pattern(r"(\*\*|__)(.*?)(\*\*|__)"));
+static MD_ITALIC: LazyLock<Regex> = LazyLock::new(|| pattern(r"(\*|_)(.*?)(\*|_)"));
+static MD_LINK: LazyLock<Regex> = LazyLock::new(|| pattern(r"\[(.*?)\]\(.*?\)"));
+static MD_IMAGE: LazyLock<Regex> = LazyLock::new(|| pattern(r"!\[.*?\]\(.*?\)"));
+static MD_FENCE: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?s)```.*?```"));
+static MD_CODE: LazyLock<Regex> = LazyLock::new(|| pattern(r"`([^`]+)`"));
+static MD_BULLET: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?m)^[-*+]\s+"));
+static MD_ORDERED: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?m)^\d+\.\s+"));
+static MD_QUOTE: LazyLock<Regex> = LazyLock::new(|| pattern(r"(?m)^>\s+"));
+static MD_RULE: LazyLock<Regex> = LazyLock::new(|| pattern(r"---+"));
+static MD_PIPE: LazyLock<Regex> = LazyLock::new(|| pattern(r"\|"));
+
+/// 把 Markdown 清洗成纯文本，替换顺序与 story 一致。输入输出都是原文以外的
+/// 派生文本，调用方负责决定拿它做什么（库只拿它喂索引分词）。
+pub fn clean_markdown(input: &str) -> String {
+    let text = input.to_string();
+    let text = MD_HTML.replace_all(&text, "");
+    let text = MD_HEADING.replace_all(&text, "");
+    let text = MD_BOLD.replace_all(&text, "$2");
+    let text = MD_ITALIC.replace_all(&text, "$2");
+    let text = MD_LINK.replace_all(&text, "$1");
+    let text = MD_IMAGE.replace_all(&text, "");
+    let text = MD_FENCE.replace_all(&text, "");
+    let text = MD_CODE.replace_all(&text, "$1");
+    let text = MD_BULLET.replace_all(&text, "");
+    let text = MD_ORDERED.replace_all(&text, "");
+    let text = MD_QUOTE.replace_all(&text, "");
+    let text = MD_RULE.replace_all(&text, "");
+    let text = MD_PIPE.replace_all(&text, " ");
+    text.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_markdown;
+
+    /// 期望值与 story 的 `clean_markdown` 逐条对拍得到（见 .pai/temp/clean_compare.py）。
+    #[test]
+    fn clean_markdown_matches_reference() {
+        let cases = [
+            ("# 标题\n\n正文 **粗体** 与 *斜体* 和 _下划线_", "标题\n\n正文 粗体 与 斜体 和 下划线"),
+            ("见 [链接](http://a.b) 与 ![图片](http://c.d)", "见 链接 与 !图片"),
+            ("```py\nprint(1)\n```\n后面 `行内` 文字", "后面 行内 文字"),
+            ("- 项目一\n- 项目二\n1. 有序\n> 引用\n\n---", "项目一\n项目二\n有序\n引用"),
+            ("| 列A | 列B |\n|---|---|\n| 1 | 2 |", "列A   列B  \n   \n  1   2"),
+            ("<div>标签</div> 普通文本", "标签 普通文本"),
+            ("混合 **粗** [链](u) `码` 尾", "混合 粗 链 码 尾"),
+            ("  ## 缩进标题  ", "缩进标题"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(clean_markdown(input), expected, "input={input:?}");
+        }
+    }
 }

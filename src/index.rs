@@ -83,7 +83,7 @@ impl TextIndex {
             let mut document = doc!(self.fields.key => encoded, self.fields.namespace => namespace,
                 self.fields.scope => scope, self.fields.kind => kind.as_str(),
                 self.fields.body => body,
-                self.fields.text => text::tokenize(&body).join(" "));
+                self.fields.text => text::tokenize(&text::clean_markdown(&body)).join(" "));
             let mut tags = conn.prepare("SELECT t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1")?;
             for tag in tags.query_map([id], |r| r.get::<_, String>(0))? {
                 let tag = tag?;

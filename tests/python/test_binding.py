@@ -17,6 +17,7 @@ from p_memory import (
     KnowledgeBase,
     LockedError,
     NotFoundError,
+    PMemoryError,
     ValidationError,
     import_legacy,
 )
@@ -178,6 +179,30 @@ def test_note_rejects_out_of_range_chunk_size(kb):
     """切片大小超范围由核心拒绝。"""
     with pytest.raises(ValidationError):
         kb.notes.upsert(source="docs/x.md", content="正文", chunk_chars=5)
+
+
+def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
+    """按路径同步：标题取文件名，正文是文件原文，清洗只作用于索引文本。"""
+    path = tmp_path / "世界观.md"
+    raw = "# 标题\n\n这里有 **独有措辞** 正文。"
+    path.write_text(raw, encoding="utf-8", newline="")
+
+    note = kb.notes.upsert_file(source="docs/世界观.md", path=str(path))["value"]
+    assert note["title"] == "世界观"
+    assert note["content"] == raw
+    assert kb.search("独有措辞", kinds=["chunk"])["hits"], "清洗后的文本仍可检索"
+
+    path.write_text("改过的正文 **新词** 在这里。", encoding="utf-8", newline="")
+    updated = kb.notes.upsert_file(source="docs/世界观.md", path=str(path))["value"]
+    assert updated["id"] == note["id"], "同一 source 复用同一笔记"
+    assert updated["content"] == "改过的正文 **新词** 在这里。"
+
+    with pytest.raises(PMemoryError):
+        kb.notes.upsert_file(source="missing", path=str(tmp_path / "nope.md"))
+    bad = tmp_path / "bad.md"
+    bad.write_bytes(b"\xff\xfe\xfd")
+    with pytest.raises(PMemoryError):
+        kb.notes.upsert_file(source="bad", path=str(bad))
 
 
 # ── 向量与重排 ────────────────────────────────────────────────────────
