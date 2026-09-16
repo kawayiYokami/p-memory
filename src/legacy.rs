@@ -1,5 +1,5 @@
 //! Read-only, repeatable migration into a separate p-memory directory.
-use crate::{graph::{self, *}, memory::{self, *}, notes::{self, NoteInput},
+use crate::{graph::{self, *}, memory::{self, *}, notes::{self, NoteFileInput},
     schema, storage::{self, KnowledgeBase}, text, types::*, Error, Result};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ struct RelationDraft { table: String, source_id: String, record: RecordInput, su
 #[derive(Serialize)]
 struct EventDraft { table: String, source_id: String, record: RecordInput, name: String, summary: String, participants: Vec<String>, confidence: f64, reason: String }
 #[derive(Serialize)]
-struct NoteDraft { table: String, source_id: String, input: NoteInput }
+struct NoteDraft { table: String, source_id: String, input: NoteFileInput }
 #[derive(Default, Serialize)]
 struct Plan { memories: Vec<MemoryDraft>, entities: Vec<EntityDraft>, relations: Vec<RelationDraft>, events: Vec<EventDraft>,
     notes: Vec<NoteDraft>, missing: BTreeSet<String>, warnings: Vec<String> }
@@ -341,7 +341,7 @@ fn import_notes(req:&ImportRequest,plan:&mut Plan,index_rows:Vec<Row>,raw:&[Row]
         let sid=format!("{ns}:{relative}");
         let mut rec=record(req,"notes",&sid,&row,&domain)?;
         rec.tags=strings(row.get("tags"));
-        let note=NoteInput{record:rec,source:relative,title:{let title=string(&row,"title");if title.is_empty(){string(&row,"heading_h1")}else{title}},content:std::fs::read_to_string(&path)?,chunk_chars:220};
+        let note=NoteFileInput{record:rec,path:path.clone(),chunk_chars:220};
         plan.notes.push(NoteDraft{table:"notes".into(),source_id:sid,input:note});
     }
     Ok(())
@@ -378,7 +378,7 @@ fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut
         let event=graph::upsert_event(conn,&EventInput{record:draft.record.clone(),name:draft.name.clone(),summary:draft.summary.clone(),participants,confidence:draft.confidence,reason:draft.reason.clone()})?;
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:event.header.id});
     }
-    for draft in &plan.notes { let note=notes::upsert(conn,&draft.input)?;
+    for draft in &plan.notes { let note=notes::sync_file(conn,&draft.input)?;
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id}); }
     Ok(())
 }

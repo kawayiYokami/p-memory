@@ -157,52 +157,57 @@ def test_deleting_a_referenced_entity_reports_conflict(kb):
 
 # ── 笔记 ──────────────────────────────────────────────────────────────
 
-def test_note_chunks_are_line_ranges_and_reuse_ids(kb):
-    """切片行号从 1 起；同一来源追加内容时复用未变切片的 id，并删掉失效切片。"""
-    first = kb.notes.upsert(source="docs/a.md", content="A段\n\nB段\n\nC段")
+def test_note_chunks_are_line_ranges_and_reuse_ids(kb, tmp_path):
+    """切片行号从 1 起；同一路径追加内容时复用未变切片的 id，并删掉失效切片。"""
+    path = tmp_path / "a.md"
+    path.write_text("A段\n\nB段\n\nC段", encoding="utf-8", newline="")
+    first = kb.notes.upsert_file(path=str(path))
     note_id = first["value"]["id"]
     chunks = kb.notes.chunks(note_id)
 
-    assert first["value"]["chunk_count"] == len(chunks) == 3
+    assert len(chunks) == 3
     assert [(c["ordinal"], c["offset"], c["limit"]) for c in chunks] == [(0, 1, 1), (1, 3, 1), (2, 5, 1)]
     assert all(c["note_id"] == note_id for c in chunks)
 
-    second = kb.notes.upsert(source="docs/a.md", content="A段\n\nB段\n\nC段\n\nD段")
-    assert second["value"]["id"] == note_id, "同一 (namespace, scope, source) 应复用同一条笔记"
+    path.write_text("A段\n\nB段\n\nC段\n\nD段", encoding="utf-8", newline="")
+    second = kb.notes.upsert_file(path=str(path))
+    assert second["value"]["id"] == note_id, "同一路径应复用同一条笔记"
 
     grown = kb.notes.chunks(note_id)
     assert [c["ordinal"] for c in grown] == [0, 1, 2, 3]
     assert [c["id"] for c in grown][:3] == [c["id"] for c in chunks], "未变切片应复用原 id"
 
 
-def test_note_rejects_out_of_range_chunk_size(kb):
+def test_note_rejects_out_of_range_chunk_size(kb, tmp_path):
     """切片大小超范围由核心拒绝。"""
+    path = tmp_path / "x.md"
+    path.write_text("正文", encoding="utf-8", newline="")
     with pytest.raises(ValidationError):
-        kb.notes.upsert(source="docs/x.md", content="正文", chunk_chars=5)
+        kb.notes.upsert_file(path=str(path), chunk_chars=5)
 
 
 def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
-    """按路径同步：标题取文件名，正文是文件原文，清洗只作用于索引文本。"""
+    """按路径同步：标题取文件名，路径即身份，正文不落库、切片正文由文件原文派生。"""
     path = tmp_path / "世界观.md"
     raw = "# 标题\n\n这里有 **独有措辞** 正文。"
     path.write_text(raw, encoding="utf-8", newline="")
 
-    note = kb.notes.upsert_file(source="docs/世界观.md", path=str(path))["value"]
+    note = kb.notes.upsert_file(path=str(path))["value"]
     assert note["title"] == "世界观"
-    assert note["content"] == raw
+    assert note["source"] == str(path), "路径即身份"
     assert kb.search("独有措辞", kinds=["chunk"])["hits"], "清洗后的文本仍可检索"
+    assert any("独有措辞" in c["content"] for c in kb.notes.chunks(note["id"])), "切片正文由文件原文派生"
 
     path.write_text("改过的正文 **新词** 在这里。", encoding="utf-8", newline="")
-    updated = kb.notes.upsert_file(source="docs/世界观.md", path=str(path))["value"]
-    assert updated["id"] == note["id"], "同一 source 复用同一笔记"
-    assert updated["content"] == "改过的正文 **新词** 在这里。"
+    updated = kb.notes.upsert_file(path=str(path))["value"]
+    assert updated["id"] == note["id"], "同一路径复用同一笔记"
 
     with pytest.raises(PMemoryError):
-        kb.notes.upsert_file(source="missing", path=str(tmp_path / "nope.md"))
+        kb.notes.upsert_file(path=str(tmp_path / "nope.md"))
     bad = tmp_path / "bad.md"
     bad.write_bytes(b"\xff\xfe\xfd")
     with pytest.raises(PMemoryError):
-        kb.notes.upsert_file(source="bad", path=str(bad))
+        kb.notes.upsert_file(path=str(bad))
 
 
 # ── 向量与重排 ────────────────────────────────────────────────────────
@@ -316,7 +321,7 @@ def test_health_exposes_core_counters(kb):
     kb.memories.upsert_by_judgment(judgment="一条记忆")
     report = kb.health()
 
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
     assert report["pending_index_updates"] == 0

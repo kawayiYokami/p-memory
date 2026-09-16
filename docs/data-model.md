@@ -1,6 +1,6 @@
 # 数据模型
 
-所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。可检索正文不落 SQLite：写入时按 payload 现算，交给全文索引的 stored 字段承载。
+所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。记忆的正文（`judgment`）权威在 payload；笔记的正文权威在宿主文件，库内只留路径。可检索正文不落 SQLite：写入时按 payload（或文件）现算，交给全文索引的 stored 字段承载。
 
 ## 记录类型
 
@@ -220,21 +220,20 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 ## 领域三：笔记与切片（Note / Chunk）
 
 ```rust
-struct NoteInput { source: String, title: String, content: String, chunk_chars: usize /* 默认 220 */ }
-struct NoteFileInput { record, source, path, chunk_chars }   // 库自己读 path
-struct Note   { header, source, title, content, source_revision, chunk_chars, chunk_count }
+struct NoteFileInput { record, path, chunk_chars }   // 库自己读 path；路径即身份
+struct Note   { header, source, title, chunk_chars }
 struct Chunk  { header, note_id, ordinal, offset, limit, content }
 struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 ```
 
-- `source` 必填；`(namespace, scope, source)` 唯一，重复写入按来源定位到同一笔记。
-- `upsert_file` 按 `path` 读文件：正文取文件原文，标题取文件名（去扩展名）；`source` 仍是定位键。
-- 笔记正文的权威副本存在库内（`payload_json.content`）；`source` 只是宿主路径的快照，核心不去读写它。
-- **路径与标题只存在笔记这一层**；切片不重复存 `source`/`title`，需要时经 `note_id` 关联取回。
-- **切片正文也不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由笔记原文按字符区间取出。
-- 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文与切片照旧保留原文。
+- `path` 必填且**即身份**：写入 `(namespace, scope, source)` 的 `source` 直接取路径字符串，同一路径重复写入定位到同一笔记。
+- `upsert_file` 按 `path` 读文件：正文取文件原文，标题取文件名（去扩展名）。
+- **库内不留正文**：笔记 payload 只存切片粒度 `chunk_chars`，正文权威是宿主文件；`Note` 已无 `content` 字段，正文经 `chunks()` 返回的切片 `content` 由文件原文按字符区间取出。
+- **路径只在 `notes` 表存一次**（→strings），payload 不重复存 `source`；标题由路径派生，也不落库。
+- **切片正文不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由文件原文按字符区间取出。
+- 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文照旧保留原文。
+- 文件缺失时：索引/向量等**派生路径容错**，退回只索引标题，库仍能打开重建；**显式读正文**（`get_chunk` / `chunks`）报错。
 - 切片规则见 [笔记切片](#笔记切片)。
-- `source_revision = sha256(content)`。
 - 正文替换时在同一事务内原子重建切片投影：`chunks` 存内容指纹 `fingerprint`，`ordinal` 与内容都未变的切片保留其整数 `record_id`，向量继续有效；失效的旧切片连同向量一并删除。
 
 ### 笔记切片
@@ -242,8 +241,8 @@ struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 - 按段落切分，目标 `chunk_chars`（范围 16..=100000，默认 220）。
 - **围栏代码块与表格整体保留**，即使超过目标大小也不拆分。
 - `offset` 从 **1** 开始（起始行），`limit` 为行数；两者的计数单位都是**行**。
-- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；`char_start`/`char_end` 是切片在笔记原文里的字符区间（含起、不含止），行号因此无法唯一定位的超长段落靠它精确取回切片正文。
-- 标题来自笔记层，仍进正文；`source` 路径作为精确整词关键字进 `keywords` 字段（含各级父目录名），不进正文参与切分。
+- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；`char_start`/`char_end` 是切片在文件原文里的字符区间（含起、不含止），行号因此无法唯一定位的超长段落靠它精确取回切片正文。
+- 标题由路径文件名派生；`source` 路径作为精确整词关键字进 `keywords` 字段（含各级父目录名），不进正文参与切分。
 
 ## 领域四：向量与重排（EmbeddingSpace / Embedder / Reranker）
 

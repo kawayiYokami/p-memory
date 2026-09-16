@@ -439,6 +439,17 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
         let (id, tag) = row?;
         tags.entry(id).or_default().push(tag);
     }
+    // 笔记只把路径落在 notes 表：读取时按 record_id 补回 source（及其派生 title），
+    // payload 里不再重复存路径，正文更不落库。
+    let mut note_sources: BTreeMap<i64, String> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(&format!("SELECT n.record_id,s.text FROM notes n JOIN strings s ON s.id=n.source_id \
+            WHERE n.record_id IN ({placeholders})"))?;
+        for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, source) = row?;
+            note_sources.insert(id, source);
+        }
+    }
     for (id, namespace, kind_code, scope, created, updated, revision, metadata, evidence, payload) in rows {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let header = RecordHeader { id, namespace, kind, scope,
@@ -451,6 +462,12 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
         if let Some(type_id) = payload.get("memory_type_id").and_then(Value::as_i64) {
             payload.insert("memory_type".into(), Value::String(term_text(conn, type_id)?));
             payload.remove("memory_type_id");
+        }
+        if kind == RecordKind::Note {
+            let source = note_sources.remove(&id).unwrap_or_default();
+            let title = std::path::Path::new(&source).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            payload.insert("source".into(), Value::String(source));
+            payload.insert("title".into(), Value::String(title));
         }
         object.extend(payload);
         out.insert(id, value);
@@ -537,7 +554,7 @@ pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i6
         let (id, kind_code, payload_json) = row?;
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: Value = serde_json::from_str(&payload_json)?;
-        out.insert(id, search_text(conn, kind, &payload)?);
+        out.insert(id, search_text(conn, id, kind, &payload)?);
     }
     Ok(out)
 }
@@ -550,15 +567,18 @@ pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[Rec
 }
 
 /// 记录的可检索正文（写入时现算，不落 SQLite）。切片正文由其笔记原文按字符区间取出。
-pub(crate) fn search_text(conn: &Connection, kind: RecordKind, payload: &Value) -> Result<String> {
+pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value) -> Result<String> {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     Ok(match kind {
         RecordKind::Memory => field("judgment"),
-        // 笔记正文不进全文索引，检索面交给切片；笔记记录只留标题。
-        RecordKind::Note => field("title"),
+        // 笔记正文不进全文索引，检索面交给切片；笔记记录只留标题（由宿主路径文件名派生）。
+        RecordKind::Note => note_title(conn, id)?,
         RecordKind::Chunk => {
             let (title, content) = chunk_origin(conn, payload)?;
-            format!("{title}\n{}", char_slice(&content, payload))
+            match content {
+                Some(content) => format!("{title}\n{}", char_slice(&content, payload)),
+                None => title,
+            }
         }
         RecordKind::Entity => entity_body(payload),
         RecordKind::Relation => format!("{} {} {} {}", field("subject_name"), field("predicate"), field("object_name"), field("reason")),
@@ -566,14 +586,29 @@ pub(crate) fn search_text(conn: &Connection, kind: RecordKind, payload: &Value) 
     })
 }
 
-/// 向量化的输入文本。记忆额外拼上标签，笔记带上正文，其余与可检索正文一致。
-pub(crate) fn embedding_text(conn: &Connection, kind: RecordKind, payload: &Value, tags: &[String]) -> Result<String> {
+/// 向量化的输入文本。记忆额外拼上标签，笔记带上正文（读自宿主文件），其余与可检索正文一致。
+pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, tags: &[String]) -> Result<String> {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
     Ok(match kind {
         RecordKind::Memory => format!("{}\n{}", field("judgment"), tags.join(" ")),
-        RecordKind::Note => format!("{}\n{}", field("title"), field("content")),
-        _ => search_text(conn, kind, payload)?,
+        RecordKind::Note => {
+            let source = note_source(conn, id)?;
+            // 派生路径容错：文件缺失时退回只用标题，向量化不因单个文件消失而失败。
+            format!("{}\n{}", note_title(conn, id)?, std::fs::read_to_string(&source).unwrap_or_default())
+        }
+        _ => search_text(conn, id, kind, payload)?,
     })
+}
+
+/// 笔记的宿主路径：只落在 `notes` 表（→strings），payload 里不再重复。
+fn note_source(conn: &Connection, note_id: i64) -> Result<String> {
+    Ok(conn.query_row("SELECT s.text FROM notes n JOIN strings s ON s.id=n.source_id WHERE n.record_id=?1",
+        [note_id], |r| r.get::<_, String>(0)).optional()?.unwrap_or_default())
+}
+
+/// 笔记标题由宿主路径的文件名派生，不落库。
+fn note_title(conn: &Connection, note_id: i64) -> Result<String> {
+    Ok(std::path::Path::new(&note_source(conn, note_id)?).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
 fn name_list(payload: &Value) -> String {
@@ -596,13 +631,13 @@ fn entity_body(payload: &Value) -> String {
     format!("{name} {aliases} {summary} {attr_text}")
 }
 
-/// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间。
-fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, String)> {
+/// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间；
+/// 正文读时从笔记的宿主文件取，库里不留副本。派生路径（索引/向量/检索降级）对
+/// 文件缺失容错：取不到正文时返回 `None`，让该记录退回只索引标题，而不是整个库打不开。
+fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, Option<String>)> {
     let note_id = payload.get("note_id").and_then(Value::as_i64).ok_or_else(|| Error::Validation("chunk payload is missing note_id".into()))?;
-    let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [note_id], |r| r.get(0))?;
-    let note: Value = serde_json::from_str(&raw)?;
-    Ok((note.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-        note.get("content").and_then(Value::as_str).unwrap_or("").to_string()))
+    let source = note_source(conn, note_id)?;
+    Ok((note_title(conn, note_id)?, std::fs::read_to_string(&source).ok()))
 }
 
 /// 按 payload 里的 `char_start` / `char_end` 从原文取切片正文。
@@ -617,6 +652,7 @@ pub(crate) fn chunk_content(conn: &Connection, chunk_id: i64) -> Result<String> 
     let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [chunk_id], |r| r.get(0))?;
     let payload: Value = serde_json::from_str(&raw)?;
     let (_, content) = chunk_origin(conn, &payload)?;
+    let content = content.ok_or_else(|| Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "note source file is missing or unreadable")))?;
     Ok(char_slice(&content, &payload))
 }
 

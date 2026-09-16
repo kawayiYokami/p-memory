@@ -6,7 +6,7 @@
 //! 然后直接拿搜索结果。向量化与重排都在库内部完成——宿主只提供内容与模型接口，
 //! 不自己算向量，也不自己重排。它跑通，就说明整条路径没有漏。
 
-use p_memory::{EmbedCallbackError, EmbeddingSpace, KnowledgeBase, MemoryInput, NoteInput,
+use p_memory::{EmbedCallbackError, EmbeddingSpace, KnowledgeBase, MemoryInput, NoteFileInput,
                ReadFilter, RecordKind, SearchRequest};
 
 /// 确定性假向量：同一文本永远得到同一向量，也不为零。Demo 零外部依赖、结果可复现，
@@ -62,11 +62,10 @@ fn main() {
         memory.record.tags = vec![tag.to_string()];
         kb.memories().upsert(memory).expect("upsert memory");
     }
+    let note_path = dir.path().join("demo.md");
+    std::fs::write(&note_path, "档案：最小 Demo 只用一小份样本。\n\n它直接完成搜索，不做多余处理。").expect("write note file");
     kb.notes()
-        .upsert(NoteInput::new(
-            "docs/demo.md",
-            "档案：最小 Demo 只用一小份样本。\n\n它直接完成搜索，不做多余处理。",
-        ))
+        .upsert_file(NoteFileInput::new(&note_path))
         .expect("upsert note");
 
     // 直接检索：宿主只给搜索词与目标空间，库用它注册的回调嵌入查询词。

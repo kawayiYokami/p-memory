@@ -106,7 +106,7 @@ flowchart LR
 | 严格 | 全部词项 `Must` 命中 | 精确匹配优先 |
 | 宽松 | 词项 `Should` 命中 | 补充召回 |
 
-结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（正文与切片仍保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/keywords/text/body`：`text` 使用预切分的空白分词器（`pretokenized`）承担正文 1+2 分词召回；`body` 是同一段未分词正文的 stored 字段，供重排取候选正文与命中回读，索引不可用时改由 payload 现算；`tags` 与 `keywords` 是精确整词字段（`STRING`），`keywords` 收纳各记录的 tags 与笔记 `source` 的各级父目录名，查询时按整词与正文并行 `Should` 召回——打关键字即能命中，且专有名词不被切碎。
+结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（正文照旧保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/keywords/text/body`：`text` 使用预切分的空白分词器（`pretokenized`）承担正文 1+2 分词召回；`body` 是同一段未分词正文的 stored 字段，供重排取候选正文与命中回读，索引不可用时改由 payload（笔记读文件）现算；`tags` 与 `keywords` 是精确整词字段（`STRING`），`keywords` 收纳各记录的 tags 与笔记 `source` 的各级父目录名，查询时按整词与正文并行 `Should` 召回——打关键字即能命中，且专有名词不被切碎。
 
 ## 向量检索
 

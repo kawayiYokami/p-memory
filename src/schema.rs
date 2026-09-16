@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -66,6 +66,26 @@ fn migrate_chunk_payloads(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// 把笔记 payload 里的正文与派生字段摘掉，只留切片粒度。
+/// 路径权威在 `notes` 表（→strings），标题由路径文件名派生，正文在宿主文件里。
+fn migrate_note_payloads(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT id,payload_json FROM records WHERE kind=?1")?;
+        for row in stmt.query_map([crate::types::RecordKind::Note.code()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            rows.push(row?);
+        }
+    }
+    for (id, raw) in rows {
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        if let Some(object) = value.as_object_mut() {
+            for key in ["content", "title", "chunk_count", "source_revision", "source"] { object.remove(key); }
+        }
+        tx.execute("UPDATE records SET payload_json=?2 WHERE id=?1", rusqlite::params![id, serde_json::to_string(&value)?])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 0 && !(2..=SCHEMA_VERSION).contains(&version) {
@@ -101,6 +121,9 @@ fn migrate(conn: &mut Connection, mut version: i64) -> Result<()> {
             // v4 -> v5：可检索正文交给 Tantivy（索引侧重建即可），SQLite 删掉两条派生文本列；
             // 切片 payload 去 content，改存字符区间，正文由笔记原文派生。
             4 => { tx.execute_batch(MIGRATION_4_TO_5)?; migrate_chunk_payloads(&tx)?; }
+            // v5 -> v6：笔记 payload 不再留正文与派生字段（路径只在 notes 表，标题由路径派生），
+            // 正文改由宿主文件承载；旧库里的副本就地摘除。
+            5 => { migrate_note_payloads(&tx)?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -175,6 +198,12 @@ mod tests {
         assert!(value.get("content").is_none(), "切片 payload 不再存正文");
         assert_eq!(value.get("char_start").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(value.get("char_end").and_then(|v| v.as_u64()), Some(3));
+        let note_payload: String = conn.query_row("SELECT payload_json FROM records WHERE id=1", [], |r| r.get(0)).unwrap();
+        let note: serde_json::Value = serde_json::from_str(&note_payload).unwrap();
+        assert!(note.get("content").is_none(), "笔记 payload 不再存正文");
+        assert!(note.get("title").is_none(), "笔记标题由路径派生，不落库");
+        assert!(note.get("source").is_none(), "路径只落在 notes 表，payload 不重复");
+        assert_eq!(note.get("chunk_chars").and_then(|v| v.as_u64()), Some(220), "只留切片粒度");
     }
 }
 

@@ -305,7 +305,7 @@ pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, aft
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
         let tags = record_tags(conn, id)?;
-        let body = storage::embedding_text(conn, kind, &payload, &tags)?;
+        let body = storage::embedding_text(conn, id, kind, &payload, &tags)?;
         items.push(EmbeddingInput { key: RecordKey { id }, text: body, fingerprint });
     }
     Ok(items)

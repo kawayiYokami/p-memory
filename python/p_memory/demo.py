@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import tempfile
+from pathlib import Path
 
 from .api import KnowledgeBase
 
@@ -52,10 +53,9 @@ def main() -> int:
                 ("搜索优先返回精确结果", "原则"),
             ):
                 kb.memories.upsert_by_judgment(judgment=judgment, tags=[tag])
-            kb.notes.upsert(
-                source="docs/demo.md",
-                content="档案：最小 Demo 只用一小份样本。\n\n它直接完成搜索，不做多余处理。",
-            )
+            note_path = Path(directory) / "demo.md"
+            note_path.write_text("档案：最小 Demo 只用一小份样本。\n\n它直接完成搜索，不做多余处理。", encoding="utf-8", newline="")
+            kb.notes.upsert_file(path=str(note_path))
 
             # 直接检索：宿主只给搜索词与目标空间，库用它注册的回调嵌入查询词。
             result = kb.search(

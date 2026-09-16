@@ -7,43 +7,31 @@ use std::path::PathBuf;
 
 fn default_chunk_chars() -> usize { 220 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoteInput {
-    #[serde(flatten)] pub record: RecordInput,
-    /// A host-owned path or URI. The library never reads or writes this path.
-    pub source: String,
-    #[serde(default)] pub title: String,
-    pub content: String,
-    #[serde(default = "default_chunk_chars")] pub chunk_chars: usize,
-}
-impl NoteInput {
-    pub fn new(source: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { record: RecordInput::default(), source: source.into(), title: String::new(), content: content.into(), chunk_chars: default_chunk_chars() }
-    }
-}
-
 /// 按文件路径同步一篇笔记的入参：库自己读文件，标题取文件名（去扩展名）。
-/// 正文仍是文件原文；清洗只作用于送进索引的文本，不改动正文。
+/// 路径即身份——`(namespace, scope)` 下的定位键就是文件路径，库按它读回正文。
+/// 正文真相源是文件：清洗只作用于送进索引的文本，库内不留任何正文副本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteFileInput {
     #[serde(flatten)] pub record: RecordInput,
-    /// 写入 `(namespace, scope, source)` 的定位键，由调用方给出。
-    pub source: String,
-    /// 要读取的文件路径。
+    /// 要读取的文件路径，同时作为 `(namespace, scope, source)` 的定位键。
     pub path: PathBuf,
     #[serde(default = "default_chunk_chars")] pub chunk_chars: usize,
 }
 impl NoteFileInput {
-    pub fn new(source: impl Into<String>, path: impl Into<PathBuf>) -> Self {
-        Self { record: RecordInput::default(), source: source.into(), path: path.into(), chunk_chars: default_chunk_chars() }
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { record: RecordInput::default(), path: path.into(), chunk_chars: default_chunk_chars() }
     }
 }
 
+/// 笔记的对外形态：库内只留路径，正文读时按 `source` 读文件，标题由文件名派生。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     #[serde(flatten)] pub header: RecordHeader,
-    pub source: String, pub title: String, pub content: String,
-    pub source_revision: String, pub chunk_chars: usize, pub chunk_count: usize,
+    /// 文件路径，读时由 `notes` 表补回（库内只此一处）。
+    pub source: String,
+    /// 由 `source` 的文件名派生，不落库。
+    #[serde(default)] pub title: String,
+    pub chunk_chars: usize,
 }
 /// 切片不再重复携带 source/title；路径与标题经 `note_id` 关联 notes 取回。
 /// `content` 不落 SQLite，读取时由笔记原文按字符区间派生。
@@ -154,24 +142,26 @@ fn find_chars(chars: &[char], needle: &str, from: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn upsert(conn: &Connection, input: &NoteInput) -> Result<Note> {
-    storage::validate_identity("source", &input.source)?;
-    let split = chunk_text(&input.content, input.chunk_chars)?;
+pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<Note> {
+    let content = std::fs::read_to_string(&input.path)?;
+    let source = input.path.to_string_lossy().into_owned();
+    let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    storage::validate_identity("source", &source)?;
+    let split = chunk_text(&content, input.chunk_chars)?;
     let mut record = input.record.clone();
     let namespace_id = storage::term_id(conn, &record.namespace)?;
     let scope_id = storage::term_id(conn, &record.scope)?;
-    let source_id = storage::term_id(conn, &input.source)?;
+    let source_id = storage::term_id(conn, &source)?;
     let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND source_id=?3",
         params![namespace_id, scope_id, source_id], |r| r.get(0)).optional()?;
     if let Some(id) = existing {
         if record.id.is_some_and(|given| given != id) { return Err(Error::Conflict("source already belongs to another note ID".into())); }
         record.id = Some(id);
     }
-    let source_revision = text::digest(&input.content);
     // 路径与 tags 不再混入正文被切碎：正文只留标题与内容，关键字走精确整词字段。
-    let body = format!("{}\n{}", input.title, input.content);
+    let body = format!("{title}\n{content}");
     let header = storage::put_record(conn, RecordKind::Note, &record,
-        &json!({"source":input.source,"title":input.title,"content":input.content,"source_revision":source_revision,"chunk_chars":input.chunk_chars,"chunk_count":split.len()}), &body)?;
+        &json!({"chunk_chars":input.chunk_chars}), &body)?;
     conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,source_id) VALUES (?1,?2,?3,?4)
         ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,source_id=excluded.source_id",
         params![header.id, namespace_id, scope_id, source_id])?;
@@ -201,7 +191,7 @@ pub(crate) fn upsert(conn: &Connection, input: &NoteInput) -> Result<Note> {
             None => {
                 let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(), tags: header.tags.clone(),
                     evidence: vec![], metadata: header.metadata.clone(), created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
-                let chunk_body = format!("{}\n{}", input.title, chunk.content);
+                let chunk_body = format!("{title}\n{}", chunk.content);
                 storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk_body)?.id
             }
         };
@@ -210,8 +200,7 @@ pub(crate) fn upsert(conn: &Connection, input: &NoteInput) -> Result<Note> {
     }
     // Delete obsolete records (and their embeddings), not just projection rows.
     for (id, _, _) in old { if !used.contains(&id) { storage::delete_record(conn, &RecordKey { id })?; } }
-    Ok(Note { header, source: input.source.clone(), title: input.title.clone(), content: input.content.clone(), source_revision,
-        chunk_chars: input.chunk_chars, chunk_count: split.len() })
+    Ok(Note { header, source, title, chunk_chars: input.chunk_chars })
 }
 
 #[derive(Clone)]
@@ -224,18 +213,13 @@ fn with_content(conn: &Connection, mut chunk: Chunk) -> Result<Chunk> {
 }
 
 impl NoteStore {
-    pub fn upsert(&self, input: NoteInput) -> Result<WriteReceipt<Note>> {
-        let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
+    /// 读文件后同步一篇笔记：正文取文件原文，标题取文件名（去扩展名），路径即身份。
+    /// 监听与对账在使用方；库只按给定路径处理这一个文件。
+    pub fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>> {
+        let receipt = self.0.mutate(|tx| sync_file(tx, &input))?;
         // 笔记与其切片一同交给内部向量化；默认关闭时这一步直接跳过。
         self.0.vectorize_note(receipt.value.header.id);
         Ok(receipt)
-    }
-    /// 读文件后同步一篇笔记：正文取文件原文，标题取文件名（去扩展名）。
-    /// 监听与对账在使用方；库只按给定路径处理这一个文件。
-    pub fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>> {
-        let content = std::fs::read_to_string(&input.path)?;
-        let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
-        self.upsert(NoteInput { record: input.record, source: input.source, title, content, chunk_chars: input.chunk_chars })
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note> {
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)

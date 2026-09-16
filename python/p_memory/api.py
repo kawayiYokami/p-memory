@@ -10,7 +10,7 @@ from typing import Any
 from . import _native
 from .errors import ClosedError, ValidationError, from_native
 from .models import (EmbeddingSpace, EntityInput, EventInput, MemoryInput,
-                     NoteFileInput, NoteInput, Page, ReadFilter, RecordKind, RelationInput,
+                     NoteFileInput, Page, ReadFilter, RecordKind, RelationInput,
                      SearchResult, WriteReceipt)
 
 
@@ -221,11 +221,8 @@ class GraphStore(_Store):
 class NoteStore(_Store):
     prefix = "notes"
 
-    def upsert(self, data: NoteInput | None = None, **fields: Any) -> WriteReceipt:
-        return self._call("upsert", self._kb._input(data, fields))
-
     def upsert_file(self, data: NoteFileInput | None = None, **fields: Any) -> WriteReceipt:
-        """按文件路径同步一篇笔记：正文取文件原文，标题取文件名（去扩展名）。"""
+        """按文件路径同步一篇笔记：正文取文件原文，路径即身份，标题取文件名（去扩展名）。"""
         return self._call("upsert_file", self._kb._input(data, fields))
 
     def chunks(self, note_id: str, *, filter: ReadFilter | None = None) -> list[dict]:

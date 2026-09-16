@@ -190,7 +190,9 @@ fn writes_vectorize_in_place_and_notes_stay_out_by_default() {
         kinds: vec![RecordKind::Memory], ..SearchRequest { query: "偏好".into(), ..Default::default() } }).unwrap().hits;
     assert_eq!(by_tag[0].key.id, id);
     // 笔记与切片默认不进向量：向量路看不到，全文路仍能看到。
-    let note = kb.notes().upsert(NoteInput::new("docs/a.md", "笔记正文里的独有措辞")).unwrap().value;
+    let note_path = dir.path().join("a.md");
+    std::fs::write(&note_path, "笔记正文里的独有措辞").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&note_path)).unwrap().value;
     let vector_hits = kb.search(&vector_query("v", "笔记正文里的独有措辞", vec![RecordKind::Note, RecordKind::Chunk])).unwrap().hits;
     assert!(vector_hits.is_empty(), "笔记默认不应生成向量");
     let text_hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Note, RecordKind::Chunk], ..Default::default() }).unwrap().hits;
@@ -198,7 +200,7 @@ fn writes_vectorize_in_place_and_notes_stay_out_by_default() {
     let chunk_id = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
     assert!(text_hits.iter().any(|hit| hit.key.id == chunk_id), "正文命中应落在切片上");
     assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "笔记正文里的独有措辞");
-    assert_eq!(note.chunk_count, 1);
+    assert_eq!(kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap().len(), 1);
 }
 
 #[test]
@@ -544,8 +546,9 @@ fn graph_integrity_aliases_and_rename_propagation() {
 #[test]
 fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
-    let input = NoteInput::new("docs/tea.md", "# 茶\n\n上海喝茶\n\n```rust\nlet x = 1;\n```\n\n最后一段");
-    let note = kb.notes().upsert(input).unwrap().value;
+    let tea_path = dir.path().join("tea.md");
+    std::fs::write(&tea_path, "# 茶\n\n上海喝茶\n\n```rust\nlet x = 1;\n```\n\n最后一段").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&tea_path)).unwrap().value;
     let note_id = note.header.id;
     let chunks = kb.notes().chunks(note_id, &ReadFilter::default()).unwrap();
     let tea = chunks.iter().find(|c| c.content == "上海喝茶").unwrap();
@@ -554,7 +557,8 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     let evidence = Evidence { source: "docs/tea.md".into(), offset: Some(3), limit: Some(1), quote: "上海喝茶".into(), ..Default::default() };
     let mut m = memory("source fact", "public"); m.record.evidence = vec![evidence];
     let memory_id = kb.memories().upsert(m).unwrap().value.header.id;
-    let new = kb.notes().upsert(NoteInput::new("docs/tea.md", "replacement")).unwrap().value;
+    std::fs::write(&tea_path, "replacement").unwrap();
+    let new = kb.notes().upsert_file(NoteFileInput::new(&tea_path)).unwrap().value;
     assert_eq!(new.header.id, note_id);
     assert!(kb.notes().get_chunk(tea.header.id, &ReadFilter::default()).is_err());
     assert_eq!(kb.memories().get(memory_id, &ReadFilter::default()).unwrap().header.evidence[0].quote, "上海喝茶");
@@ -620,7 +624,11 @@ fn exact_keywords_recall_tags_and_parent_dirs() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
     // 正文不含"角色"，只有 source 的父目录带它：靠父目录整词关键字召回切片。
-    let note = kb.notes().upsert(NoteInput::new("绝区零/角色/雅.md", "这是一段无关内容")).unwrap().value;
+    let note_dir = dir.path().join("绝区零").join("角色");
+    std::fs::create_dir_all(&note_dir).unwrap();
+    let note_path = note_dir.join("雅.md");
+    std::fs::write(&note_path, "这是一段无关内容").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&note_path)).unwrap().value;
     let hits = kb.search(&SearchRequest { query: "角色".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
     assert!(hits.iter().any(|h| h.record["note_id"] == json!(note.header.id)));
 }
@@ -782,23 +790,66 @@ fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
     let raw = "# 标题\n\n这里有 **独有措辞** 正文。";
     std::fs::write(&path, raw).unwrap();
 
-    let note = kb.notes().upsert_file(NoteFileInput::new("docs/世界观.md", &path)).unwrap().value;
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
     assert_eq!(note.title, "世界观", "标题取文件名");
-    assert_eq!(note.content, raw, "正文是文件原文，清洗不改动正文");
+    assert_eq!(note.source, *path.to_string_lossy(), "路径即身份");
+    // 正文不落库：切片正文读时由文件原文派生。
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert!(chunks.iter().any(|c| c.content.contains("独有措辞")), "切片正文由文件原文派生");
 
     // 索引在分词前清洗：标记符不干扰，正文词照常命中切片。
     let hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
     assert!(!hits.is_empty(), "清洗后的文本仍可检索");
 
-    // 同一 source 重新同步：定位到同一笔记、更新正文、重建切片。
+    // 同一路径重新同步：定位到同一笔记、更新正文、重建切片。
     std::fs::write(&path, "改过的正文 **新词** 在这里。").unwrap();
-    let updated = kb.notes().upsert_file(NoteFileInput::new("docs/世界观.md", &path)).unwrap().value;
-    assert_eq!(updated.header.id, note.header.id, "同一 source 复用同一笔记");
-    assert_eq!(updated.content, "改过的正文 **新词** 在这里。");
+    let updated = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    assert_eq!(updated.header.id, note.header.id, "同一路径复用同一笔记");
+    let hits = kb.search(&SearchRequest { query: "新词".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert!(!hits.is_empty(), "更新后的正文进入索引");
 
     // 文件不存在与非 UTF-8 都直接报错，不落库。
-    assert!(kb.notes().upsert_file(NoteFileInput::new("missing", dir.path().join("nope.md"))).is_err());
+    assert!(kb.notes().upsert_file(NoteFileInput::new(dir.path().join("nope.md"))).is_err());
     let bad = dir.path().join("bad.md");
     std::fs::write(&bad, [0xffu8, 0xfe, 0xfd]).unwrap();
-    assert!(kb.notes().upsert_file(NoteFileInput::new("bad", &bad)).is_err());
+    assert!(kb.notes().upsert_file(NoteFileInput::new(&bad)).is_err());
+}
+
+/// 笔记正文只在宿主文件里：库内任何文本列都不留副本，切片正文读时从文件取回。
+#[test]
+fn note_body_stays_in_the_file_not_in_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let path = dir.path().join("note.md");
+    std::fs::write(&path, "ZZBODYMARK 独有正文标记").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+
+    // 显式读切片正文：由文件原文派生。
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert!(chunks.iter().any(|chunk| chunk.content.contains("ZZBODYMARK")));
+    drop(kb);
+
+    // 库内所有文本列都不含正文标记。
+    let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+    let mut stmt = conn.prepare("SELECT payload_json||metadata_json||evidence_json FROM records").unwrap();
+    let hits = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .filter(|row| row.as_ref().unwrap().contains("ZZBODYMARK")).count();
+    assert_eq!(hits, 0, "笔记正文不落 SQLite");
+}
+
+/// 文件缺失时：派生路径容错（库仍能打开重建索引），显式读正文报错。
+#[test]
+fn missing_source_file_is_tolerated_by_derived_paths_but_errors_on_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let path = dir.path().join("gone.md");
+    std::fs::write(&path, "会被删掉的正文").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    let chunk_id = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    std::fs::remove_file(&path).unwrap();
+
+    assert!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).is_err(), "文件缺失时显式读正文报错");
+    drop(kb);
+    // 重新打开：索引重建遇到缺失文件不应让整库打不开。
+    KnowledgeBase::open(dir.path()).expect("缺失文件的库仍能打开");
 }

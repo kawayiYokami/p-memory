@@ -174,8 +174,8 @@ _TOOLS = [
           ("subject_id", "predicate", "object_id")),
     _tool("event_upsert", "Save an event and its existing participant entity IDs.",
           {"id": _RECORD_ID, "name": _ID, "summary": _STR, "participants": _IDS, "confidence": _CONFIDENCE, "reason": _STR}, ("name",)),
-    _tool("note_upsert", "Save a Markdown/TXT content snapshot and indexed chunks in the database. Source is a label; no filesystem file is written.",
-          {"source": _ID, "title": _STR, "content": _STR, "tags": _TAGS}, ("source", "content")),
+    _tool("note_upsert", "Read a Markdown/TXT file from disk and index its chunks. The path is the identity; the body stays in the file, never copied into the database.",
+          {"path": _STR, "tags": _TAGS}, ("path",)),
 ]
 _READ_TOOLS = {"memory_search", "record_get", "graph_resolve", "graph_neighbors"}
 
@@ -321,7 +321,7 @@ class SimpleAgent:
         if name == "event_upsert":
             return self.kb.graph.apply_batch(events=[self._input(args)])
         if name == "note_upsert":
-            return self.kb.notes.upsert(self._input(args))
+            return self.kb.notes.upsert_file(self._input(args))
         raise ValidationError(f"unknown tool: {name}")
 
     def _tool_result(self, name: str, arguments: str) -> tuple[dict, dict]:
