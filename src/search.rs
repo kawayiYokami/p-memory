@@ -147,27 +147,6 @@ impl KnowledgeBase {
         self.index()?.search(query, filter, kinds, limit)
     }
 
-    /// 全文索引不可用时的兜底：直接扫权威库的 `search_text`，按命中的词数排序。
-    /// 结果会比派生索引粗，但绝不返回空、也绝不报错。
-    fn search_text_fallback(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
-        let tokens = text::query_terms(query, false);
-        if tokens.is_empty() { return Ok(Vec::new()); }
-        let (condition, mut values) = storage::filter_sql(filter, kinds, false)?;
-        let likes = vec!["r.search_text LIKE ?"; tokens.len()].join(" OR ");
-        for token in &tokens { values.push(SqlValue::Text(format!("%{token}%"))); }
-        values.push(SqlValue::Integer(limit as i64));
-        let mut stmt = conn.prepare(&format!("SELECT r.id,r.search_text FROM records r WHERE {condition} AND ({likes}) ORDER BY r.id LIMIT ?"))?;
-        let mut scored = Vec::new();
-        for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-            let (id, body) = row?;
-            let score = tokens.iter().filter(|token| body.contains(token.as_str())).count() as f64;
-            scored.push((RecordKey { id }, score));
-        }
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(limit);
-        Ok(scored)
-    }
-
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         storage::validate_filter(&request.filter)?;
         storage::validate_limit(request.limit)?;
@@ -220,10 +199,10 @@ impl KnowledgeBase {
         if request.text {
             let text_hits = match self.search_text(conn, query, &request.filter, &request.kinds, limit) {
                 Ok(hits) => Some(hits),
-                // 派生索引不可用：隔离它、退到 SQLite 直查，权威数据不受影响。
+                // 派生索引不可用：隔离它，文本路返回空；矢量路不受影响。
                 Err(Error::Index(_)) | Err(Error::Closed) => {
                     diagnostics.degraded.push(Degrade::TextIndexUnavailable);
-                    Some(self.search_text_fallback(conn, query, &request.filter, &request.kinds, limit)?)
+                    Some(Vec::new())
                 }
                 Err(error) => return Err(error),
             };
@@ -263,7 +242,11 @@ impl KnowledgeBase {
                 let truncated = ranked.len().saturating_sub(options.max_docs);
                 ranked.truncate(options.max_docs);
                 let ids: Vec<i64> = ranked.iter().map(|(key, _)| key.id).collect();
-                let bodies = storage::search_texts(conn, &ids)?;
+                // 候选正文取自索引的 stored 字段（切片正文在这里）；索引不可用时退回按 payload 现算。
+                let bodies = match self.index() {
+                    Ok(index) => index.bodies(&ids)?,
+                    Err(_) => storage::search_texts(conn, &ids)?,
+                };
                 let documents: Vec<String> = ids.iter()
                     .map(|id| bodies.get(id).map(String::as_str).unwrap_or(""))
                     .map(|body| text::truncate_to_tokens(body, options.max_tokens_per_doc))

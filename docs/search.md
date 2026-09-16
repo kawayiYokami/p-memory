@@ -106,7 +106,7 @@ flowchart LR
 | 严格 | 全部词项 `Must` 命中 | 精确匹配优先 |
 | 宽松 | 词项 `Should` 命中 | 补充召回 |
 
-结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。索引侧 schema 为 `key/namespace/scope/kind/tags/keywords/text`：`text` 使用预切分的空白分词器（`pretokenized`）承担正文 1+2 分词召回；`tags` 与 `keywords` 是精确整词字段（`STRING`），`keywords` 收纳各记录的 tags 与笔记 `source` 的各级父目录名，查询时按整词与正文并行 `Should` 召回——打关键字即能命中，且专有名词不被切碎。
+结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。索引侧 schema 为 `key/namespace/scope/kind/tags/keywords/text/body`：`text` 使用预切分的空白分词器（`pretokenized`）承担正文 1+2 分词召回；`body` 是同一段未分词正文的 stored 字段，供重排取候选正文与命中回读，索引不可用时改由 payload 现算；`tags` 与 `keywords` 是精确整词字段（`STRING`），`keywords` 收纳各记录的 tags 与笔记 `source` 的各级父目录名，查询时按整词与正文并行 `Should` 召回——打关键字即能命中，且专有名词不被切碎。
 
 ## 向量检索
 
@@ -131,7 +131,7 @@ flowchart LR
 | 纯全文 | 目标空间没注册嵌入回调 | `no_embedder` |
 | 纯全文 | 嵌入回调调用失败 | `embed_failed` |
 | 按融合分排序 | 重排回调失败或产出不符 | `rerank_failed` |
-| SQLite 直查 | 全文派生索引不可用 | `text_index_unavailable` |
+| 文本路不可用 | 全文派生索引查询失败（故障隔离） | `text_index_unavailable` |
 
 任一档都返回结果、不抛错、不返回空；当前档位可从 `SearchResult.diagnostics.degraded` 与 `HealthReport.last_degraded` 读到。
 
@@ -145,6 +145,6 @@ flowchart LR
 
 - SQLite 与 Tantivy 之间用可重放的 `index_updates` 日志衔接，每条日志记录 `(revision, record_id)`：
   `revision` 既是主键也是重放游标，`record_id` 指向待同步的那条记录。
-- 索引提交带 payload `p-memory-text-v2:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符即整体重建。
+- 索引提交带 payload `p-memory-text-v3:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符即整体重建。
 - 索引目录损坏时**隔离并重建**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再新建空索引，权威数据库不受影响。
 - 检索前若有待处理更新会先重放，保证结果与已提交数据一致。

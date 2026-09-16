@@ -346,7 +346,7 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInput,
-    payload: &Value, search_text: &str, embedding_text: &str) -> Result<RecordHeader> {
+    payload: &Value, embedding_text: &str) -> Result<RecordHeader> {
     validate_identity("namespace", &input.namespace)?;
     validate_identity("scope", &input.scope)?;
     for evidence in &input.evidence {
@@ -383,18 +383,18 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
         Some(id) => {
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET namespace_id=?2,kind=?3,scope_id=?4,updated_at_us=?5,revision=?6,metadata_json=?7,
-                evidence_json=?8,search_text=?9,embedding_text=?10,fingerprint=?11,payload_json=?12 WHERE id=?1",
+                evidence_json=?8,fingerprint=?9,payload_json=?10 WHERE id=?1",
                 params![id, namespace_id, kind.code(), scope_id, updated, revision, metadata_json, evidence_json,
-                    search_text, embedding_text, fingerprint, payload_json])?;
+                    fingerprint, payload_json])?;
             // Updating text invalidates every space's embedding in the same transaction.
             conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
             (id, revision)
         }
         None => {
             conn.execute("INSERT INTO records(namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,
-                search_text,embedding_text,fingerprint,payload_json) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10,?11)",
+                fingerprint,payload_json) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9)",
                 params![namespace_id, kind.code(), scope_id, created, updated, metadata_json, evidence_json,
-                    search_text, embedding_text, fingerprint, payload_json])?;
+                    fingerprint, payload_json])?;
             let id = conn.last_insert_rowid();
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET revision=?2 WHERE id=?1", params![id, revision])?;
@@ -525,6 +525,23 @@ pub(crate) fn filter_sql(filter: &ReadFilter, kinds: &[RecordKind], by_ids: bool
     Ok((query, values))
 }
 
+/// 批量取回一批记录的可检索正文（按 kind 从 payload 现算）。
+/// 正常情况下重排候选正文取自 Tantivy 的 stored 字段；索引不可用时退到这里，仍然拿得到正文。
+pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() { return Ok(out); }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+    let mut stmt = conn.prepare(&format!("SELECT id,kind,payload_json FROM records WHERE id IN ({placeholders})"))?;
+    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))? {
+        let (id, kind_code, payload_json) = row?;
+        let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
+        let payload: Value = serde_json::from_str(&payload_json)?;
+        out.insert(id, search_text(conn, kind, &payload)?);
+    }
+    Ok(out)
+}
+
 /// 过滤条件下的匹配总数（截断之前）。`with_total` 打开时才调用。
 pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<usize> {
     let (condition, values) = filter_sql(filter, kinds, false)?;
@@ -532,18 +549,75 @@ pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[Rec
     Ok(count as usize)
 }
 
-/// 批量取回一批记录参与全文检索的文本，供重排回调作为 `documents`。
-pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
-    let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
-    let mut stmt = conn.prepare(&format!("SELECT id,search_text FROM records WHERE id IN ({placeholders})"))?;
-    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-        let (id, text_value) = row?;
-        out.insert(id, text_value);
-    }
-    Ok(out)
+/// 记录的可检索正文（写入时现算，不落 SQLite）。切片正文由其笔记原文按字符区间取出。
+pub(crate) fn search_text(conn: &Connection, kind: RecordKind, payload: &Value) -> Result<String> {
+    let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(match kind {
+        RecordKind::Memory => field("judgment"),
+        // 笔记正文不进全文索引，检索面交给切片；笔记记录只留标题。
+        RecordKind::Note => field("title"),
+        RecordKind::Chunk => {
+            let (title, content) = chunk_origin(conn, payload)?;
+            format!("{title}\n{}", char_slice(&content, payload))
+        }
+        RecordKind::Entity => entity_body(payload),
+        RecordKind::Relation => format!("{} {} {} {}", field("subject_name"), field("predicate"), field("object_name"), field("reason")),
+        RecordKind::Event => format!("{} {} {} {}", field("name"), field("summary"), name_list(payload), field("reason")),
+    })
+}
+
+/// 向量化的输入文本。记忆额外拼上标签，笔记带上正文，其余与可检索正文一致。
+pub(crate) fn embedding_text(conn: &Connection, kind: RecordKind, payload: &Value, tags: &[String]) -> Result<String> {
+    let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
+    Ok(match kind {
+        RecordKind::Memory => format!("{}\n{}", field("judgment"), tags.join(" ")),
+        RecordKind::Note => format!("{}\n{}", field("title"), field("content")),
+        _ => search_text(conn, kind, payload)?,
+    })
+}
+
+fn name_list(payload: &Value) -> String {
+    payload.get("participant_names").and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+fn entity_body(payload: &Value) -> String {
+    let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+    let aliases = payload.get("aliases").and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let summary = payload.get("summary").and_then(Value::as_str).unwrap_or("");
+    let attr_text = payload.get("attributes").and_then(Value::as_object).map(|attrs| {
+        attrs.iter().map(|(key, values)| {
+            let joined = values.as_array().map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            format!("{key} {joined}")
+        }).collect::<Vec<_>>().join(" ")
+    }).unwrap_or_default();
+    format!("{name} {aliases} {summary} {attr_text}")
+}
+
+/// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间。
+fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, String)> {
+    let note_id = payload.get("note_id").and_then(Value::as_i64).ok_or_else(|| Error::Validation("chunk payload is missing note_id".into()))?;
+    let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [note_id], |r| r.get(0))?;
+    let note: Value = serde_json::from_str(&raw)?;
+    Ok((note.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+        note.get("content").and_then(Value::as_str).unwrap_or("").to_string()))
+}
+
+/// 按 payload 里的 `char_start` / `char_end` 从原文取切片正文。
+fn char_slice(content: &str, payload: &Value) -> String {
+    let start = payload.get("char_start").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let end = payload.get("char_end").and_then(Value::as_u64).unwrap_or(0) as usize;
+    content.chars().skip(start).take(end.saturating_sub(start)).collect()
+}
+
+/// 取某条切片记录的正文（由所属笔记原文按字符区间切出）。
+pub(crate) fn chunk_content(conn: &Connection, chunk_id: i64) -> Result<String> {
+    let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [chunk_id], |r| r.get(0))?;
+    let payload: Value = serde_json::from_str(&raw)?;
+    let (_, content) = chunk_origin(conn, &payload)?;
+    Ok(char_slice(&content, &payload))
 }
 
 pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;

@@ -1,6 +1,6 @@
 # 数据模型
 
-所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。
+所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。可检索正文不落 SQLite：写入时按 payload 现算，交给全文索引的 stored 字段承载。
 
 ## 记录类型
 
@@ -223,12 +223,13 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 struct NoteInput { source: String, title: String, content: String, chunk_chars: usize /* 默认 220 */ }
 struct Note   { header, source, title, content, source_revision, chunk_chars, chunk_count }
 struct Chunk  { header, note_id, ordinal, offset, limit, content }
-struct TextChunk { ordinal, offset, limit, content }
+struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 ```
 
 - `source` 必填；`(namespace, scope, source)` 唯一，重复写入按来源定位到同一笔记。
-- **核心只保存用于检索的正文快照，从不读写 `source` 指向的文件。**
+- 笔记正文的权威副本存在库内（`payload_json.content`）；`source` 只是宿主路径的快照，核心不去读写它。
 - **路径与标题只存在笔记这一层**；切片不重复存 `source`/`title`，需要时经 `note_id` 关联取回。
+- **切片正文也不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由笔记原文按字符区间取出。
 - 切片规则见 [笔记切片](#笔记切片)。
 - `source_revision = sha256(content)`。
 - 正文替换时在同一事务内原子重建切片投影：`chunks` 存内容指纹 `fingerprint`，`ordinal` 与内容都未变的切片保留其整数 `record_id`，向量继续有效；失效的旧切片连同向量一并删除。
@@ -238,7 +239,7 @@ struct TextChunk { ordinal, offset, limit, content }
 - 按段落切分，目标 `chunk_chars`（范围 16..=100000，默认 220）。
 - **围栏代码块与表格整体保留**，即使超过目标大小也不拆分。
 - `offset` 从 **1** 开始（起始行），`limit` 为行数；两者的计数单位都是**行**。
-- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号。
+- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；`char_start`/`char_end` 是切片在笔记原文里的字符区间（含起、不含止），行号因此无法唯一定位的超长段落靠它精确取回切片正文。
 - 标题来自笔记层，仍进正文；`source` 路径作为精确整词关键字进 `keywords` 字段（含各级父目录名），不进正文参与切分。
 
 ## 领域四：向量与重排（EmbeddingSpace / Embedder / Reranker）
@@ -290,7 +291,8 @@ struct RerankerOptions  { max_docs: usize, max_tokens_per_doc: usize, max_tokens
 ### 多档降级
 
 - 写入侧：模型可用则正常生成；模型不可用或该 namespace 关了向量化时，**记录照常写入**、向量留待补齐，不抛错。
-- 检索侧：全档是文本 + 向量融合；往下依次是「关向量化的 namespace → 纯全文」「回调挂了 → 纯全文」「全文索引坏了 → 退 SQLite 直查」。任一档都返回结果、不抛错、不返回空，当前落在哪一档见 `SearchDiagnostics.degraded` 与 `HealthReport.last_degraded`。
+- 检索侧：全档是文本 + 向量融合；往下依次是「关向量化的 namespace → 纯全文」「回调挂了 → 纯全文」。任一档都返回结果、不抛错、不返回空，当前落在哪一档见 `SearchDiagnostics.degraded` 与 `HealthReport.last_degraded`。
+- 检索的降级只到纯全文为止，不设比 BM25 更弱的检索档；索引查询失败按故障隔离（文本路不可用、向量路照常，记 `text_index_unavailable`），索引目录损坏则在打开时隔离重建。
 
 
 ## 错误码

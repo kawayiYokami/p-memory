@@ -53,7 +53,7 @@ Both print the hit count, which paths ran, and whether reranking truncated. The 
 
 **The graph** — entities, relations, and events. Find an entity by name, look at its neighborhood, or trace the shortest way two entities are connected.
 
-**Notes** — documents chunked by paragraph, each chunk keeping its source file and line range.
+**Notes** — documents chunked by paragraph; each chunk keeps only a line and character range into the note, not its own copy of the text. The searchable text lives in the full-text index.
 
 **Isolation** — memories, the graph, and notes all support separation by domain and by agent. One store can serve several domains and several agents at once, each seeing only its own.
 

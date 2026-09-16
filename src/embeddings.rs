@@ -275,7 +275,7 @@ pub(crate) fn namespace_vectorization(conn: &Connection, namespace: &str) -> Res
 /// 合格判定全部落在 SQL 里：记录类型默认开关、namespace 开关、指纹是否已补齐。
 /// 这样游标推进永远不会跳过仍需处理的记录，也不会把不合格记录反复取回来。
 pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, after: Option<i64>, ids: Option<&[i64]>) -> Result<Vec<EmbeddingInput>> {
-    let mut sql = String::from("SELECT r.id,r.embedding_text,r.fingerprint FROM records r JOIN strings n ON n.id=r.namespace_id WHERE 1=1");
+    let mut sql = String::from("SELECT r.id,r.kind,r.payload_json,r.fingerprint FROM records r JOIN strings n ON n.id=r.namespace_id WHERE 1=1");
     let mut values: Vec<SqlValue> = Vec::new();
     let disabled: Vec<RecordKind> = [RecordKind::Memory, RecordKind::Entity, RecordKind::Relation, RecordKind::Event, RecordKind::Note, RecordKind::Chunk]
         .into_iter().filter(|kind| !vectorized_by_default(*kind)).collect();
@@ -299,11 +299,24 @@ pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, aft
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
-    for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-        let (id, body, fingerprint) = row?;
+    for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
+        let (id, kind_code, payload_json, fingerprint) = row?;
+        // 向量输入文本不落盘：按 kind 从 payload 现算（记忆额外拼标签，切片由其笔记正文取出）。
+        let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        let tags = record_tags(conn, id)?;
+        let body = storage::embedding_text(conn, kind, &payload, &tags)?;
         items.push(EmbeddingInput { key: RecordKey { id }, text: body, fingerprint });
     }
     Ok(items)
+}
+
+/// 一条记录的标签文本（按字典序，与写入时 `normalize_tags` 的顺序一致）。
+fn record_tags(conn: &Connection, id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1 ORDER BY t.text")?;
+    let mut tags = Vec::new();
+    for row in stmt.query_map([id], |r| r.get::<_, String>(0))? { tags.push(row?); }
+    Ok(tags)
 }
 
 /// 单批回调的结果。

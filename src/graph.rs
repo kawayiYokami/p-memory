@@ -81,7 +81,7 @@ pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<En
     let attr_text = attributes.iter().map(|(k, values)| format!("{k} {}", values.join(" "))).collect::<Vec<_>>().join(" ");
     let body = format!("{} {} {} {}", input.name, aliases.join(" "), input.summary, attr_text);
     let header = storage::put_record(conn, RecordKind::Entity, &input.record,
-        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body, &body)?;
+        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body)?;
     let entity_type_id = storage::term_id(conn, &input.entity_type)?;
     conn.execute("INSERT INTO entities(record_id,name,entity_type_id) VALUES (?1,?2,?3)
         ON CONFLICT(record_id) DO UPDATE SET name=excluded.name,entity_type_id=excluded.entity_type_id",
@@ -108,7 +108,8 @@ pub(crate) fn upsert_relation(conn: &Connection, input: &RelationInput) -> Resul
     let object = referenced_entity(conn, &input.record, input.object_id)?;
     let body = format!("{} {} {} {}", subject.name, input.predicate, object.name, input.reason);
     let header = storage::put_record(conn, RecordKind::Relation, &input.record,
-        &json!({"subject_id":input.subject_id,"predicate":input.predicate,"object_id":input.object_id,"confidence":input.confidence,"reason":input.reason}), &body, &body)?;
+        &json!({"subject_id":input.subject_id,"predicate":input.predicate,"object_id":input.object_id,"confidence":input.confidence,"reason":input.reason,
+            "subject_name":subject.name,"object_name":object.name}), &body)?;
     let predicate_id = storage::term_id(conn, &input.predicate)?;
     conn.execute("INSERT INTO relations(record_id,subject_id,predicate_id,object_id) VALUES (?1,?2,?3,?4)
         ON CONFLICT(record_id) DO UPDATE SET subject_id=excluded.subject_id,predicate_id=excluded.predicate_id,object_id=excluded.object_id",
@@ -123,7 +124,8 @@ pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<Even
     let names = participants.iter().map(|id| referenced_entity(conn, &input.record, *id).map(|e| e.name)).collect::<Result<Vec<_>>>()?;
     let body = format!("{} {} {} {}", input.name, input.summary, names.join(" "), input.reason);
     let header = storage::put_record(conn, RecordKind::Event, &input.record,
-        &json!({"name":input.name,"summary":input.summary,"participants":participants,"confidence":input.confidence,"reason":input.reason}), &body, &body)?;
+        &json!({"name":input.name,"summary":input.summary,"participants":participants,"confidence":input.confidence,"reason":input.reason,
+            "participant_names":names}), &body)?;
     conn.execute("DELETE FROM event_participants WHERE event_id=?1", [header.id])?;
     for id in &participants {
         conn.execute("INSERT INTO event_participants(event_id,entity_id) VALUES (?1,?2)", params![header.id, id])?;
@@ -159,21 +161,30 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>
         let value = storage::record_value(conn, &key)?.ok_or_else(|| Error::NotFound(key.id.to_string()))?;
         let kind_code: i64 = conn.query_row("SELECT kind FROM records WHERE id=?1", [key.id], |r| r.get(0))?;
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
-        let body = if kind == RecordKind::Relation {
-            let r: Relation = serde_json::from_value(value)?;
+        // 正文由 payload 字段现拼；实体改名时，把新名字写回 payload 的名称快照并推进指纹。
+        let (body, patch) = if kind == RecordKind::Relation {
+            let r: Relation = serde_json::from_value(value.clone())?;
             let input = r.header.as_input();
-            format!("{} {} {} {}", referenced_entity(conn, &input, r.subject_id)?.name,
-                r.predicate, referenced_entity(conn, &input, r.object_id)?.name, r.reason)
+            let subject = referenced_entity(conn, &input, r.subject_id)?.name;
+            let object = referenced_entity(conn, &input, r.object_id)?.name;
+            (format!("{} {} {} {}", subject, r.predicate, object, r.reason), json!({"subject_name":subject,"object_name":object}))
         } else {
-            let e: Event = serde_json::from_value(value)?;
+            let e: Event = serde_json::from_value(value.clone())?;
             let names = e.participants.iter().map(|id| referenced_entity(conn, &e.header.as_input(), *id).map(|v| v.name)).collect::<Result<Vec<_>>>()?;
-            format!("{} {} {} {}", e.name, e.summary, names.join(" "), e.reason)
+            (format!("{} {} {} {}", e.name, e.summary, names.join(" "), e.reason), json!({"participant_names":names}))
         };
-        let old: String = conn.query_row("SELECT embedding_text FROM records WHERE id=?1", [key.id], |r| r.get(0))?;
+        let old = storage::search_text(conn, kind, &value)?;
         if old != body {
+            let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [key.id], |r| r.get(0))?;
+            let mut payload: serde_json::Value = serde_json::from_str(&raw)?;
+            if let Some(object) = payload.as_object_mut() {
+                if let Some(extra) = patch.as_object() {
+                    for (name, value) in extra { object.insert(name.clone(), value.clone()); }
+                }
+            }
             let revision = storage::next_revision(conn, key.id)?;
-            conn.execute("UPDATE records SET search_text=?2,embedding_text=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
-                params![key.id, body, text::digest(&format!("text-v1\n{body}")), revision, storage::now_us()])?;
+            conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
+                params![key.id, serde_json::to_string(&payload)?, text::digest(&format!("text-v1\n{body}")), revision, storage::now_us()])?;
             conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
             rewritten.push(key.id);
         }

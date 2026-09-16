@@ -194,7 +194,10 @@ fn writes_vectorize_in_place_and_notes_stay_out_by_default() {
     let vector_hits = kb.search(&vector_query("v", "笔记正文里的独有措辞", vec![RecordKind::Note, RecordKind::Chunk])).unwrap().hits;
     assert!(vector_hits.is_empty(), "笔记默认不应生成向量");
     let text_hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Note, RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-    assert!(text_hits.iter().any(|hit| hit.record["source"] == json!("docs/a.md")));
+    // 笔记正文不进索引，检索面交给切片：命中落在切片上，正文由笔记原文派生。
+    let chunk_id = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    assert!(text_hits.iter().any(|hit| hit.key.id == chunk_id), "正文命中应落在切片上");
+    assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "笔记正文里的独有措辞");
     assert_eq!(note.chunk_count, 1);
 }
 

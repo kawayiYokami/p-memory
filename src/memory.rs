@@ -102,7 +102,7 @@ pub(crate) fn upsert(conn: &Connection, input: &MemoryInput) -> Result<Memory> {
     let memory_type_id = storage::term_id(conn, &input.memory_type)?;
     let payload = json!({"memory_type_id": memory_type_id, "judgment": judgment, "reasoning": reasoning,
         "state": state, "judgment_key": text::normalized_tag(&judgment)});
-    let header = storage::put_record(conn, RecordKind::Memory, &input.record, &payload, &judgment, &embedding_text)?;
+    let header = storage::put_record(conn, RecordKind::Memory, &input.record, &payload, &embedding_text)?;
     Ok(Memory { header, memory_type: input.memory_type.clone(), judgment, reasoning, state })
 }
 

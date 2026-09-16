@@ -1,15 +1,15 @@
 use crate::{storage, text, types::*, Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
-use std::{collections::{BTreeSet, HashMap, HashSet}, path::Path};
-use tantivy::{collector::{TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, path::Path};
+use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v2";
+const FORMAT: &str = "p-memory-text-v3";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, keywords: Field, text: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, keywords: Field, text: Field, body: Field }
 /// 文本索引。`IndexReader` 可并发检索，`IndexWriter` 收进内部互斥锁：
 /// 整个结构可以直接共享给多个读线程，提交只在写者之间串行。
 pub(crate) struct TextIndex { index: Index, reader: IndexReader, writer: Mutex<IndexWriter>, fields: Fields }
@@ -28,6 +28,8 @@ impl TextIndex {
             keywords: builder.add_text_field("keywords", STRING),
             text: builder.add_text_field("text", TextOptions::default().set_indexing_options(
                 TextFieldIndexing::default().set_tokenizer("pretokenized").set_index_option(IndexRecordOption::WithFreqsAndPositions))),
+            // 可检索正文的存储字段：SQLite 不再保留派生文本，重排候选与切片正文从这里取回。
+            body: builder.add_text_field("body", STORED),
         };
         let schema = builder.build();
         let open = || -> Result<Index> {
@@ -60,14 +62,18 @@ impl TextIndex {
     fn add_current(&self, writer: &mut IndexWriter, conn: &Connection, id: i64) -> Result<()> {
         let encoded = id.to_string();
         writer.delete_term(Term::from_field_text(self.fields.key, &encoded));
-        let row = conn.query_row("SELECT n.text,r.kind,s.text,r.search_text FROM records r
+        let row = conn.query_row("SELECT n.text,r.kind,s.text,r.payload_json FROM records r
             JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id=?1",
             [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))).optional()?;
-        if let Some((namespace, kind_code, scope, text_value)) = row {
+        if let Some((namespace, kind_code, scope, payload_json)) = row {
             let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Index("invalid stored record kind".into()))?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|e| Error::Index(e.to_string()))?;
+            // 可检索正文不落 SQLite，写入索引时按 kind 从 payload 现算。
+            let body = storage::search_text(conn, kind, &payload)?;
             let mut document = doc!(self.fields.key => encoded, self.fields.namespace => namespace,
                 self.fields.scope => scope, self.fields.kind => kind.as_str(),
-                self.fields.text => text::tokenize(&text_value).join(" "));
+                self.fields.body => body,
+                self.fields.text => text::tokenize(&body).join(" "));
             let mut tags = conn.prepare("SELECT t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1")?;
             for tag in tags.query_map([id], |r| r.get::<_, String>(0))? {
                 let tag = tag?;
@@ -197,5 +203,22 @@ impl TextIndex {
         result.sort_by(|a, b| strict_rank[&b.0].cmp(&strict_rank[&a.0]).then_with(|| b.1.total_cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
         result.truncate(limit);
         Ok(result)
+    }
+
+    /// 按 id 取回索引里存储的可检索正文：重排候选与「从命中直接取正文」都走这里，不再回 SQLite。
+    pub fn bodies(&self, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
+        let mut out = BTreeMap::new();
+        if ids.is_empty() { return Ok(out); }
+        let searcher = self.reader.searcher();
+        for id in ids {
+            let query = Self::exact(self.fields.key, &id.to_string());
+            if let Some(address) = searcher.search(&query, &DocSetCollector)?.into_iter().next() {
+                let document: tantivy::TantivyDocument = searcher.doc(address)?;
+                if let Some(body) = document.get_first(self.fields.body).and_then(|v| v.as_str()) {
+                    out.insert(*id, body.to_string());
+                }
+            }
+        }
+        Ok(out)
     }
 }

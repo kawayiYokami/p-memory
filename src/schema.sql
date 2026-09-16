@@ -13,8 +13,7 @@ CREATE TABLE records (
     scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
     created_at_us INTEGER NOT NULL, updated_at_us INTEGER NOT NULL, revision INTEGER NOT NULL,
     metadata_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
-    search_text TEXT NOT NULL, embedding_text TEXT NOT NULL, fingerprint TEXT NOT NULL,
-    payload_json TEXT NOT NULL
+    fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL
 );
 CREATE INDEX records_kind ON records(kind, id);
 CREATE INDEX records_scope ON records(namespace_id, kind, scope_id, id);

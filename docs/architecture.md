@@ -16,7 +16,7 @@ flowchart TD
     K --> API["KnowledgeBase"]
     API --> D["memories / graph / notes / embeddings / search"]
     D --> ST["SQLite store.sqlite3：权威"]
-    D --> IX["Tantivy text-v2：可重建投影"]
+    D --> IX["Tantivy text-v3：可重建投影"]
 ```
 
 - Rust 宿主直接依赖核心 crate；Python 宿主经 `p_memory` 绑定，绑定只做类型转换并把调用交给 `protocol.rs` 的 JSON 分发。
@@ -168,9 +168,10 @@ erDiagram
 
 关键点：
 
-- `records` 是所有领域的宽表，主键 `id` 自增整数，与任何外部 ID 无关；`kind` 区分领域；领域正文在 `payload_json`。记忆的 `memory_type` 也以 `memory_type_id` 存在 payload 内，指向 `strings`，读取时还原文本。
+- `records` 是所有领域的宽表，主键 `id` 自增整数，与任何外部 ID 无关；`kind` 区分领域；领域正文在 `payload_json`，它是正文的唯一权威副本。记忆的 `memory_type` 也以 `memory_type_id` 存在 payload 内，指向 `strings`，读取时还原文本。
+- 可检索正文与向量输入都是**派生文本**，不落 SQLite 列：写入时按 `kind` 从 `payload_json` 现算，可检索正文交给 Tantivy 的 stored 字段，需要时也能从 payload 重新推出来。
 - 各领域投影表（`entities`/`relations`/`notes`/`chunks` 等）的 `record_id` 直接复用 `records.id`，靠外键与级联删除维持一致性。
-- 路径与标题只在 `notes` 层存一次；`chunks` 不重复携带，经 `note_id` 取回。
+- 路径、标题与正文只在 `notes` 层存一次；`chunks` 不重复携带正文，只存 `note_id` 与行/字符区间，切片正文按区间从笔记原文取出。
 - `chunks.fingerprint` 保留「内容未变则复用向量」的语义：`ordinal` 与内容都没变的切片复用原 `record_id`，向量继续有效。
 - `embedding_spaces` 的 `id` 是文本（模型标识），`embeddings` 是「空间 × 记录」的复合主键。
 - `index_updates`、`import_runs`、`meta` 是辅助表：索引重放日志、导入批次指纹、修订号计数器。
@@ -191,7 +192,7 @@ sequenceDiagram
     S->>S: 字符串 → strings id（不存在则插入新行）
     S->>S: 写 records 与投影表，revision += 1，登记 index_updates
     S-->>K: 提交事务
-    K->>I: 同步全文索引
+    K->>I: 同步全文索引（可检索正文按 payload 现算，写入 stored 字段）
     K-->>H: WriteReceipt{ revision, index_ready }
 ```
 

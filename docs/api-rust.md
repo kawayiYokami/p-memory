@@ -154,6 +154,7 @@ impl NoteStore {
 
 - `upsert` 按 `(namespace, scope, source)` 定位：来源已存在则替换正文，否则新建。
 - 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
+- 切片只在 payload 里存 `note_id` 与行/字符区间，正文不落 SQLite；`get_chunk` / `chunks` 返回的 `Chunk.content` 由笔记原文按 `char_start`/`char_end` 取出。
 - `delete` 先删切片再删笔记。
 - `chunk_text(content, target)` 是公开辅助函数，可脱离数据库单独调用。
 
