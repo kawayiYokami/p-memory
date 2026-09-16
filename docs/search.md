@@ -131,9 +131,9 @@ flowchart LR
 | 纯全文 | 目标空间没注册嵌入回调 | `no_embedder` |
 | 纯全文 | 嵌入回调调用失败 | `embed_failed` |
 | 按融合分排序 | 重排回调失败或产出不符 | `rerank_failed` |
-| 文本路不可用 | 全文派生索引查询失败（故障隔离） | `text_index_unavailable` |
+| 文本路不可用 | 索引查询失败，且当场重建仍未能恢复 | `text_index_unavailable` |
 
-任一档都返回结果、不抛错、不返回空；当前档位可从 `SearchResult.diagnostics.degraded` 与 `HealthReport.last_degraded` 读到。
+任一档都返回结果、不抛错、不返回空；当前档位可从 `SearchResult.diagnostics.degraded` 与 `HealthReport.last_degraded` 读到。索引查询失败不是直接降级：检索会先按 `FORMAT` 与权威数据当场重建索引并重试，只有重建仍失败时才隔离文本路。
 
 ## 过滤
 

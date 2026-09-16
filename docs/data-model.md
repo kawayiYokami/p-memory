@@ -292,7 +292,7 @@ struct RerankerOptions  { max_docs: usize, max_tokens_per_doc: usize, max_tokens
 
 - 写入侧：模型可用则正常生成；模型不可用或该 namespace 关了向量化时，**记录照常写入**、向量留待补齐，不抛错。
 - 检索侧：全档是文本 + 向量融合；往下依次是「关向量化的 namespace → 纯全文」「回调挂了 → 纯全文」。任一档都返回结果、不抛错、不返回空，当前落在哪一档见 `SearchDiagnostics.degraded` 与 `HealthReport.last_degraded`。
-- 检索的降级只到纯全文为止，不设比 BM25 更弱的检索档；索引查询失败按故障隔离（文本路不可用、向量路照常，记 `text_index_unavailable`），索引目录损坏则在打开时隔离重建。
+- 检索的降级只到纯全文为止，不设比 BM25 更弱的检索档；索引查询失败先当场从权威数据重建并重试，重建后仍失败才隔离文本路（向量路照常，记 `text_index_unavailable`），索引目录损坏则在打开时隔离重建。
 
 
 ## 错误码

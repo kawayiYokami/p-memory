@@ -1,6 +1,8 @@
 use crate::{storage, text, types::*, Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, path::Path};
 use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
@@ -12,7 +14,13 @@ const FORMAT: &str = "p-memory-text-v3";
 struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, keywords: Field, text: Field, body: Field }
 /// 文本索引。`IndexReader` 可并发检索，`IndexWriter` 收进内部互斥锁：
 /// 整个结构可以直接共享给多个读线程，提交只在写者之间串行。
-pub(crate) struct TextIndex { index: Index, reader: IndexReader, writer: Mutex<IndexWriter>, fields: Fields }
+pub(crate) struct TextIndex {
+    index: Index, reader: IndexReader, writer: Mutex<IndexWriter>, fields: Fields,
+    /// 测试专用：注入查询故障，验证「索引查询失败即重建并重试」的恢复路径。
+    #[cfg(test)] pub(crate) fail_search: AtomicBool,
+    /// 测试专用：统计重建次数。
+    #[cfg(test)] pub(crate) rebuilds: AtomicUsize,
+}
 
 impl TextIndex {
     pub fn open(root: &Path) -> Result<Self> {
@@ -48,7 +56,9 @@ impl TextIndex {
         index.tokenizers().register("pretokenized", WhitespaceTokenizer::default());
         let writer = index.writer(20_000_000)?;
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
-        Ok(Self { index, reader, writer: Mutex::new(writer), fields })
+        Ok(Self { index, reader, writer: Mutex::new(writer), fields,
+            #[cfg(test)] fail_search: AtomicBool::new(false),
+            #[cfg(test)] rebuilds: AtomicUsize::new(0) })
     }
 
     pub fn document_count(&self) -> usize { self.reader.searcher().num_docs() as usize }
@@ -137,6 +147,8 @@ impl TextIndex {
     }
 
     pub fn rebuild(&self, conn: &Connection) -> Result<()> {
+        #[cfg(test)]
+        self.rebuilds.fetch_add(1, Ordering::SeqCst);
         let mut writer = self.writer.lock();
         writer.delete_all_documents()?;
         let mut stmt = conn.prepare("SELECT id FROM records ORDER BY id")?;
@@ -177,6 +189,8 @@ impl TextIndex {
     }
 
     pub fn search(&self, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
+        #[cfg(test)]
+        if self.fail_search.load(Ordering::SeqCst) { return Err(Error::Index("injected index failure".into())); }
         let mut result = Vec::new();
         let mut seen = HashSet::new();
         let searcher = self.reader.searcher();
