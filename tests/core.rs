@@ -837,9 +837,10 @@ fn note_body_stays_in_the_file_not_in_sqlite() {
     assert_eq!(hits, 0, "笔记正文不落 SQLite");
 }
 
-/// 文件缺失时：派生路径容错（库仍能打开重建索引），显式读正文报错。
+/// 文件缺失时：读正文（显式读取与全量重建索引）直接报错，不静默兜底——
+/// 按分工这是一致性被破坏，由上游主动删除记录来消除。
 #[test]
-fn missing_source_file_is_tolerated_by_derived_paths_but_errors_on_read() {
+fn missing_source_file_surfaces_as_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let path = dir.path().join("gone.md");
@@ -849,7 +850,5 @@ fn missing_source_file_is_tolerated_by_derived_paths_but_errors_on_read() {
     std::fs::remove_file(&path).unwrap();
 
     assert!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).is_err(), "文件缺失时显式读正文报错");
-    drop(kb);
-    // 重新打开：索引重建遇到缺失文件不应让整库打不开。
-    KnowledgeBase::open(dir.path()).expect("缺失文件的库仍能打开");
+    assert!(kb.rebuild_indexes().is_err(), "全量重建索引遇到缺失文件报错");
 }

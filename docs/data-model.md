@@ -232,7 +232,7 @@ struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 - **路径只在 `notes` 表存一次**（→strings），payload 不重复存 `source`；标题由路径派生，也不落库。
 - **切片正文不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由文件原文按字符区间取出。
 - 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文照旧保留原文。
-- 文件缺失时：索引/向量等**派生路径容错**，退回只索引标题，库仍能打开重建；**显式读正文**（`get_chunk` / `chunks`）报错。
+- 文件缺失时读正文直接报错（显式读取与索引全量重建都一样），不静默兜底——按分工这是一致性被破坏，由上游主动删除记录来消除。
 - 切片规则见 [笔记切片](#笔记切片)。
 - 正文替换时在同一事务内原子重建切片投影：`chunks` 存内容指纹 `fingerprint`，`ordinal` 与内容都未变的切片保留其整数 `record_id`，向量继续有效；失效的旧切片连同向量一并删除。
 

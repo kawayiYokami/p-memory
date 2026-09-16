@@ -575,10 +575,7 @@ pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload:
         RecordKind::Note => note_title(conn, id)?,
         RecordKind::Chunk => {
             let (title, content) = chunk_origin(conn, payload)?;
-            match content {
-                Some(content) => format!("{title}\n{}", char_slice(&content, payload)),
-                None => title,
-            }
+            format!("{title}\n{}", char_slice(&content, payload))
         }
         RecordKind::Entity => entity_body(payload),
         RecordKind::Relation => format!("{} {} {} {}", field("subject_name"), field("predicate"), field("object_name"), field("reason")),
@@ -593,8 +590,7 @@ pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, paylo
         RecordKind::Memory => format!("{}\n{}", field("judgment"), tags.join(" ")),
         RecordKind::Note => {
             let source = note_source(conn, id)?;
-            // 派生路径容错：文件缺失时退回只用标题，向量化不因单个文件消失而失败。
-            format!("{}\n{}", note_title(conn, id)?, std::fs::read_to_string(&source).unwrap_or_default())
+            format!("{}\n{}", note_title(conn, id)?, std::fs::read_to_string(&source)?)
         }
         _ => search_text(conn, id, kind, payload)?,
     })
@@ -632,12 +628,12 @@ fn entity_body(payload: &Value) -> String {
 }
 
 /// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间；
-/// 正文读时从笔记的宿主文件取，库里不留副本。派生路径（索引/向量/检索降级）对
-/// 文件缺失容错：取不到正文时返回 `None`，让该记录退回只索引标题，而不是整个库打不开。
-fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, Option<String>)> {
+/// 正文读时从笔记的宿主文件取，库里不留副本。文件缺失由上游负责删除记录，
+/// 因此这里直接报错，把不一致暴露出来，而不是静默兜底。
+fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, String)> {
     let note_id = payload.get("note_id").and_then(Value::as_i64).ok_or_else(|| Error::Validation("chunk payload is missing note_id".into()))?;
     let source = note_source(conn, note_id)?;
-    Ok((note_title(conn, note_id)?, std::fs::read_to_string(&source).ok()))
+    Ok((note_title(conn, note_id)?, std::fs::read_to_string(&source)?))
 }
 
 /// 按 payload 里的 `char_start` / `char_end` 从原文取切片正文。
@@ -652,7 +648,6 @@ pub(crate) fn chunk_content(conn: &Connection, chunk_id: i64) -> Result<String> 
     let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [chunk_id], |r| r.get(0))?;
     let payload: Value = serde_json::from_str(&raw)?;
     let (_, content) = chunk_origin(conn, &payload)?;
-    let content = content.ok_or_else(|| Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "note source file is missing or unreadable")))?;
     Ok(char_slice(&content, &payload))
 }
 

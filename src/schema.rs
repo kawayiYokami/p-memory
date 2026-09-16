@@ -176,17 +176,21 @@ mod tests {
     fn rolls_v4_forward_dropping_derived_columns() {
         let dir = tempfile::tempdir().unwrap();
         legacy_db(dir.path(), 4, "");
+        // 迁移后会按权威数据全量重建索引，笔记正文从宿主文件取：造一个真实文件。
+        let note_file = dir.path().join("a.md");
+        std::fs::write(&note_file, "甲乙丙").unwrap();
+        let source_path = note_file.to_string_lossy().replace('\\', "/");
         {
             let conn = Connection::open(dir.path().join("store.sqlite3")).unwrap();
-            conn.execute_batch(r#"
-                INSERT INTO strings(id,text) VALUES (10,'ns'),(11,'sc'),(12,'a.md');
+            conn.execute_batch(&format!(r#"
+                INSERT INTO strings(id,text) VALUES (10,'ns'),(11,'sc'),(12,'{source_path}');
                 INSERT INTO records(id,namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,search_text,embedding_text,fingerprint,payload_json)
-                VALUES (1,10,4,11,1,1,1,'{}','[]','T','T','nf','{"source":"a.md","title":"T","content":"甲乙丙","source_revision":"x","chunk_chars":220,"chunk_count":1}');
+                VALUES (1,10,4,11,1,1,1,'{{}}','[]','T','T','nf','{{"source":"{source_path}","title":"T","content":"甲乙丙","source_revision":"x","chunk_chars":220,"chunk_count":1}}');
                 INSERT INTO notes(record_id,namespace_id,scope_id,source_id) VALUES (1,10,11,12);
                 INSERT INTO records(id,namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,search_text,embedding_text,fingerprint,payload_json)
-                VALUES (2,10,5,11,1,1,1,'{}','[]','T','T','cfp','{"note_id":1,"ordinal":0,"offset":1,"limit":1,"content":"甲乙丙"}');
+                VALUES (2,10,5,11,1,1,1,'{{}}','[]','T','T','cfp','{{"note_id":1,"ordinal":0,"offset":1,"limit":1,"content":"甲乙丙"}}');
                 INSERT INTO chunks(record_id,note_id,ordinal,"offset","limit",fingerprint) VALUES (2,1,0,1,1,'cfp');
-            "#).unwrap();
+            "#)).unwrap();
         }
         let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
         assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
