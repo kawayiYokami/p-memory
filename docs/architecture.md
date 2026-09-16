@@ -90,7 +90,7 @@ erDiagram
     entities ||--o{ event_participants : "entity_id"
 
     records ||--|| notes : "record_id"
-    strings }o--o{ notes : "namespace_id / scope_id / source_id"
+    strings }o--o{ notes : "namespace_id / scope_id"
     notes ||--o{ chunks : "note_id"
     records ||--|| chunks : "record_id"
 
@@ -142,7 +142,7 @@ erDiagram
         INTEGER record_id PK
         INTEGER namespace_id FK
         INTEGER scope_id FK
-        INTEGER source_id FK
+        TEXT path
     }
     chunks {
         INTEGER record_id PK

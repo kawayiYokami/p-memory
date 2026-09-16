@@ -321,7 +321,7 @@ def test_health_exposes_core_counters(kb):
     kb.memories.upsert_by_judgment(judgment="一条记忆")
     report = kb.health()
 
-    assert report["schema_version"] == 6
+    assert report["schema_version"] == 7
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
     assert report["pending_index_updates"] == 0

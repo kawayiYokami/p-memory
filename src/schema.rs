@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -86,6 +86,28 @@ fn migrate_note_payloads(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v6 -> v7：笔记路径从 `strings` 标签字典改存本表 `path` 列（原样）。
+/// 路径是笔记自己的列，不是标签：进标签字典既无复用价值，又会被归一化改写
+/// （全角折半角、字母小写），改一个字符就指向另一个不存在的路径。
+/// 旧库里的字符串已被改写，只能原样搬过来，由上游按真实路径重新 `upsert_file` 覆盖。
+fn migrate_note_paths(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch("
+        CREATE TABLE notes_new (
+            record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+            namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
+            scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
+            path TEXT NOT NULL,
+            UNIQUE(namespace_id, scope_id, path)
+        );
+        INSERT INTO notes_new(record_id,namespace_id,scope_id,path)
+            SELECT n.record_id,n.namespace_id,n.scope_id,s.text
+            FROM notes n JOIN strings s ON s.id=n.source_id;
+        DROP TABLE notes;
+        ALTER TABLE notes_new RENAME TO notes;
+    ")?;
+    Ok(())
+}
+
 pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 0 && !(2..=SCHEMA_VERSION).contains(&version) {
@@ -110,7 +132,16 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
 }
 
 /// 逐版本前滚，每一步都在独立事务里：任何一步失败都不会留下半升级的库。
-fn migrate(conn: &mut Connection, mut version: i64) -> Result<()> {
+/// 个别步骤要重建表（v6→v7 的 notes），SQLite 官方流程要求重建表期间关闭外键——
+/// 否则 DROP 掉被 chunks 引用的 notes 会被拦下；pragma 只能在事务外改，故包一层。
+fn migrate(conn: &mut Connection, version: i64) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate_steps(conn, version);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    outcome
+}
+
+fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
     while version < SCHEMA_VERSION {
         let tx = conn.transaction()?;
         match version {
@@ -124,6 +155,8 @@ fn migrate(conn: &mut Connection, mut version: i64) -> Result<()> {
             // v5 -> v6：笔记 payload 不再留正文与派生字段（路径只在 notes 表，标题由路径派生），
             // 正文改由宿主文件承载；旧库里的副本就地摘除。
             5 => { migrate_note_payloads(&tx)?; }
+            // v6 -> v7：笔记路径从 strings 标签字典改存本表 path 列（原样）。
+            6 => { migrate_note_paths(&tx)?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -146,6 +179,18 @@ mod tests {
         if version < 5 {
             conn.execute_batch("ALTER TABLE records ADD COLUMN search_text TEXT NOT NULL DEFAULT ''; \
                 ALTER TABLE records ADD COLUMN embedding_text TEXT NOT NULL DEFAULT '';").unwrap();
+        }
+        // v7 之前 notes 用 source_id 引用标签字典；回退到旧版本时换回该形态，供 v6→v7 迁移验证。
+        if version < 7 {
+            conn.execute_batch("CREATE TABLE notes_legacy (
+                    record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+                    namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
+                    scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
+                    source_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
+                    UNIQUE(namespace_id, scope_id, source_id)
+                );
+                DROP TABLE notes;
+                ALTER TABLE notes_legacy RENAME TO notes;").unwrap();
         }
         conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -208,6 +253,8 @@ mod tests {
         assert!(note.get("title").is_none(), "笔记标题由路径派生，不落库");
         assert!(note.get("source").is_none(), "路径只落在 notes 表，payload 不重复");
         assert_eq!(note.get("chunk_chars").and_then(|v| v.as_u64()), Some(220), "只留切片粒度");
+        let migrated_path: String = conn.query_row("SELECT path FROM notes WHERE record_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(migrated_path, source_path, "笔记路径应从标签字典原样迁到 path 列");
     }
 }
 

@@ -78,7 +78,7 @@ enum RecordKind { Memory, Entity, Relation, Event, Note, Chunk }
 strings(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE)
 ```
 
-涵盖：`tag`、`memory_type`、`entity_type`、`predicate`、`attr_key`、`namespace`、`scope`、路径 `source`。`memory_type` 的值存于记忆 payload 的 `memory_type_id`，读取时经 `strings` 还原文本。
+涵盖：`tag`、`memory_type`、`entity_type`、`predicate`、`attr_key`、`namespace`、`scope`。`memory_type` 的值存于记忆 payload 的 `memory_type_id`，读取时经 `strings` 还原文本。
 
 - `text` 存归一化后的字符串，全表唯一。
 - 记录通过 id 列表引用，例如 tags `[1, 2, 3]` 对应 `我`、`身份`、`猪`。
@@ -220,16 +220,16 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 ## 领域三：笔记与切片（Note / Chunk）
 
 ```rust
-struct NoteFileInput { record, path, chunk_chars }   // 库自己读 path；路径即身份
+struct NoteFileInput { record, path, chunk_chars }   // 库自己读 path
 struct Note   { header, source, title, chunk_chars }
 struct Chunk  { header, note_id, ordinal, offset, limit, content }
 struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 ```
 
-- `path` 必填且**即身份**：写入 `(namespace, scope, source)` 的 `source` 直接取路径字符串，同一路径重复写入定位到同一笔记。
+- `path` 必填：写入时路径逐字符原样存进 `notes.path` 这一列；`UNIQUE(namespace_id, scope_id, path)` 只用于「同一文件重复同步定位到同一条」，路径不是笔记的身份，更不是标签。
 - `upsert_file` 按 `path` 读文件：正文取文件原文，标题取文件名（去扩展名）。
 - **库内不留正文**：笔记 payload 只存切片粒度 `chunk_chars`，正文权威是宿主文件；`Note` 已无 `content` 字段，正文经 `chunks()` 返回的切片 `content` 由文件原文按字符区间取出。
-- **路径只在 `notes` 表存一次**（→strings），payload 不重复存 `source`；标题由路径派生，也不落库。
+- **路径只在 `notes` 表存一次**：它既用来读文件、也用来定位同一条，`payload` 不重复存 `source`；标题由路径派生，也不落库。
 - **切片正文不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由文件原文按字符区间取出。
 - 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文照旧保留原文。
 - 文件缺失时读正文直接报错（显式读取与索引全量重建都一样），不静默兜底——按分工这是一致性被破坏，由上游主动删除记录来消除。

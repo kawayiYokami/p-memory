@@ -102,9 +102,9 @@ impl TextIndex {
     fn note_source(&self, conn: &Connection, id: i64, kind: RecordKind) -> Result<Option<String>> {
         let source = match kind {
             RecordKind::Note => conn.query_row(
-                "SELECT s.text FROM notes n JOIN strings s ON s.id=n.source_id WHERE n.record_id=?1", [id], |r| r.get::<_, String>(0)).optional()?,
+                "SELECT path FROM notes WHERE record_id=?1", [id], |r| r.get::<_, String>(0)).optional()?,
             RecordKind::Chunk => conn.query_row(
-                "SELECT s.text FROM chunks c JOIN notes n ON n.record_id=c.note_id JOIN strings s ON s.id=n.source_id WHERE c.record_id=?1", [id], |r| r.get::<_, String>(0)).optional()?,
+                "SELECT n.path FROM chunks c JOIN notes n ON n.record_id=c.note_id WHERE c.record_id=?1", [id], |r| r.get::<_, String>(0)).optional()?,
             _ => None,
         };
         Ok(source)

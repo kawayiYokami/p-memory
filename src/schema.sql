@@ -73,12 +73,13 @@ CREATE TABLE event_participants (
 CREATE INDEX events_by_entity ON event_participants(entity_id, event_id);
 
 -- 笔记持有路径/标题；切片不再重复携带 source/title，只经 note_id 关联取回。
+-- 路径是笔记自己的一列、逐字符原样：它既用来读文件、也用来定位同一条，不进标签字典。
 CREATE TABLE notes (
     record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
     namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
     scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
-    source_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
-    UNIQUE(namespace_id, scope_id, source_id)
+    path TEXT NOT NULL,
+    UNIQUE(namespace_id, scope_id, path)
 );
 CREATE TABLE chunks (
     record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,

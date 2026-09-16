@@ -8,12 +8,12 @@ use std::path::PathBuf;
 fn default_chunk_chars() -> usize { 220 }
 
 /// 按文件路径同步一篇笔记的入参：库自己读文件，标题取文件名（去扩展名）。
-/// 路径即身份——`(namespace, scope)` 下的定位键就是文件路径，库按它读回正文。
+/// 路径逐字符原样存为笔记自己的一列：既用它读回正文，也用它定位同一文件。
 /// 正文真相源是文件：清洗只作用于送进索引的文本，库内不留任何正文副本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteFileInput {
     #[serde(flatten)] pub record: RecordInput,
-    /// 要读取的文件路径，同时作为 `(namespace, scope, source)` 的定位键。
+    /// 要读取的文件路径，同时作为 `(namespace, scope, path)` 的定位键。
     pub path: PathBuf,
     #[serde(default = "default_chunk_chars")] pub chunk_chars: usize,
 }
@@ -151,9 +151,8 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<Note
     let mut record = input.record.clone();
     let namespace_id = storage::term_id(conn, &record.namespace)?;
     let scope_id = storage::term_id(conn, &record.scope)?;
-    let source_id = storage::term_id(conn, &source)?;
-    let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND source_id=?3",
-        params![namespace_id, scope_id, source_id], |r| r.get(0)).optional()?;
+    let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
+        params![namespace_id, scope_id, source], |r| r.get(0)).optional()?;
     if let Some(id) = existing {
         if record.id.is_some_and(|given| given != id) { return Err(Error::Conflict("source already belongs to another note ID".into())); }
         record.id = Some(id);
@@ -162,9 +161,9 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<Note
     let body = format!("{title}\n{content}");
     let header = storage::put_record(conn, RecordKind::Note, &record,
         &json!({"chunk_chars":input.chunk_chars}), &body)?;
-    conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,source_id) VALUES (?1,?2,?3,?4)
-        ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,source_id=excluded.source_id",
-        params![header.id, namespace_id, scope_id, source_id])?;
+    conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path) VALUES (?1,?2,?3,?4)
+        ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path",
+        params![header.id, namespace_id, scope_id, source])?;
     // Reuse the record ID of any slice whose ordinal和内容都未变，让它的向量继续有效。
     let mut old = Vec::new();
     {

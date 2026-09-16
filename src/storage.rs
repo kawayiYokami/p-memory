@@ -439,15 +439,15 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
         let (id, tag) = row?;
         tags.entry(id).or_default().push(tag);
     }
-    // 笔记只把路径落在 notes 表：读取时按 record_id 补回 source（及其派生 title），
-    // payload 里不再重复存路径，正文更不落库。
-    let mut note_sources: BTreeMap<i64, String> = BTreeMap::new();
+    // 笔记的路径是它自己的一列（原样）：读取时按 record_id 补回（及其派生 title），
+    // 路径不进标签字典，payload 里也不重复存。
+    let mut note_paths: BTreeMap<i64, String> = BTreeMap::new();
     {
-        let mut stmt = conn.prepare(&format!("SELECT n.record_id,s.text FROM notes n JOIN strings s ON s.id=n.source_id \
+        let mut stmt = conn.prepare(&format!("SELECT n.record_id,n.path FROM notes n \
             WHERE n.record_id IN ({placeholders})"))?;
         for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (id, source) = row?;
-            note_sources.insert(id, source);
+            note_paths.insert(id, source);
         }
     }
     for (id, namespace, kind_code, scope, created, updated, revision, metadata, evidence, payload) in rows {
@@ -464,7 +464,7 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
             payload.remove("memory_type_id");
         }
         if kind == RecordKind::Note {
-            let source = note_sources.remove(&id).unwrap_or_default();
+            let source = note_paths.remove(&id).unwrap_or_default();
             let title = std::path::Path::new(&source).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             payload.insert("source".into(), Value::String(source));
             payload.insert("title".into(), Value::String(title));
@@ -596,9 +596,9 @@ pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, paylo
     })
 }
 
-/// 笔记的宿主路径：只落在 `notes` 表（→strings），payload 里不再重复。
+/// 笔记的宿主路径：笔记自己的一列（原样），payload 里不再重复。
 fn note_source(conn: &Connection, note_id: i64) -> Result<String> {
-    Ok(conn.query_row("SELECT s.text FROM notes n JOIN strings s ON s.id=n.source_id WHERE n.record_id=?1",
+    Ok(conn.query_row("SELECT path FROM notes WHERE record_id=?1",
         [note_id], |r| r.get::<_, String>(0)).optional()?.unwrap_or_default())
 }
 
