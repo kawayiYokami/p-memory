@@ -230,6 +230,136 @@ fn namespace_switch_disables_vectorization_and_degrades() {
 }
 
 #[test]
+fn vectorization_targets_are_independent_per_namespace() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    // 内置默认：记忆与图谱开、笔记关。
+    assert!(kb.embeddings().vectorization("default", "memory").unwrap());
+    assert!(kb.embeddings().vectorization("default", "graph").unwrap());
+    assert!(!kb.embeddings().vectorization("default", "notes").unwrap());
+    // 档位名只认三档。
+    assert!(matches!(kb.embeddings().set_vectorization("default", "knowledge", true), Err(Error::Validation(_))));
+    assert!(matches!(kb.embeddings().vectorization("default", "文本"), Err(Error::Validation(_))));
+    // 关掉记忆档，图谱档与笔记档的取值不动。
+    kb.embeddings().set_vectorization("default", "memory", false).unwrap();
+    assert!(!kb.embeddings().vectorization("default", "memory").unwrap());
+    assert!(kb.embeddings().vectorization("default", "graph").unwrap());
+    assert!(!kb.embeddings().vectorization("default", "notes").unwrap());
+
+    let muted = kb.memories().upsert(memory("记忆档关闭时的措辞", "public")).unwrap().value.header.id;
+    let entity_id = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("记忆档关闭时写入的实体")], ..Default::default() })
+        .unwrap().value.entities[0].header.id;
+    // 记忆不生成向量；同一时刻写的实体照旧生成，两档互不牵连。
+    assert!(kb.search(&vector_query("v", "记忆档关闭时的措辞", vec![RecordKind::Memory])).unwrap().hits.is_empty());
+    assert_eq!(kb.search(&vector_query("v", "记忆档关闭时写入的实体", vec![RecordKind::Entity])).unwrap().hits[0].key.id, entity_id);
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的档位不该被 sync 补出向量");
+    // 开关只管「是否生成」：重新打开后这一条才补上向量。
+    kb.embeddings().set_vectorization("default", "memory", true).unwrap();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 1, "重新打开后 sync 补齐缺的那一条");
+    assert_eq!(kb.search(&vector_query("v", "记忆档关闭时的措辞", vec![RecordKind::Memory])).unwrap().hits[0].key.id, muted);
+}
+
+#[test]
+fn notes_switch_gates_chunk_vectors_and_keeps_existing_ones() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    let path = dir.path().join("n.md");
+    std::fs::write(&path, "切片正文里的独有措辞").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
+    let chunk = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    // 笔记档默认关：切片不进向量路，全文路照常命中在切片上。
+    assert!(kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits.is_empty());
+    assert_eq!(kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits[0].key.id, chunk);
+    // 打开笔记档：sync 补齐切片向量，向量路命中它，且向量取自切片正文本身。
+    kb.embeddings().set_vectorization("default", "notes", true).unwrap();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 1);
+    let hits = kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits;
+    assert_eq!(hits[0].key.id, chunk);
+    assert!((hits[0].vector_scores["v"] - 1.0).abs() < 1e-6, "查询词与切片正文逐字相同，余弦应为 1");
+    // 关掉笔记档：向量留在库里（sync 没有需要补的），只是不再进向量路。
+    kb.embeddings().set_vectorization("default", "notes", false).unwrap();
+    assert!(kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits.is_empty());
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "已有向量仍在，无需重算");
+    kb.embeddings().set_vectorization("default", "notes", true).unwrap();
+    assert_eq!(kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits[0].key.id, chunk);
+}
+
+#[test]
+fn namespace_master_switch_overrides_every_target() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.embeddings().set_namespace_vectorization("other", false).unwrap();
+    // 域级键不渗进档位读取：三档仍按各自的内置默认。
+    assert!(kb.embeddings().vectorization("other", "memory").unwrap());
+    assert!(!kb.embeddings().vectorization("other", "notes").unwrap());
+    // 三档全开也压不过总闸。
+    for target in ["memory", "graph", "notes"] { kb.embeddings().set_vectorization("other", target, true).unwrap(); }
+    let mut muted = memory("总闸关闭时的措辞", "public"); muted.record.namespace = "other".into();
+    kb.memories().upsert(muted).unwrap();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0);
+    let request = SearchRequest { query: "总闸关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
+        embed_space: Some("v".into()), ..Default::default() };
+    let result = kb.search(&request).unwrap();
+    assert!(result.diagnostics.degraded.contains(&Degrade::NamespaceDisabled));
+    assert!(!result.diagnostics.vector_used, "总闸关闭时不走向量路");
+    assert!(!result.hits.is_empty(), "总闸只关向量路，全文路照常给结果");
+}
+
+#[test]
+fn vectorization_switches_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+        kb.embeddings().set_vectorization("default", "memory", false).unwrap();
+        kb.embeddings().set_vectorization("default", "notes", true).unwrap();
+        kb.close().unwrap();
+    }
+    let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    assert!(!kb.embeddings().vectorization("default", "memory").unwrap());
+    assert!(kb.embeddings().vectorization("default", "notes").unwrap());
+    assert!(kb.embeddings().vectorization("default", "graph").unwrap(), "没设过的档位仍取内置默认");
+    kb.memories().upsert(memory("重开之后写入的记忆", "public")).unwrap();
+    std::fs::write(dir.path().join("n.md"), "重开之后写入的切片").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(dir.path().join("n.md"))).unwrap();
+    kb.update_index().unwrap();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 1, "只有笔记档那一条会被补上");
+    assert!(kb.search(&vector_query("v", "重开之后写入的记忆", vec![RecordKind::Memory])).unwrap().hits.is_empty());
+    assert!(!kb.search(&vector_query("v", "重开之后写入的切片", vec![RecordKind::Chunk])).unwrap().hits.is_empty());
+}
+
+#[test]
+fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    let id = kb.memories().upsert(memory("待删除的记忆措辞", "public")).unwrap().value.header.id;
+    assert_eq!(kb.search(&vector_query("v", "待删除的记忆措辞", vec![RecordKind::Memory])).unwrap().hits[0].key.id, id);
+    // 关闭状态下删除：向量随记录一起消失。
+    kb.embeddings().set_vectorization("default", "memory", false).unwrap();
+    kb.memories().delete(id, &ReadFilter::default()).unwrap();
+    assert!(kb.search(&vector_query("v", "待删除的记忆措辞", vec![RecordKind::Memory])).unwrap().hits.is_empty());
+    // 关闭状态下改笔记正文：旧切片的向量照旧随记录作废，也不生成新的。
+    kb.embeddings().set_vectorization("default", "notes", true).unwrap();
+    let path = dir.path().join("n.md");
+    std::fs::write(&path, "第一版切片措辞").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
+    kb.embeddings().sync("v", 32).unwrap();
+    let first = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    assert_eq!(kb.search(&vector_query("v", "第一版切片措辞", vec![RecordKind::Chunk])).unwrap().hits[0].key.id, first);
+    // 关闭状态下改正文：旧切片的向量照旧随记录作废，也不生成新的。
+    kb.embeddings().set_vectorization("default", "notes", false).unwrap();
+    std::fs::write(&path, "第二版切片措辞").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+    kb.update_index().unwrap();
+    let second = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    assert_ne!(second, first);
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的笔记档不补新向量");
+    kb.embeddings().set_vectorization("default", "notes", true).unwrap();
+    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 1, "只有新切片需要补向量");
+    let mut wide = vector_query("v", "第二版切片措辞", vec![RecordKind::Chunk]); wide.limit = 10;
+    let hits = kb.search(&wide).unwrap().hits;
+    assert_eq!(hits[0].key.id, second);
+    assert!(hits.iter().all(|hit| hit.key.id != first), "旧切片的向量没有留下");
+}
+
+#[test]
 fn callback_failures_still_commit_and_degrade_to_text() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();

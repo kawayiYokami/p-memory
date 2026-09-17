@@ -254,35 +254,89 @@ fn decode_sq8(bytes: &[u8], dimension: usize) -> Result<(f32, Vec<i8>)> {
 
 // ── 向量化开关与默认值 ───────────────────────────────────────────────
 
-fn vectorize_key(namespace: &str) -> String { format!("vectorize:{}", text::normalized_tag(namespace)) }
+/// 一个领域下的三个独立开关：记忆、图谱、笔记。
+///
+/// 图谱这一档同时管住实体、关系、事件三类：它们同进同出，本次不细分。
+/// 笔记这一档落在切片上——笔记记录自己没有正文，给它算向量等于算空文本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorizeTarget { Memory, Graph, Notes }
 
-/// 记录类型是否默认生成向量。笔记与切片默认关闭：它们体积大、切分多，
-/// 走全文进重排候选即可；记忆与图谱记录默认开启。
-pub(crate) fn vectorized_by_default(kind: RecordKind) -> bool {
-    !matches!(kind, RecordKind::Note | RecordKind::Chunk)
+impl VectorizeTarget {
+    pub(crate) const ALL: [Self; 3] = [Self::Memory, Self::Graph, Self::Notes];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self { Self::Memory => "memory", Self::Graph => "graph", Self::Notes => "notes" }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        Self::ALL.into_iter().find(|target| target.as_str() == value)
+            .ok_or_else(|| Error::Validation(format!("vectorize target must be memory, graph or notes, got {value}")))
+    }
+
+    /// 该档覆盖的记录类型。
+    pub(crate) fn kinds(self) -> &'static [RecordKind] {
+        match self {
+            Self::Memory => &[RecordKind::Memory],
+            Self::Graph => &[RecordKind::Entity, RecordKind::Relation, RecordKind::Event],
+            Self::Notes => &[RecordKind::Chunk],
+        }
+    }
+
+    /// 没被显式设置过时的内置默认：记忆与图谱开、笔记关，新装库因此与旧行为一致。
+    fn default_enabled(self) -> bool { !matches!(self, Self::Notes) }
 }
 
-/// 该 namespace 是否启用向量化。缺省启用；开关由库落盘，宿主配置一次即生效。
+/// 领域级总闸的键。缺省启用；开关由库落盘，宿主配置一次即生效。
+fn vectorize_key(namespace: &str) -> String { format!("vectorize:{}", text::normalized_tag(namespace)) }
+
+/// 某档开关的键：`vectorize:<领域>:<档位>`。
+fn target_vectorize_key(namespace: &str, target: VectorizeTarget) -> String {
+    format!("{}:{}", vectorize_key(namespace), target.as_str())
+}
+
+/// 该 namespace 的领域级总闸。
 pub(crate) fn namespace_vectorization(conn: &Connection, namespace: &str) -> Result<bool> {
     let value: Option<i64> = conn.query_row("SELECT value FROM meta WHERE key=?1", [vectorize_key(namespace)], |r| r.get(0)).optional()?;
     Ok(value != Some(0))
+}
+
+/// 某档位在该 namespace 下的取值；没设置过就落到这一档的内置默认。
+pub(crate) fn target_vectorization(conn: &Connection, namespace: &str, target: VectorizeTarget) -> Result<bool> {
+    let value: Option<i64> = conn.query_row("SELECT value FROM meta WHERE key=?1", [target_vectorize_key(namespace, target)], |r| r.get(0)).optional()?;
+    Ok(value.map_or_else(|| target.default_enabled(), |value| value != 0))
+}
+
+/// 该 namespace 下真正启用向量化的记录类型；总闸关闭时为空。
+/// 生成侧与检索侧共用这一份判定，不各写一套。
+pub(crate) fn enabled_kinds(conn: &Connection, namespace: &str) -> Result<Vec<RecordKind>> {
+    if !namespace_vectorization(conn, namespace)? { return Ok(Vec::new()); }
+    let mut kinds = Vec::new();
+    for target in VectorizeTarget::ALL {
+        if target_vectorization(conn, namespace, target)? { kinds.extend_from_slice(target.kinds()); }
+    }
+    Ok(kinds)
+}
+
+/// `pending_batch` 的类型判定：按记录自己所属的 namespace 逐档放行。
+/// 档位覆盖范围与默认值都取自 `VectorizeTarget`，不在 SQL 里另写一遍。
+fn enabled_kinds_sql() -> String {
+    VectorizeTarget::ALL.iter().map(|target| {
+        let codes = target.kinds().iter().map(|kind| kind.code().to_string()).collect::<Vec<_>>().join(",");
+        format!("(r.kind IN ({codes}) AND COALESCE((SELECT value FROM meta WHERE key='vectorize:'||n.text||':{}'),{}) = 1)",
+            target.as_str(), i64::from(target.default_enabled()))
+    }).collect::<Vec<_>>().join(" OR ")
 }
 
 // ── 待嵌入批次（库内部） ─────────────────────────────────────────────
 
 /// 取一批「已启用、已声明、且缺当前指纹向量」的文本。
 ///
-/// 合格判定全部落在 SQL 里：记录类型默认开关、namespace 开关、指纹是否已补齐。
+/// 合格判定全部落在 SQL 里：领域总闸、档位开关、指纹是否已补齐。
 /// 这样游标推进永远不会跳过仍需处理的记录，也不会把不合格记录反复取回来。
 pub(crate) fn pending_batch(conn: &Connection, index: &crate::index::TextIndex, space_id: &str, limit: usize, after: Option<i64>, ids: Option<&[i64]>) -> Result<Vec<EmbeddingInput>> {
     let mut sql = String::from("SELECT r.id,r.kind,r.payload_json,r.fingerprint FROM records r JOIN strings n ON n.id=r.namespace_id WHERE 1=1");
     let mut values: Vec<SqlValue> = Vec::new();
-    let disabled: Vec<RecordKind> = [RecordKind::Memory, RecordKind::Entity, RecordKind::Relation, RecordKind::Event, RecordKind::Note, RecordKind::Chunk]
-        .into_iter().filter(|kind| !vectorized_by_default(*kind)).collect();
-    if !disabled.is_empty() {
-        sql.push_str(&format!(" AND r.kind NOT IN ({})", vec!["?"; disabled.len()].join(",")));
-        values.extend(disabled.iter().map(|kind| SqlValue::Integer(kind.code())));
-    }
+    sql.push_str(&format!(" AND ({})", enabled_kinds_sql()));
     sql.push_str(" AND COALESCE((SELECT value FROM meta WHERE key='vectorize:'||n.text),1)=1");
     sql.push_str(" AND NOT EXISTS(SELECT 1 FROM embeddings e WHERE e.space_id=? AND e.record_id=r.id AND e.fingerprint=r.fingerprint)");
     values.push(SqlValue::Text(space_id.into()));
@@ -426,6 +480,26 @@ impl EmbeddingStore {
         self.0.mutate(|tx| {
             tx.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![vectorize_key(namespace), i64::from(enabled)])?;
+            Ok(enabled)
+        })
+    }
+
+    /// 某档开关在该领域下的取值；没设置过时给出该档的内置默认。
+    /// `target` 取 `memory` / `graph` / `notes`。
+    pub fn vectorization(&self, namespace: &str, target: &str) -> Result<bool> {
+        storage::validate_identity("namespace", namespace)?;
+        let target = VectorizeTarget::parse(target)?;
+        let state = self.0.read()?;
+        target_vectorization(state.conn(), namespace, target)
+    }
+
+    /// 设置某档开关。只影响以后是否生成向量，已有向量保留在库里。
+    pub fn set_vectorization(&self, namespace: &str, target: &str, enabled: bool) -> Result<WriteReceipt<bool>> {
+        storage::validate_identity("namespace", namespace)?;
+        let target = VectorizeTarget::parse(target)?;
+        self.0.mutate(|tx| {
+            tx.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![target_vectorize_key(namespace, target), i64::from(enabled)])?;
             Ok(enabled)
         })
     }

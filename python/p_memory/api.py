@@ -264,6 +264,14 @@ class EmbeddingStore:
     def set_namespace_vectorization(self, namespace: str, enabled: bool) -> WriteReceipt:
         return self._kb.invoke("embeddings.set_namespace_vectorization", {"namespace": namespace, "enabled": enabled})
 
+    def vectorization(self, namespace: str, target: str) -> bool:
+        """某档开关在该领域下的取值；`target` 取 `memory` / `graph` / `notes`。"""
+        return self._kb.invoke("embeddings.vectorization", {"namespace": namespace, "target": target})
+
+    def set_vectorization(self, namespace: str, target: str, enabled: bool) -> WriteReceipt:
+        """设置某档开关；只决定以后是否生成向量，已有向量保留。"""
+        return self._kb.invoke("embeddings.set_vectorization", {"namespace": namespace, "target": target, "enabled": enabled})
+
     def sync(self, space_id: str, *, batch: int = 32) -> WriteReceipt:
         """库拿该空间注册的回调，把缺失向量的记录分批补齐；宿主不参与向量计算。"""
         return self._kb.invoke("embeddings.sync", {"space_id": space_id, "batch": batch})

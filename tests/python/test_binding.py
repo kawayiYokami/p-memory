@@ -275,6 +275,41 @@ def test_namespace_vectorization_switch_is_per_namespace(kb):
     assert result["hits"], "关掉向量化后全文路仍然给结果"
 
 
+def test_vectorization_targets_are_independent(kb, tmp_path):
+    """每个领域下三档独立开关：默认值、按档读写、非法档位名被拒、设置落盘。"""
+    kb.embeddings.register_space({"id": "v", "model": "m", "dimension": 4})
+    kb.embeddings.register_embedder("v", lambda texts: [[1.0, 0.0, 0.0, 0.0] for _ in texts])
+    assert kb.embeddings.vectorization("default", "memory") is True
+    assert kb.embeddings.vectorization("default", "graph") is True
+    assert kb.embeddings.vectorization("default", "notes") is False
+
+    kb.embeddings.set_vectorization("default", "memory", False)
+    kb.embeddings.set_vectorization("default", "notes", True)
+    assert kb.embeddings.vectorization("default", "memory") is False
+    assert kb.embeddings.vectorization("default", "graph") is True, "关掉一档不影响另一档"
+    with pytest.raises(ValidationError):
+        kb.embeddings.set_vectorization("default", "knowledge", True)
+    with pytest.raises(ValidationError):
+        kb.embeddings.vectorization("default", "记忆")
+
+    # 关掉的那档不生成向量，也不进向量路；全文路照常给结果。
+    kb.memories.upsert_by_judgment(judgment="关掉记忆档之后写入的内容")
+    muted = kb.search("关掉记忆档之后写入的内容", kinds=["memory"], embed_space="v", text=False)
+    assert muted["hits"] == []
+    assert muted["diagnostics"]["vector_used"] is False, "该档关闭时向量路整条不走"
+    assert kb.search("关掉记忆档之后写入的内容")["hits"], "全文路不受开关影响"
+    assert kb.embeddings.sync("v")["value"]["written"] == 0, "关闭的档位不会被 sync 补出向量"
+
+    # 设置落盘：重开同一个库仍然生效。
+    kb.close()
+    reopened = KnowledgeBase(str(tmp_path / "data"))
+    try:
+        assert reopened.embeddings.vectorization("default", "memory") is False
+        assert reopened.embeddings.vectorization("default", "notes") is True
+    finally:
+        reopened.close()
+
+
 def test_reranker_reorders_and_reports_diagnostics(kb):
     """重排回调在融合之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
     for i in range(4):

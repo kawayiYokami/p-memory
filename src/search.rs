@@ -174,20 +174,28 @@ impl KnowledgeBase {
         // 向量路的第一步是「库自己把查询词嵌入」——宿主只给词，不给向量。
         // 这一步是模型往返，必须在取库锁之前做完。
         let mut embedded_query: Option<(embeddings::EmbeddingSpace, Vec<f32>)> = None;
+        // 向量路的候选限在「该领域实际启用了向量化的类型」上：请求的 kinds 与它取交集。
+        // 交集为空就整条向量路不走——空的 kinds 在打分侧表示「不过滤」，
+        // 直接传下去会把已关闭类型的存量向量也捞回来。
+        let mut vector_kinds: Vec<RecordKind> = Vec::new();
         if let Some(space_id) = request.embed_space.as_deref().filter(|_| request.vector) {
-            let enabled = { let state = self.read()?; embeddings::namespace_vectorization(state.conn(), &request.filter.namespace)? };
-            if !enabled {
+            let gated = { let state = self.read()?; embeddings::namespace_vectorization(state.conn(), &request.filter.namespace)? };
+            if !gated {
                 diagnostics.degraded.push(Degrade::NamespaceDisabled);
             } else {
+                let enabled = { let state = self.read()?; embeddings::enabled_kinds(state.conn(), &request.filter.namespace)? };
+                vector_kinds = request.kinds.iter().copied().filter(|kind| enabled.contains(kind)).collect();
                 // 空间没登记过是配置错误，直接报；登记过但没绑回调才是可降级的情形。
-                let space = { let state = self.read()?; embeddings::get_space(state.conn(), space_id)? };
-                match self.engine.embedders.get(space_id) {
-                    None => diagnostics.degraded.push(Degrade::NoEmbedder),
-                    Some(entry) => {
-                        let produced = { let mut guard = entry.lock(); guard.embed(&[query.to_string()]) };
-                        match produced {
-                            Ok(mut values) if values.len() == 1 => embedded_query = Some((space, values.remove(0))),
-                            _ => diagnostics.degraded.push(Degrade::EmbedFailed),
+                if !vector_kinds.is_empty() {
+                    let space = { let state = self.read()?; embeddings::get_space(state.conn(), space_id)? };
+                    match self.engine.embedders.get(space_id) {
+                        None => diagnostics.degraded.push(Degrade::NoEmbedder),
+                        Some(entry) => {
+                            let produced = { let mut guard = entry.lock(); guard.embed(&[query.to_string()]) };
+                            match produced {
+                                Ok(mut values) if values.len() == 1 => embedded_query = Some((space, values.remove(0))),
+                                _ => diagnostics.degraded.push(Degrade::EmbedFailed),
+                            }
                         }
                     }
                 }
@@ -225,7 +233,7 @@ impl KnowledgeBase {
             let mut scored: Vec<(RecordKey, f64)> = Vec::new();
             for scope in scopes {
                 let Some(partition) = self.partition(conn, space, &namespace, &scope)? else { continue };
-                scored.extend(partition.search(vector, &request.kinds, &tags, limit, allowed.as_ref())?);
+                scored.extend(partition.search(vector, &vector_kinds, &tags, limit, allowed.as_ref())?);
             }
             // 跨分区汇总后再统一排名：分区各自从 0 计 rank 会破坏 RRF 融合语义。
             scored.sort_by(|a,b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

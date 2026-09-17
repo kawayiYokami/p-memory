@@ -54,6 +54,8 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "embeddings.unregister_embedder"=>encode(kb.embeddings().unregister_embedder(&field::<String>(&args,"space_id")?)?),
         "embeddings.namespace_vectorization"=>encode(kb.embeddings().namespace_vectorization(&field::<String>(&args,"namespace")?)?),
         "embeddings.set_namespace_vectorization"=>encode(kb.embeddings().set_namespace_vectorization(&field::<String>(&args,"namespace")?,field(&args,"enabled")?)?),
+        "embeddings.vectorization"=>encode(kb.embeddings().vectorization(&field::<String>(&args,"namespace")?,&field::<String>(&args,"target")?)?),
+        "embeddings.set_vectorization"=>encode(kb.embeddings().set_vectorization(&field::<String>(&args,"namespace")?,&field::<String>(&args,"target")?,field(&args,"enabled")?)?),
         "embeddings.delete_space"=>encode(kb.embeddings().delete_space(&field::<String>(&args,"id")?)?),
         _=>Err(Error::Validation(format!("unknown operation: {operation}"))),
     }
