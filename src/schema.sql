@@ -90,6 +90,13 @@ CREATE TABLE chunks (
 );
 CREATE INDEX chunks_by_fingerprint ON chunks(note_id, fingerprint);
 
+-- 知识领域的笔记根目录。登记之后写进来的笔记路径减掉它、存相对路径，
+-- 相对路径按段拆出的标签挂到这篇的每一条切片上；没登记的领域维持原样。
+CREATE TABLE namespace_roots (
+    namespace_id INTEGER PRIMARY KEY REFERENCES strings(id) ON DELETE CASCADE,
+    root TEXT NOT NULL
+);
+
 CREATE TABLE embedding_spaces (
     id TEXT PRIMARY KEY, model TEXT NOT NULL, dimension INTEGER NOT NULL, text_version INTEGER NOT NULL,
     encoding TEXT NOT NULL DEFAULT 'sq8'

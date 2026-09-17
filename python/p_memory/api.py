@@ -229,6 +229,14 @@ class NoteStore(_Store):
         """按文件路径同步一篇笔记：正文取文件原文，路径即身份，标题取文件名（去扩展名）。"""
         return self._call("upsert_file", self._kb._input(data, fields))
 
+    def set_root(self, namespace: str, root: str | os.PathLike) -> None:
+        """登记该知识领域的笔记根目录：之后写入的路径必须是它的子路径，库里存相对路径。"""
+        return self._call("set_root", {"namespace": namespace, "root": os.fspath(root)})
+
+    def root(self, namespace: str) -> str | None:
+        """该领域登记的笔记根目录；没登记就是 None。"""
+        return self._call("root", {"namespace": namespace})
+
     def chunks(self, note_id: str, *, filter: ReadFilter | None = None) -> list[dict]:
         return self._call("chunks", {"id": note_id, "filter": self._kb._filter(filter)})
 

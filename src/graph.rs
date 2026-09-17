@@ -81,7 +81,7 @@ pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<(E
     let attr_text = attributes.iter().map(|(k, values)| format!("{k} {}", values.join(" "))).collect::<Vec<_>>().join(" ");
     let body = format!("{} {} {} {}", input.name, aliases.join(" "), input.summary, attr_text);
     let (header, document) = storage::put_record(conn, RecordKind::Entity, &input.record,
-        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body, "")?;
+        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body)?;
     let entity_type_id = storage::term_id(conn, &input.entity_type)?;
     conn.execute("INSERT INTO entities(record_id,name,entity_type_id) VALUES (?1,?2,?3)
         ON CONFLICT(record_id) DO UPDATE SET name=excluded.name,entity_type_id=excluded.entity_type_id",
@@ -109,7 +109,7 @@ pub(crate) fn upsert_relation(conn: &Connection, input: &RelationInput) -> Resul
     let body = format!("{} {} {} {}", subject.name, input.predicate, object.name, input.reason);
     let (header, document) = storage::put_record(conn, RecordKind::Relation, &input.record,
         &json!({"subject_id":input.subject_id,"predicate":input.predicate,"object_id":input.object_id,"confidence":input.confidence,"reason":input.reason,
-            "subject_name":subject.name,"object_name":object.name}), &body, "")?;
+            "subject_name":subject.name,"object_name":object.name}), &body)?;
     let predicate_id = storage::term_id(conn, &input.predicate)?;
     conn.execute("INSERT INTO relations(record_id,subject_id,predicate_id,object_id) VALUES (?1,?2,?3,?4)
         ON CONFLICT(record_id) DO UPDATE SET subject_id=excluded.subject_id,predicate_id=excluded.predicate_id,object_id=excluded.object_id",
@@ -125,7 +125,7 @@ pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<(Eve
     let body = format!("{} {} {} {}", input.name, input.summary, names.join(" "), input.reason);
     let (header, document) = storage::put_record(conn, RecordKind::Event, &input.record,
         &json!({"name":input.name,"summary":input.summary,"participants":participants,"confidence":input.confidence,"reason":input.reason,
-            "participant_names":names}), &body, "")?;
+            "participant_names":names}), &body)?;
     conn.execute("DELETE FROM event_participants WHERE event_id=?1", [header.id])?;
     for id in &participants {
         conn.execute("INSERT INTO event_participants(event_id,entity_id) VALUES (?1,?2)", params![header.id, id])?;
@@ -190,14 +190,12 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<(Vec<i64
             }
             let tags: Vec<String> = value.get("tags").and_then(|v| v.as_array())
                 .map(|list| list.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default();
-            let fingerprint = text::digest(&format!("text-v1\n{body}\n{}", tags.join(" ")));
+            let fingerprint = storage::record_fingerprint(&body, &tags);
             let revision = storage::next_revision(conn, key.id)?;
             conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
                 params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
             conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
-            let namespace = value.get("namespace").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let scope = value.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            documents.push(crate::index::IndexDocument { id: key.id, namespace, scope, kind, text: body.clone(), path: String::new(), tags });
+            documents.push(storage::index_document(conn, key.id, kind, body.clone())?);
             rewritten.push(key.id);
         }
     }

@@ -8,7 +8,8 @@ use std::path::PathBuf;
 fn default_chunk_chars() -> usize { 220 }
 
 /// 按文件路径同步一篇笔记的入参：库自己读文件，标题取文件名（去扩展名）。
-/// 路径逐字符原样存为笔记自己的一列：既用它读回正文，也用它定位同一文件。
+/// 路径存为笔记自己的一列：领域登记过根目录时存减掉根目录的相对路径，否则逐字符原样存。
+/// 它既用来读回正文，也用来定位同一文件。
 /// 正文真相源是文件：清洗只作用于送进索引的文本，库内不留任何正文副本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteFileInput {
@@ -27,7 +28,7 @@ impl NoteFileInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     #[serde(flatten)] pub header: RecordHeader,
-    /// 文件路径，读时由 `notes` 表补回（库内只此一处）。
+    /// 文件路径：写入时给进来的那条；库内一行存的是相对根目录的形态，读回时拼成绝对路径。
     pub source: String,
     /// 由 `source` 的文件名派生，不落库。
     #[serde(default)] pub title: String,
@@ -118,23 +119,34 @@ pub fn chunk_text(content: &str, target: usize) -> Result<Vec<TextChunk>> {
 
 pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Note, Vec<crate::index::IndexDocument>)> {
     let content = std::fs::read_to_string(&input.path)?;
-    let source = input.path.to_string_lossy().into_owned();
+    let given = input.path.to_string_lossy().into_owned();
     let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
-    storage::validate_identity("source", &source)?;
+    storage::validate_identity("source", &given)?;
     let split = chunk_text(&content, input.chunk_chars)?;
     let mut record = input.record.clone();
     let namespace_id = storage::term_id(conn, &record.namespace)?;
     let scope_id = storage::term_id(conn, &record.scope)?;
+    // 领域登记过根目录：存库与进索引的都是减掉根目录的相对路径，相对路径按 / 拆段当标签。
+    // 没登记就维持原样——路径逐字符存、不拆标签。
+    let (source, path_tags) = match storage::namespace_root(conn, namespace_id)? {
+        Some(root) => { let relative = relative_note_path(&root, &given)?; let tags = path_tags(&relative); (relative, tags) }
+        None => (given.clone(), Vec::new()),
+    };
+    // 这一份标签挂到这篇的每一条切片上：调用方给的 + 路径拆出来的。
+    let mut merged = record.tags.clone();
+    merged.extend(path_tags);
+    record.tags = merged;
     let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
         params![namespace_id, scope_id, source], |r| r.get(0)).optional()?;
     if let Some(id) = existing {
         if record.id.is_some_and(|given| given != id) { return Err(Error::Conflict("source already belongs to another note ID".into())); }
         record.id = Some(id);
     }
-    // 笔记这条记录自己不承载正文：检索面交给切片，它靠路径列与标签列被搜到。
-    let (header, note_document) = storage::put_record(conn, RecordKind::Note, &record,
-        &json!({"chunk_chars":input.chunk_chars}), "", &source)?;
-    let mut documents = vec![note_document];
+    // 笔记这条记录自己不承载正文，也不占索引文档：路径信息以标签形态挂在它的每个切片上，
+    // 要文件列表就按库里的标签翻笔记。
+    let (header, _) = storage::put_record(conn, RecordKind::Note, &record,
+        &json!({"chunk_chars":input.chunk_chars}), "")?;
+    let mut documents = Vec::new();
     conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path) VALUES (?1,?2,?3,?4)
         ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path",
         params![header.id, namespace_id, scope_id, source])?;
@@ -153,31 +165,59 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
     conn.execute("DELETE FROM chunks WHERE note_id=?1", [header.id])?;
     let mut used = BTreeSet::new();
     for chunk in &split {
-        let fingerprint = text::digest(&chunk.content);
+        let content_digest = text::digest(&chunk.content);
         let payload = json!({"note_id":header.id,"ordinal":chunk.ordinal,"offset":chunk.offset,"limit":chunk.limit});
-        let id = match reuse.get(&(chunk.ordinal as i64, fingerprint.clone())) {
+        let (id, document) = match reuse.get(&(chunk.ordinal as i64, content_digest.clone())) {
             Some(&id) => {
                 used.insert(id);
                 conn.execute("UPDATE records SET payload_json=?2 WHERE id=?1", params![id, serde_json::to_string(&payload)?])?;
-                // 复用的切片内容没变，只刷新它自己的正文与标签。
-                documents.push(crate::index::IndexDocument { id, namespace: header.namespace.clone(), scope: header.scope.clone(),
-                    kind: RecordKind::Chunk, text: chunk.content.clone(), path: String::new(), tags: header.tags.clone() });
-                id
+                // 内容没变，但标签是这篇当前这一份：标签换了指纹跟着换，旧向量就地作废。
+                let tag_ids = storage::set_record_tags(conn, id, &header.tags)?;
+                let fingerprint = storage::record_fingerprint(&chunk.content, &header.tags);
+                conn.execute("UPDATE records SET fingerprint=?2,updated_at_us=MAX(updated_at_us,?3) WHERE id=?1",
+                    params![id, fingerprint, header.updated_at_us])?;
+                conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
+                (id, crate::index::IndexDocument { id, namespace_id, scope_id, kind: RecordKind::Chunk,
+                    text: chunk.content.clone(), tags: header.tags.clone(), tag_ids })
             }
             None => {
                 let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(), tags: header.tags.clone(),
                     evidence: vec![], metadata: header.metadata.clone(), created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
-                let (header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content, "")?;
-                documents.push(document);
-                header.id
+                let (chunk_header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content)?;
+                (chunk_header.id, document)
             }
         };
         conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\",fingerprint) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, fingerprint])?;
+            params![id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, content_digest])?;
+        documents.push(document);
     }
     // Delete obsolete records (and their embeddings), not just projection rows.
     for (id, _, _) in old { if !used.contains(&id) { storage::delete_record(conn, &RecordKey { id })?; } }
-    Ok((Note { header, source, title, chunk_chars: input.chunk_chars }, documents))
+    Ok((Note { header, source: given, title, chunk_chars: input.chunk_chars }, documents))
+}
+
+/// 减掉领域根目录得到库里存的那条相对路径；不在根目录之内直接报错，不做猜测。
+/// 只统一分隔符，不改大小写——存的是什么名字，读回文件时就找什么名字。
+fn relative_note_path(root: &str, given: &str) -> Result<String> {
+    let root = root.replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let relative = given.replace('\\', "/");
+    let Some(relative) = relative.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) else {
+        return Err(Error::Validation(format!("note path {given} is outside the domain root {root}")));
+    };
+    if relative.is_empty() { return Err(Error::Validation("note path must name a file below the domain root".into())); }
+    Ok(relative.to_string())
+}
+
+/// 相对路径按 / 拆段当标签：目录段原样，最后一段（文件名）去掉扩展名。
+fn path_tags(relative: &str) -> Vec<String> {
+    let segments: Vec<&str> = relative.split('/').filter(|segment| !segment.is_empty()).collect();
+    let last = segments.len().saturating_sub(1);
+    segments.iter().enumerate()
+        .map(|(index, segment)| if index == last { segment.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(segment) } else { segment })
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect()
 }
 
 #[derive(Clone)]
@@ -203,6 +243,31 @@ impl NoteStore {
         // 切片正文在写入时就地切好、一路带到索引，索引阶段不再回读文件。
         self.0.index_documents(&documents)?;
         Ok(WriteReceipt { value: note, revision })
+    }
+    /// 登记该知识领域的笔记根目录。登记之后写入的笔记路径必须是它的子路径：
+    /// 库里存相对路径，相对路径按段拆出的标签挂到这篇的每一条切片上。
+    pub fn set_root(&self, namespace: &str, root: &str) -> Result<()> {
+        storage::validate_identity("namespace", namespace)?;
+        if !std::path::Path::new(root).is_dir() {
+            return Err(Error::Validation(format!("domain root {root} is not an existing directory")));
+        }
+        let root = root.replace('\\', "/");
+        let root = root.trim_end_matches('/').to_string();
+        self.0.write(|writer| {
+            let namespace_id = storage::term_id(&writer.conn, namespace)?;
+            writer.conn.execute("INSERT INTO namespace_roots(namespace_id,root) VALUES (?1,?2)
+                ON CONFLICT(namespace_id) DO UPDATE SET root=excluded.root", params![namespace_id, root])?;
+            Ok(())
+        })
+    }
+    /// 该领域登记的笔记根目录；没登记就是 `None`。
+    pub fn root(&self, namespace: &str) -> Result<Option<String>> {
+        let state = self.0.read()?;
+        let conn = state.conn();
+        let namespace_id: Option<i64> = conn.query_row("SELECT id FROM strings WHERE text=?1",
+            [text::normalized_tag(namespace)], |r| r.get(0)).optional()?;
+        let Some(namespace_id) = namespace_id else { return Ok(None) };
+        storage::namespace_root(conn, namespace_id)
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note> {
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)
@@ -238,5 +303,27 @@ impl NoteStore {
             for child in ids { storage::delete_record(tx, &RecordKey { id: child })?; }
             storage::delete_record(tx, &key)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_segments_become_tags_and_only_the_file_name_loses_its_extension() {
+        assert_eq!(path_tags("bwiki/沧州/澜川.md"), vec!["bwiki".to_string(), "沧州".to_string(), "澜川".to_string()]);
+        // 目录段里的点不是扩展名：只有最后一段去后缀。
+        assert_eq!(path_tags("v1.2/角色.设定.md"), vec!["v1.2".to_string(), "角色.设定".to_string()]);
+        assert_eq!(path_tags("澜川"), vec!["澜川".to_string()]);
+    }
+
+    #[test]
+    fn note_paths_must_stay_inside_the_domain_root() {
+        assert_eq!(relative_note_path("E:/data/gi", r"E:\data\gi\bwiki\澜川.md").unwrap(), "bwiki/澜川.md");
+        // 前缀只是像，不是子路径；也不许正好等于根目录本身。
+        assert!(relative_note_path("E:/data/gi", "E:/data/gix/澜川.md").is_err());
+        assert!(relative_note_path("E:/data/gi", "E:/data/hsr/澜川.md").is_err());
+        assert!(relative_note_path("E:/data/gi", "E:/data/gi").is_err());
     }
 }

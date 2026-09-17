@@ -208,19 +208,30 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
         kb.notes.upsert_file(path=str(bad))
 
 
-def test_note_body_lives_in_the_index_and_path_has_its_own_column(kb, tmp_path):
-    """切片正文随写入进索引：源文件删掉仍读得到；路径列挂在笔记上，切片一条都不命中路径词。"""
-    directory = tmp_path / "绝区零" / "角色"
+def test_note_body_lives_in_the_index_and_path_tags_ride_on_every_chunk(kb, tmp_path):
+    """切片正文随写入进索引：源文件删掉仍读得到；登记根目录后路径段拆成标签，挂在每个切片上。"""
+    root = tmp_path / "domain"
+    directory = root / "绝区零" / "角色"
     directory.mkdir(parents=True)
     path = directory / "雅.md"
     path.write_text("苹果 香蕉 橘子", encoding="utf-8", newline="")
+    kb.notes.set_root("default", root)
+    assert kb.notes.root("default") == str(root).replace("\\", "/")
     note = kb.notes.upsert_file(path=str(path))["value"]
 
     path.unlink()
     chunks = kb.notes.chunks(note["id"])
     assert [c["content"] for c in chunks] == ["苹果 香蕉 橘子"], "正文在索引里，源文件没了也读得到"
-    assert kb.search("角色", kinds=["note"])["hits"], "路径词命中笔记"
-    assert kb.search("角色", kinds=["chunk"])["hits"] == [], "路径词不落在切片上"
+    assert [c["tags"] for c in chunks] == [["绝区零", "角色", "雅"]], "路径段标签挂在切片上"
+    assert kb.search("角色", kinds=["chunk"])["hits"], "路径段标签让切片被搜到"
+    assert kb.search("角色", kinds=["note"])["hits"] == [], "笔记不占索引文档"
+    page = kb.notes.list(filter={"tags": ["角色"]})
+    assert [item["id"] for item in page["items"]] == [note["id"]], "按标签翻笔记仍能筛出这一篇"
+
+    outside = tmp_path / "外面.md"
+    outside.write_text("根目录之外", encoding="utf-8", newline="")
+    with pytest.raises(PMemoryError):
+        kb.notes.upsert_file(path=str(outside))
 
 
 # ── 向量与重排 ────────────────────────────────────────────────────────
@@ -372,7 +383,7 @@ def test_health_exposes_core_counters(kb):
     kb.update_index()
     report = kb.health()
 
-    assert report["schema_version"] == 8
+    assert report["schema_version"] == 9
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
     assert report["pending_index_updates"] == 0

@@ -88,11 +88,17 @@ kb.graph().path(a, b, &filter)?;           // 桥接
 ```rust
 use p_memory::notes::NoteFileInput;
 
+// 登记该知识领域的笔记根目录：之后写入的路径必须是它的子路径，库里存相对路径
+kb.notes().set_root("akasha/gi", "./data/domain/gi")?;
+kb.notes().root("akasha/gi")?;              // -> Some("./data/domain/gi")
+
 // 只给路径：库自己读文件，标题取文件名（去扩展名），路径即身份
-kb.notes().upsert_file(NoteFileInput::new("docs/readme.md"))?;
+kb.notes().upsert_file(NoteFileInput::new("./data/domain/gi/bwiki/沧州/澜川.md"))?;
 ```
 
-写入时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。正文不进库——切片正文在写入时从文件读一次、切好就随文档进全文索引，库内只留路径与切片粒度；索引还没提交时取正文会先提交一次。
+登记根目录之后，库里存的是 `bwiki/沧州/澜川.md`，相对路径按 `/` 拆出的 `bwiki`、`沧州`、`澜川` 会与调用方给的标签合并，挂到这一篇的每一条切片上——搜「澜川」时这篇的每一片都拿到一份标签分。没登记根目录的领域路径照旧原样存、不拆标签。
+
+写入时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。正文不进库——切片正文在写入时从文件读一次、切好就随文档进全文索引，库内只留路径与切片粒度；索引还没提交时取正文会先提交一次。笔记记录自己不占索引文档，要文件列表用 `kb.notes().list(&PageRequest{ filter, ..Default::default() })` 按标签翻。
 
 ## 向量与重排（宿主提供模型接口，库内部执行）
 

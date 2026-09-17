@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -21,6 +21,14 @@ INSERT OR IGNORE INTO predicate_rules(predicate_id, is_symmetric) SELECT id, 1 F
 const MIGRATION_4_TO_5: &str = "
 ALTER TABLE records DROP COLUMN search_text;
 ALTER TABLE records DROP COLUMN embedding_text;
+";
+
+/// v8 -> v9：知识领域的笔记根目录表。旧库没有登记，迁移只建表、不动数据。
+const MIGRATION_8_TO_9: &str = "
+CREATE TABLE namespace_roots (
+    namespace_id INTEGER PRIMARY KEY REFERENCES strings(id) ON DELETE CASCADE,
+    root TEXT NOT NULL
+);
 ";
 
 /// 把切片 payload 里的若干键摘掉。切片正文只在索里存一份，库内副本一律不要。
@@ -136,6 +144,8 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             // v7 -> v8：切片 payload 摘掉字符区间。写入时切好的正文直接进索引、成为唯一副本，
             // 从原文按区间二次取正文这条路径整个撤掉。
             7 => { strip_chunk_payload_keys(&tx, &["char_start", "char_end"])?; }
+            // v8 -> v9：知识领域的笔记根目录表。
+            8 => { tx.execute_batch(MIGRATION_8_TO_9)?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -171,6 +181,10 @@ mod tests {
                 DROP TABLE notes;
                 ALTER TABLE notes_legacy RENAME TO notes;").unwrap();
         }
+        // v9 之前没有领域根目录表；回退到旧版本时删掉，供 v8→v9 迁移验证。
+        if version < 9 {
+            conn.execute_batch("DROP TABLE namespace_roots;").unwrap();
+        }
         conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
     }
@@ -192,6 +206,18 @@ mod tests {
         let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
         assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
         kb.graph().set_predicate_rule("同事", None, true).unwrap();
+    }
+
+    /// v8 形态的库前滚到当前版本：新增领域根目录表，登记与读取立刻可用。
+    #[test]
+    fn rolls_v8_forward_adding_domain_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_db(dir.path(), 8, "");
+        let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
+        assert!(kb.notes().root("default").unwrap().is_none(), "旧库没有登记过根目录");
+        kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
+        assert!(kb.notes().root("default").unwrap().is_some());
     }
 
     /// v4 形态的笔记 + 切片（带 content 与两条派生列）前滚到当前版本：

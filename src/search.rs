@@ -1,6 +1,6 @@
 use crate::{embeddings, graph::{Entity, Neighborhood, Relation}, storage::{self, KnowledgeBase}, text, types::*, Error, Result};
 use parking_lot::Mutex;
-use rusqlite::{params_from_iter, types::Value as SqlValue};
+use rusqlite::{params_from_iter, types::Value as SqlValue, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -9,6 +9,26 @@ use std::sync::Arc;
 fn default_limit() -> usize { 10 }
 fn yes() -> bool { true }
 pub fn default_kinds() -> Vec<RecordKind> { vec![RecordKind::Memory, RecordKind::Entity, RecordKind::Relation, RecordKind::Event, RecordKind::Chunk] }
+
+/// 一个标记文本在 strings 表里的 id；库里没有这个标记就是 `None`。
+fn string_id(conn: &rusqlite::Connection, value: &str) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT id FROM strings WHERE text=?1", [text::normalized_tag(value)], |r| r.get(0)).optional()?)
+}
+
+/// 把 `filter` 里的标记文本折算成 id：索引里只存 id，折算在进索引之前做完。
+/// 换不到 id 说明库里没有这个标记，本次不可能有命中，直接给空结果，不必进索引碰。
+fn index_filter(conn: &rusqlite::Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<Option<crate::index::IndexFilter>> {
+    let Some(namespace) = string_id(conn, &filter.namespace)? else { return Ok(None) };
+    let mut scopes = Vec::with_capacity(filter.scopes.len());
+    for scope in &filter.scopes {
+        match string_id(conn, scope)? { Some(id) => scopes.push(id), None => return Ok(None) }
+    }
+    let mut tags = Vec::with_capacity(filter.tags.len());
+    for tag in &filter.tags {
+        match string_id(conn, tag)? { Some(id) => tags.push(id), None => return Ok(None) }
+    }
+    Ok(Some(crate::index::IndexFilter { namespace, scopes, kinds: kinds.iter().map(|kind| kind.code()).collect(), tags }))
+}
 
 /// Graph-First 剪枝：先在图邻域里取到候选实体 id，向量检索只在这些 id 内打分。
 /// `SearchRequest::prune` 为 `None` 时保持全量检索，不改默认行为。
@@ -144,7 +164,8 @@ impl KnowledgeBase {
     /// 全文路。派生索引查询失败时返回 `Index`，由调用方触发重建后重试。
     fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
         self.sync_index_if_behind(conn)?;
-        self.index()?.search(query, filter, kinds, limit)
+        let Some(index_filter) = index_filter(conn, filter, kinds)? else { return Ok(Vec::new()) };
+        self.index()?.search(query, &index_filter, limit)
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {

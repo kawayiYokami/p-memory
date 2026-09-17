@@ -145,6 +145,8 @@ impl GraphView {
 ```rust
 impl NoteStore {
     fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>>;
+    fn set_root(&self, namespace: &str, root: &str) -> Result<()>;
+    fn root(&self, namespace: &str) -> Result<Option<String>>;
     fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note>;
     fn list(&self, page: &PageRequest) -> Result<Page<Note>>;
     fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk>;
@@ -153,8 +155,10 @@ impl NoteStore {
 }
 ```
 
-- `upsert_file` 按给定文件路径同步一篇笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；**路径即身份**，写入 `(namespace, scope, source)` 的 `source` 就是路径字符串，同一路径定位到同一笔记。监听与对账在使用方，库只处理给到的这一个文件。
-- **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。
+- `upsert_file` 按给定文件路径同步一篇笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；路径即身份，同一路径定位到同一笔记。监听与对账在使用方，库只处理给到的这一个文件。
+- `set_root` 登记该领域的笔记根目录（必须是一个已存在的目录），`root` 读回来；落了 `namespace_roots` 表。登记之后写入的路径必须是它的子路径，否则报 `validation`；库里存减掉根目录的相对路径，`Note.source` 取回时再拼回绝对路径。没登记的领域维持原样。
+- **相对路径拆成标签**：目录段原样、文件名去扩展名，与调用方给的标签合并去重，写到这一篇的每一条切片上（库里 `record_tags`，索引里标签文本与标签 id 各一列）。
+- **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。**笔记记录不进索引**，要文件列表按库里的标签翻笔记。
 - 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
 - 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引还没提交就先提交一次）。写入时文件缺失直接报错；索引重建时文件缺失只让那批切片正文为空。
 - `delete` 先删切片再删笔记。

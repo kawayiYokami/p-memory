@@ -30,6 +30,16 @@ p_memory.KnowledgeBase.restore(snapshot, directory)  # 类方法
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
 **谓词元规则 `set_predicate_rule` 仅在 Rust 侧提供，Python 未暴露**；用法示例见 [graph-search](graph-search.md#python)。
 
+笔记多两个方法，用来登记领域根目录：
+
+```python
+kb.notes.set_root("akasha/gi", "./data/domain/gi")   # 必须是已存在的目录
+kb.notes.root("akasha/gi")                                  # -> "./data/domain/gi"，没登记为 None
+kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
+```
+
+登记之后库里存的是相对路径 `bwiki/沧州/澜川.md`，拆出的 `bwiki` / `沧州` / `澜川` 与调用方标签合并、挂到这一篇的每条切片上；`path` 不在根目录之内报 `ValidationError`。没登记根目录的领域维持原样：路径逐字符存，不拆标签。
+
 ## 向量与重排回调
 
 向量化与重排都在库内部完成。宿主只注册模型接口并提供内容，不自己算向量、不自己重排：

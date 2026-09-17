@@ -347,7 +347,7 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInput,
-    payload: &Value, text: &str, path: &str) -> Result<(RecordHeader, crate::index::IndexDocument)> {
+    payload: &Value, text: &str) -> Result<(RecordHeader, crate::index::IndexDocument)> {
     validate_identity("namespace", &input.namespace)?;
     validate_identity("scope", &input.scope)?;
     for evidence in &input.evidence {
@@ -377,8 +377,8 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     let updated = input.updated_at_us.unwrap_or_else(|| now.max(existing.as_ref().map(|v| v.1).unwrap_or(created)));
     if updated < created { return Err(Error::Validation("updated_at_us precedes created_at_us".into())); }
     // 指纹跟着「送进搜索的文本 + 标签」走：正文或标签一变，各空间的旧向量立即失效。
-    let normalized_tags = normalize_tags(&input.tags);
-    let fingerprint = text::digest(&format!("text-v1\n{text}\n{}", normalized_tags.join(" ")));
+    let tags = normalize_tags(&input.tags);
+    let fingerprint = record_fingerprint(text, &tags);
     let metadata_json = serde_json::to_string(&input.metadata)?;
     let evidence_json = serde_json::to_string(&input.evidence)?;
     let payload_json = serde_json::to_string(payload)?;
@@ -404,18 +404,62 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
             (id, revision)
         }
     };
-    conn.execute("DELETE FROM record_tags WHERE record_id=?1", [id])?;
-    let tags = normalized_tags;
-    for tag in &tags {
-        let tag_id = term_id(conn, tag)?;
-        conn.execute("INSERT OR IGNORE INTO record_tags(record_id,tag_id) VALUES (?1,?2)", params![id, tag_id])?;
-    }
+    let tag_ids = set_record_tags(conn, id, &tags)?;
     // 索引文档就地拼好交回调用方：正文来自本次写入手上的那一份，索引阶段不再回源。
-    let document = crate::index::IndexDocument { id, namespace: text::normalized_tag(&input.namespace),
-        scope: text::normalized_tag(&input.scope), kind, text: text.to_string(), path: path.to_string(), tags: tags.clone() };
+    // 标记一律带整数 id 给索引：namespace、scope、kind、tags 都不写第二份文本。
+    let document = crate::index::IndexDocument { id, namespace_id, scope_id, kind,
+        text: text.to_string(), tags: tags.clone(), tag_ids };
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
+}
+
+/// 记录指纹：正文 + 标签一起算。两者任一变，各空间的旧向量立即失效。
+pub(crate) fn record_fingerprint(text: &str, tags: &[String]) -> String {
+    text::digest(&format!("text-v1\n{text}\n{}", tags.join(" ")))
+}
+
+/// 换掉一条记录的标签，返回这次的 tag id（按标签文本排序，与 `normalize_tags` 同序）。
+pub(crate) fn set_record_tags(conn: &Connection, id: i64, tags: &[String]) -> Result<Vec<i64>> {
+    conn.execute("DELETE FROM record_tags WHERE record_id=?1", [id])?;
+    let mut tag_ids = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let tag_id = term_id(conn, tag)?;
+        conn.execute("INSERT OR IGNORE INTO record_tags(record_id,tag_id) VALUES (?1,?2)", params![id, tag_id])?;
+        tag_ids.push(tag_id);
+    }
+    Ok(tag_ids)
+}
+
+/// 一条记录的 (tag id, 标签文本)，按文本排序。索引写 id 列与文本列都从这里取。
+pub(crate) fn record_tag_pairs(conn: &Connection, id: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT t.id,t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1 ORDER BY t.text")?;
+    let mut pairs = Vec::new();
+    for row in stmt.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? { pairs.push(row?); }
+    Ok(pairs)
+}
+
+/// 按库里现有状态给一条记录拼索引文档：标记（namespace / scope / tags）一律取 strings 表的 id。
+pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text: String) -> Result<crate::index::IndexDocument> {
+    let (namespace_id, scope_id): (i64, i64) = conn.query_row("SELECT namespace_id,scope_id FROM records WHERE id=?1",
+        [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let pairs = record_tag_pairs(conn, id)?;
+    Ok(crate::index::IndexDocument { id, namespace_id, scope_id, kind, text,
+        tags: pairs.iter().map(|(_, tag)| tag.clone()).collect(),
+        tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() })
+}
+
+/// 该知识领域登记的笔记根目录；没登记就是 `None`。
+pub(crate) fn namespace_root(conn: &Connection, namespace_id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT root FROM namespace_roots WHERE namespace_id=?1", [namespace_id], |r| r.get(0)).optional()?)
+}
+
+/// 库里存的相对路径 → 实际文件路径：登记过根目录就拼回去，没登记就是原样那条。
+pub(crate) fn absolute_note_path(conn: &Connection, namespace_id: i64, stored: &str) -> String {
+    match namespace_root(conn, namespace_id) {
+        Ok(Some(root)) => Path::new(&root).join(stored.replace('/', std::path::MAIN_SEPARATOR_STR)).to_string_lossy().into_owned(),
+        _ => stored.to_string(),
+    }
 }
 
 pub(crate) fn record_value(conn: &Connection, key: &RecordKey) -> Result<Option<Value>> {
@@ -429,13 +473,13 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
     if ids.is_empty() { return Ok(out); }
     let placeholders = vec!["?"; ids.len()].join(",");
     let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
-    let mut stmt = conn.prepare(&format!("SELECT r.id,n.text,r.kind,s.text,r.created_at_us,r.updated_at_us,r.revision,
+    let mut stmt = conn.prepare(&format!("SELECT r.id,r.namespace_id,n.text,r.kind,s.text,r.created_at_us,r.updated_at_us,r.revision,
         r.metadata_json,r.evidence_json,r.payload_json FROM records r
         JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id IN ({placeholders}) ORDER BY r.id"))?;
-    let mut rows: Vec<(i64, String, i64, String, i64, i64, i64, String, String, String)> = Vec::new();
-    for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
-        r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?,
-        r.get::<_, String>(7)?, r.get::<_, String>(8)?, r.get::<_, String>(9)?)))? {
+    let mut rows: Vec<(i64, i64, String, i64, String, i64, i64, i64, String, String, String)> = Vec::new();
+    for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
+        r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?,
+        r.get::<_, i64>(7)?, r.get::<_, String>(8)?, r.get::<_, String>(9)?, r.get::<_, String>(10)?)))? {
         rows.push(row?);
     }
     let mut tags_stmt = conn.prepare(&format!("SELECT rt.record_id,t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id \
@@ -456,7 +500,7 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
             note_paths.insert(id, source);
         }
     }
-    for (id, namespace, kind_code, scope, created, updated, revision, metadata, evidence, payload) in rows {
+    for (id, namespace_id, namespace, kind_code, scope, created, updated, revision, metadata, evidence, payload) in rows {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let header = RecordHeader { id, namespace, kind, scope,
             created_at_us: created, updated_at_us: updated, revision, tags: tags.remove(&id).unwrap_or_default(),
@@ -470,7 +514,9 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
             payload.remove("memory_type_id");
         }
         if kind == RecordKind::Note {
-            let source = note_paths.remove(&id).unwrap_or_default();
+            // 库里存的是相对路径（登记过领域根目录时），对外取回时拼回绝对路径。
+            let stored = note_paths.remove(&id).unwrap_or_default();
+            let source = absolute_note_path(conn, namespace_id, &stored);
             let title = std::path::Path::new(&source).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             payload.insert("source".into(), Value::String(source));
             payload.insert("title".into(), Value::String(title));

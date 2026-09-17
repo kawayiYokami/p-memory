@@ -1,32 +1,37 @@
 use crate::{storage, text, types::*, Error, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
-    schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, STRING, STORED},
+    schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v4";
+const FORMAT: &str = "p-memory-text-v5";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, path: Field, text: Field, body: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, tags_text: Field, text: Field, body: Field }
 
-/// 一条要写进索引的记录：正文、标签、路径全部由写入流程就地提供。
+/// 一条要写进索引的记录：正文、标签全部由写入流程就地提供。
 /// 写入时读一次源文件、切一次，切片正文一路带到这里，索引阶段不再回头读文件。
 pub(crate) struct IndexDocument {
     pub id: i64,
-    pub namespace: String,
-    pub scope: String,
+    pub namespace_id: i64,
+    pub scope_id: i64,
     pub kind: RecordKind,
-    /// 正文列：这条记录自己的文本。记忆是 judgment，切片是它那一段，笔记没有（检索面交给切片）。
+    /// 正文列：这条记录自己的文本。记忆是 judgment，切片是它那一段。笔记不进索引。
     pub text: String,
-    /// 路径列：笔记自己的路径，切片按从属关系取回同一串；其余记录为空。
-    pub path: String,
+    /// 标签文本列：每个标签一个词项，与正文列各算一次分，相加定名次。
     pub tags: Vec<String>,
+    /// 标签 id 列：只用来按标签过滤，不参与打分。
+    pub tag_ids: Vec<i64>,
 }
+
+/// 已在库侧折算成 id 的检索范围。索引里的 namespace / scope / kind / tags 一律是整数，
+/// 标记文本换成 id 这件事在进索引之前做完。
+pub(crate) struct IndexFilter { pub namespace: i64, pub scopes: Vec<i64>, pub kinds: Vec<i64>, pub tags: Vec<i64> }
 
 /// 文本索引。`IndexReader` 可并发检索，`IndexWriter` 收进内部互斥锁：
 /// 整个结构可以直接共享给多个读线程，提交只在写者之间串行。
@@ -49,14 +54,15 @@ impl TextIndex {
             .set_tokenizer("pretokenized").set_index_option(IndexRecordOption::WithFreqsAndPositions));
         let fields = Fields {
             key: builder.add_text_field("key", (STRING | STORED).set_fast(None)),
-            namespace: builder.add_text_field("namespace", STRING),
-            scope: builder.add_text_field("scope", STRING),
-            kind: builder.add_text_field("kind", STRING),
-            // 标签列：整串一个词项。既能被搜索（查一个标签词就给这条记录加分），
-            // 也能被精确匹配（按标签筛记录）。标签文本仍只存在库里一份，索引不存值。
-            tags: builder.add_text_field("tags", STRING),
-            // 路径列：笔记自己的路径。文档名不一定出现在正文里，它要有自己的路才搜得到。
-            path: builder.add_text_field("path", tokenized()),
+            // 标记列一律存 strings 表的整数 id：索引里不留第二份标记文本。
+            namespace: builder.add_u64_field("namespace", INDEXED),
+            scope: builder.add_u64_field("scope", INDEXED),
+            kind: builder.add_u64_field("kind", INDEXED),
+            // 标签 id 列（多值）：按标签过滤只在这一列上做精确匹配，不参与打分。
+            tags: builder.add_u64_field("tags", INDEXED),
+            // 标签文本列：BM25 要有词可算，标签文本不能只有 id。每个标签一个词项，
+            // 与正文列各算一次分、相加。这一列不存原值，取标签读库。
+            tags_text: builder.add_text_field("tags_text", STRING),
             // 正文列：唯一承载「这条记录讲了什么」的列，也是相关性打分的主力。
             text: builder.add_text_field("text", tokenized()),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
@@ -107,15 +113,14 @@ impl TextIndex {
     fn add(&self, writer: &mut IndexWriter, item: &IndexDocument) -> Result<()> {
         let encoded = item.id.to_string();
         writer.delete_term(Term::from_field_text(self.fields.key, &encoded));
-        let mut document = doc!(self.fields.key => encoded,
-            self.fields.namespace => text::normalized_tag(&item.namespace),
-            self.fields.scope => text::normalized_tag(&item.scope),
-            self.fields.kind => item.kind.as_str().to_string(),
-            self.fields.body => item.text.clone());
+        let mut document = doc!(self.fields.key => encoded, self.fields.body => item.text.clone());
+        document.add_u64(self.fields.namespace, item.namespace_id as u64);
+        document.add_u64(self.fields.scope, item.scope_id as u64);
+        document.add_u64(self.fields.kind, item.kind.code() as u64);
+        for tag in &item.tags { document.add_text(self.fields.tags_text, tag.clone()); }
+        for tag_id in &item.tag_ids { document.add_u64(self.fields.tags, *tag_id as u64); }
         let cleaned = text::clean_markdown(&item.text);
         if !cleaned.is_empty() { document.add_text(self.fields.text, text::tokenize(&cleaned).join(" ")); }
-        if !item.path.is_empty() { document.add_text(self.fields.path, text::tokenize(&item.path).join(" ")); }
-        for tag in &item.tags { document.add_text(self.fields.tags, text::normalized_tag(tag)); }
         writer.add_document(document)?;
         Ok(())
     }
@@ -158,20 +163,21 @@ impl TextIndex {
     /// 从库里现有的记录重建索引文档。切片正文没有第二份副本，这里按同一套切分规则
     /// 重新读文件切一遍；文件读不到时任该切片正文为空，不让一次恢复失败于单个缺文件。
     fn rebuild_documents(&self, conn: &Connection) -> Vec<IndexDocument> {
+        let mut documents = Vec::new();
+        let Ok(mut stmt) = conn.prepare("SELECT r.id,r.namespace_id,r.kind,r.scope_id,r.payload_json FROM records r ORDER BY r.id") else { return Vec::new() };
+        let Ok(records) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?, r.get::<_, String>(4)?))) else { return Vec::new() };
         let mut rows = Vec::new();
-        let mut failed: Vec<IndexDocument> = Vec::new();
-        let Ok(mut stmt) = conn.prepare("SELECT r.id,n.text,r.kind,s.text,r.payload_json FROM records r
-            JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id ORDER BY r.id") else { return Vec::new() };
-        let Ok(records) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
-            r.get::<_, String>(3)?, r.get::<_, String>(4)?))) else { return Vec::new() };
         for row in records {
             let Ok(row) = row else { continue };
             rows.push(row);
         }
         // 同一篇笔记的多片共用一次文件读取与一次切分。
         let mut files: HashMap<i64, Vec<String>> = HashMap::new();
-        for (id, namespace, kind_code, scope, payload_json) in rows {
+        for (id, namespace_id, kind_code, scope_id, payload_json) in rows {
             let Some(kind) = RecordKind::from_code(kind_code) else { continue };
+            // 笔记不占索引文档：路径信息以标签形态挂在它的每个切片上，文件列表按库里的标签翻。
+            if kind == RecordKind::Note { continue; }
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else { continue };
             let text = match kind {
                 RecordKind::Chunk => {
@@ -182,18 +188,19 @@ impl TextIndex {
                 }
                 _ => storage::record_text(kind, &payload),
             };
-            // 路径列只挂在笔记自己那条记录上：切片复制它就是「一篇 N 片各带同一串字」，
-            // 这串字在一篇里被计 N 次，排序会变成片多者占位多。切片靠正文列与标签列被搜到。
-            let path = if matches!(kind, RecordKind::Note) { self.note_path(conn, id).unwrap_or_default() } else { String::new() };
-            failed.push(IndexDocument { id, namespace, scope, kind, text, path, tags: self.record_tags(conn, id) });
+            let pairs = storage::record_tag_pairs(conn, id).unwrap_or_default();
+            documents.push(IndexDocument { id, namespace_id, scope_id, kind, text,
+                tags: pairs.iter().map(|(_, tag)| tag.clone()).collect(),
+                tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
-        failed
+        documents
     }
 
     /// 读一篇笔记的源文件并重跑切分，返回每片正文（按 ordinal 顺序）。
     fn note_file_chunks(&self, conn: &Connection, note_id: i64) -> Vec<String> {
-        let Ok(path) = conn.query_row("SELECT path FROM notes WHERE record_id=?1", [note_id], |r| r.get::<_, String>(0)) else { return Vec::new() };
-        let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+        let Ok((path, namespace_id)) = conn.query_row("SELECT n.path,n.namespace_id FROM notes n WHERE n.record_id=?1",
+            [note_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else { return Vec::new() };
+        let Ok(content) = std::fs::read_to_string(storage::absolute_note_path(conn, namespace_id, &path)) else { return Vec::new() };
         let chunk_chars = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [note_id], |r| r.get::<_, String>(0))
             .ok().and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|value| value.get("chunk_chars").and_then(|v| v.as_u64()))
@@ -201,62 +208,48 @@ impl TextIndex {
         crate::notes::chunk_text(&content, chunk_chars).map(|chunks| chunks.into_iter().map(|chunk| chunk.content).collect()).unwrap_or_default()
     }
 
-    fn record_tags(&self, conn: &Connection, id: i64) -> Vec<String> {
-        let mut tags = Vec::new();
-        let Ok(mut stmt) = conn.prepare("SELECT t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1 ORDER BY t.text") else { return tags };
-        let Ok(rows) = stmt.query_map([id], |r| r.get::<_, String>(0)) else { return tags };
-        for row in rows { if let Ok(tag) = row { tags.push(tag); } }
-        tags
-    }
-
-    /// 笔记沿自己的 record_id 取回路径；路径属于笔记，切片不取。
-    fn note_path(&self, conn: &Connection, id: i64) -> Result<String> {
-        Ok(conn.query_row("SELECT path FROM notes WHERE record_id=?1", [id], |r| r.get::<_, String>(0)).optional()?
-            .unwrap_or_default())
-    }
-
-    fn exact(field: Field, value: &str) -> Box<dyn Query> {
+    fn exact_text(field: Field, value: &str) -> Box<dyn Query> {
         Box::new(TermQuery::new(Term::from_field_text(field, value), IndexRecordOption::Basic))
+    }
+
+    fn exact_u64(field: Field, value: i64) -> Box<dyn Query> {
+        Box::new(TermQuery::new(Term::from_field_u64(field, value as u64), IndexRecordOption::Basic))
     }
 
     fn term(field: Field, value: &str, occurrence: Occur) -> (Occur, Box<dyn Query>) {
         (occurrence, Box::new(TermQuery::new(Term::from_field_text(field, value), IndexRecordOption::WithFreqs)) as Box<dyn Query>)
     }
 
-    fn filtered_query(&self, tokens: &[String], tags: &[String], strict: bool, filter: &ReadFilter, kinds: &[RecordKind]) -> Box<dyn Query> {
+    fn filtered_query(&self, tokens: &[String], tags: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
         let occurrence = if strict { Occur::Must } else { Occur::Should };
-        // 三列各算一次分、相加：正文列与路径列吃同一套词元（「史记」这种只出现在文档名里的
-        // 查询词落在路径列，正文里的词落在正文列），标签列按整词命中。
+        // 两列各算一次分、相加：正文列吃查询词的词元，标签文本列按整词命中。
+        // 标签挂在每个切片上，所以查「澜川」时同篇的每一片都自己拿到一份标签分。
         let text_query = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
-        let path_query = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.path, token, occurrence)).collect());
+        let mut relevance: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Should, Box::new(text_query))];
+        if !tags.is_empty() {
+            let tag_query = BooleanQuery::new(tags.iter().map(|word| (Occur::Should,
+                Box::new(TermQuery::new(Term::from_field_text(self.fields.tags_text, word), IndexRecordOption::Basic)) as Box<dyn Query>)).collect());
+            relevance.push((Occur::Should, Box::new(tag_query)));
+        }
         // 这一层只放 Should，所以至少要命中一个才算相关，过滤维度另起一层放 Must。
         // 两层不能合并：同一层里一旦存在 Must，全部 Should 都会降级为「有则加分、无也无妨」，
         // 正文条件就形同虚设，检索退化成「只按过滤条件取记录」——
         // 查一个正文里根本不存在的词，也会返回该过滤域下的任意记录。
-        let mut relevance: Vec<(Occur, Box<dyn Query>)> = vec![
-            (Occur::Should, Box::new(text_query)),
-            (Occur::Should, Box::new(path_query)),
-        ];
-        if !tags.is_empty() {
-            let tag_query = BooleanQuery::new(tags.iter().map(|word| (Occur::Should,
-                Box::new(TermQuery::new(Term::from_field_text(self.fields.tags, word), IndexRecordOption::Basic)) as Box<dyn Query>)).collect());
-            relevance.push((Occur::Should, Box::new(tag_query)));
-        }
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, Box::new(BooleanQuery::new(relevance)))];
-        let scopes = BooleanQuery::new(filter.scopes.iter().map(|scope| (Occur::Should, Self::exact(self.fields.scope, &text::normalized_tag(scope)))).collect());
-        clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Self::exact(self.fields.namespace, &text::normalized_tag(&filter.namespace)), 0.0))));
+        let scopes = BooleanQuery::new(filter.scopes.iter().map(|scope| (Occur::Should, Self::exact_u64(self.fields.scope, *scope))).collect());
+        clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Self::exact_u64(self.fields.namespace, filter.namespace), 0.0))));
         clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Box::new(scopes), 0.0))));
-        if !kinds.is_empty() {
-            let kinds = BooleanQuery::new(kinds.iter().map(|kind| (Occur::Should, Self::exact(self.fields.kind, kind.as_str()))).collect());
+        if !filter.kinds.is_empty() {
+            let kinds = BooleanQuery::new(filter.kinds.iter().map(|kind| (Occur::Should, Self::exact_u64(self.fields.kind, *kind))).collect());
             clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Box::new(kinds), 0.0))));
         }
-        for tag in &filter.tags {
-            clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Self::exact(self.fields.tags, &text::normalized_tag(tag)), 0.0))));
+        for tag_id in &filter.tags {
+            clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Self::exact_u64(self.fields.tags, *tag_id), 0.0))));
         }
         Box::new(BooleanQuery::new(clauses))
     }
 
-    pub fn search(&self, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
+    pub fn search(&self, query: &str, filter: &IndexFilter, limit: usize) -> Result<Vec<(RecordKey, f64)>> {
         #[cfg(test)]
         if self.fail_search.load(Ordering::SeqCst) { return Err(Error::Index("injected index failure".into())); }
         let mut result = Vec::new();
@@ -268,7 +261,7 @@ impl TextIndex {
             if !strict && result.len() >= limit { break; }
             let tokens = text::query_terms(query, strict);
             if tokens.is_empty() { continue; }
-            let query = self.filtered_query(&tokens, &tags, strict, filter, kinds);
+            let query = self.filtered_query(&tokens, &tags, strict, filter);
             let collector = TopDocs::with_limit(limit).order_by(((SortBySimilarityScore, Order::Desc), (SortByString::for_field("key"), Order::Asc)));
             let hits = searcher.search(&*query, &collector)?;
             for ((score, _), address) in hits {
@@ -293,7 +286,7 @@ impl TextIndex {
         if ids.is_empty() { return Ok(out); }
         let searcher = self.reader.searcher();
         for id in ids {
-            let query = Self::exact(self.fields.key, &id.to_string());
+            let query = Self::exact_text(self.fields.key, &id.to_string());
             if let Some(address) = searcher.search(&query, &DocSetCollector)?.into_iter().next() {
                 let document: tantivy::TantivyDocument = searcher.doc(address)?;
                 if let Some(body) = document.get_first(self.fields.body).and_then(|v| v.as_str()) {
