@@ -185,7 +185,7 @@ def test_note_rejects_out_of_range_chunk_size(kb, tmp_path):
 
 
 def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
-    """按路径同步：标题取文件名，路径即身份，正文不落库、切片正文由文件原文派生。"""
+    """按路径同步：标题取文件名，路径即身份，正文不进库、切片正文随写入进索引。"""
     path = tmp_path / "世界观.md"
     raw = "# 标题\n\n这里有 **独有措辞** 正文。"
     path.write_text(raw, encoding="utf-8", newline="")
@@ -194,7 +194,7 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
     assert note["title"] == "世界观"
     assert note["source"] == str(path), "路径即身份"
     assert kb.search("独有措辞", kinds=["chunk"])["hits"], "清洗后的文本仍可检索"
-    assert any("独有措辞" in c["content"] for c in kb.notes.chunks(note["id"])), "切片正文由文件原文派生"
+    assert any("独有措辞" in c["content"] for c in kb.notes.chunks(note["id"])), "切片正文随写入进索引"
 
     path.write_text("改过的正文 **新词** 在这里。", encoding="utf-8", newline="")
     updated = kb.notes.upsert_file(path=str(path))["value"]
@@ -206,6 +206,21 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
     bad.write_bytes(b"\xff\xfe\xfd")
     with pytest.raises(PMemoryError):
         kb.notes.upsert_file(path=str(bad))
+
+
+def test_note_body_lives_in_the_index_and_path_has_its_own_column(kb, tmp_path):
+    """切片正文随写入进索引：源文件删掉仍读得到；路径列挂在笔记上，切片一条都不命中路径词。"""
+    directory = tmp_path / "绝区零" / "角色"
+    directory.mkdir(parents=True)
+    path = directory / "雅.md"
+    path.write_text("苹果 香蕉 橘子", encoding="utf-8", newline="")
+    note = kb.notes.upsert_file(path=str(path))["value"]
+
+    path.unlink()
+    chunks = kb.notes.chunks(note["id"])
+    assert [c["content"] for c in chunks] == ["苹果 香蕉 橘子"], "正文在索引里，源文件没了也读得到"
+    assert kb.search("角色", kinds=["note"])["hits"], "路径词命中笔记"
+    assert kb.search("角色", kinds=["chunk"])["hits"] == [], "路径词不落在切片上"
 
 
 # ── 向量与重排 ────────────────────────────────────────────────────────
@@ -322,7 +337,7 @@ def test_health_exposes_core_counters(kb):
     kb.update_index()
     report = kb.health()
 
-    assert report["schema_version"] == 7
+    assert report["schema_version"] == 8
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
     assert report["pending_index_updates"] == 0

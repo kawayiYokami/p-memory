@@ -85,7 +85,7 @@ pub struct DecayReport { pub decayed: usize, pub retirement_candidates: Vec<Reco
 #[derive(Clone)]
 pub struct MemoryStore(pub(crate) KnowledgeBase);
 
-pub(crate) fn upsert(conn: &Connection, input: &MemoryInput) -> Result<Memory> {
+pub(crate) fn upsert(conn: &Connection, input: &MemoryInput) -> Result<(Memory, crate::index::IndexDocument)> {
     storage::validate_identity("memory_type", &input.memory_type)?;
     if input.judgment.trim().is_empty() { return Err(Error::Validation("judgment is required".into())); }
     let existing: Option<Memory> = if let Some(id) = input.record.id {
@@ -97,13 +97,11 @@ pub(crate) fn upsert(conn: &Connection, input: &MemoryInput) -> Result<Memory> {
     }
     let judgment = input.judgment.trim().to_string();
     let reasoning = input.reasoning.trim().to_string();
-    let tags = storage::normalize_tags(&input.record.tags).join(" ");
-    let embedding_text = format!("{judgment}\n{tags}");
     let memory_type_id = storage::term_id(conn, &input.memory_type)?;
     let payload = json!({"memory_type_id": memory_type_id, "judgment": judgment, "reasoning": reasoning,
         "state": state, "judgment_key": text::normalized_tag(&judgment)});
-    let header = storage::put_record(conn, RecordKind::Memory, &input.record, &payload, &embedding_text)?;
-    Ok(Memory { header, memory_type: input.memory_type.clone(), judgment, reasoning, state })
+    let (header, document) = storage::put_record(conn, RecordKind::Memory, &input.record, &payload, &judgment, "")?;
+    Ok((Memory { header, memory_type: input.memory_type.clone(), judgment, reasoning, state }, document))
 }
 
 pub(crate) fn as_input(memory: &Memory, at: i64) -> MemoryInput {
@@ -119,15 +117,21 @@ pub(crate) fn as_input(memory: &Memory, at: i64) -> MemoryInput {
 impl MemoryStore {
     pub fn upsert(&self, input: MemoryInput) -> Result<WriteReceipt<Memory>> {
         let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
+        let WriteReceipt { value: (memory, document), revision } = receipt;
+        // 索引文档由写入流程就地交过来，这里只写进 writer，提交交给 update_index。
+        self.0.index_documents(&[document])?;
         // 写入即向量化：库内部补齐，宿主只给正文。
-        self.0.vectorize(&[receipt.value.header.id]);
-        Ok(receipt)
+        self.0.vectorize(&[memory.header.id]);
+        Ok(WriteReceipt { value: memory, revision })
     }
     pub fn upsert_many(&self, inputs: &[MemoryInput]) -> Result<WriteReceipt<Vec<Memory>>> {
-        let receipt: WriteReceipt<Vec<Memory>> = self.0.mutate(|tx| inputs.iter().map(|input| upsert(tx, input)).collect())?;
-        let ids: Vec<i64> = receipt.value.iter().map(|memory| memory.header.id).collect();
+        let receipt = self.0.mutate(|tx| inputs.iter().map(|input| upsert(tx, input)).collect::<Result<Vec<_>>>())?;
+        let WriteReceipt { value, revision } = receipt;
+        let (memories, documents): (Vec<Memory>, Vec<crate::index::IndexDocument>) = value.into_iter().unzip();
+        self.0.index_documents(&documents)?;
+        let ids: Vec<i64> = memories.iter().map(|memory| memory.header.id).collect();
         self.0.vectorize(&ids);
-        Ok(receipt)
+        Ok(WriteReceipt { value: memories, revision })
     }
     pub fn upsert_by_judgment(&self, mut input: MemoryInput) -> Result<WriteReceipt<Memory>> {
         let receipt = self.0.mutate(|tx| {
@@ -148,8 +152,10 @@ impl MemoryStore {
             }
             upsert(tx, &input)
         })?;
-        self.0.vectorize(&[receipt.value.header.id]);
-        Ok(receipt)
+        let WriteReceipt { value: (memory, document), revision } = receipt;
+        self.0.index_documents(&[document])?;
+        self.0.vectorize(&[memory.header.id]);
+        Ok(WriteReceipt { value: memory, revision })
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory> {
         let state = self.0.read()?;
@@ -170,8 +176,9 @@ impl MemoryStore {
         let recalled: BTreeSet<_> = request.recalled_ids.iter().copied().collect();
         let useful: BTreeSet<_> = request.useful_ids.iter().copied().collect();
         if !useful.is_subset(&recalled) { return Err(Error::Validation("useful_ids must be a subset of recalled_ids".into())); }
-        self.0.mutate(|tx| {
+        let receipt = self.0.mutate(|tx| {
             let mut report = FeedbackReport { recalled: recalled.len(), ..Default::default() };
+            let mut documents = Vec::new();
             let at = request.now_us.unwrap_or_else(storage::now_us);
             for id in &recalled {
                 let key = RecordKey { id: *id };
@@ -186,17 +193,22 @@ impl MemoryStore {
                     memory.state.strength = (memory.state.strength - 1).max(0);
                     report.penalized += 1;
                 } else { continue; }
-                upsert(tx, &as_input(&memory, at))?;
+                let (_, document) = upsert(tx, &as_input(&memory, at))?;
+                documents.push(document);
             }
-            Ok(report)
-        })
+            Ok((report, documents))
+        })?;
+        let WriteReceipt { value: (report, documents), revision } = receipt;
+        self.0.index_documents(&documents)?;
+        Ok(WriteReceipt { value: report, revision })
     }
     pub fn decay(&self, filter: &ReadFilter, policy: &DecayPolicy, at: Option<i64>) -> Result<WriteReceipt<DecayReport>> {
         policy.validate()?;
-        self.0.mutate(|tx| {
+        let receipt = self.0.mutate(|tx| {
             let at = at.unwrap_or_else(storage::now_us);
             let keys = storage::select_keys(tx, filter, &[RecordKind::Memory], usize::MAX, None)?;
             let cycle = i128::from(policy.tier0_cycle_days) * 86_400_000_000;
+            let mut documents = Vec::new();
             let mut report = DecayReport::default();
             for key in keys {
                 let mut memory: Memory = storage::get(tx, &key, filter)?;
@@ -207,13 +219,17 @@ impl MemoryStore {
                     if steps > 0 {
                         memory.state.strength = (i128::from(memory.state.strength) - steps).max(0) as i64;
                         memory.state.last_decay_at_us = Some((i128::from(reference) + steps * cycle) as i64);
-                        upsert(tx, &as_input(&memory, at))?;
+                        let (_, document) = upsert(tx, &as_input(&memory, at))?;
+                        documents.push(document);
                         report.decayed += 1;
                     }
                 }
                 if memory.state.strength == 0 && policy.tier(memory.state.useful_score) < 2 { report.retirement_candidates.push(key); }
             }
-            Ok(report)
-        })
+            Ok((report, documents))
+        })?;
+        let WriteReceipt { value: (report, documents), revision } = receipt;
+        self.0.index_documents(&documents)?;
+        Ok(WriteReceipt { value: report, revision })
     }
 }

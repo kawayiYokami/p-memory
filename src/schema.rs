@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -17,51 +17,27 @@ INSERT OR IGNORE INTO strings(text) VALUES ('sys:same_as');
 INSERT OR IGNORE INTO predicate_rules(predicate_id, is_symmetric) SELECT id, 1 FROM strings WHERE text='sys:same_as';
 ";
 
-/// v4 -> v5：删掉两条派生文本列。切片 payload 的重写在 `migrate_chunk_payloads` 里。
+/// v4 -> v5：删掉两条派生文本列。切片 payload 里那副本正文由 `strip_chunk_payload_keys` 摘除。
 const MIGRATION_4_TO_5: &str = "
 ALTER TABLE records DROP COLUMN search_text;
 ALTER TABLE records DROP COLUMN embedding_text;
 ";
 
-/// 把切片 payload 从「带 content」翻成「带字符区间」：逐笔记重跑切片，按 `ordinal` 回填。
-/// 切片正文是原文的连续子串，字符区间足以无损还原。
-fn migrate_chunk_payloads(tx: &rusqlite::Transaction<'_>) -> Result<()> {
-    let mut notes: Vec<(i64, String, usize)> = Vec::new();
+/// 把切片 payload 里的若干键摘掉。切片正文只在索里存一份，库内副本一律不要。
+fn strip_chunk_payload_keys(tx: &rusqlite::Transaction<'_>, keys: &[&str]) -> Result<()> {
+    let mut rows: Vec<(i64, String)> = Vec::new();
     {
         let mut stmt = tx.prepare("SELECT id,payload_json FROM records WHERE kind=?1")?;
-        let rows = stmt.query_map([crate::types::RecordKind::Note.code()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (id, payload) = row?;
-            let value: serde_json::Value = serde_json::from_str(&payload)?;
-            let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let chunk_chars = value.get("chunk_chars").and_then(|v| v.as_u64()).unwrap_or(220) as usize;
-            notes.push((id, content, chunk_chars));
+        for row in stmt.query_map([crate::types::RecordKind::Chunk.code()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            rows.push(row?);
         }
     }
-    for (note_id, content, chunk_chars) in notes {
-        let ranges: std::collections::HashMap<usize, (usize, usize)> = crate::notes::chunk_text(&content, chunk_chars)?
-            .into_iter().map(|chunk| (chunk.ordinal, (chunk.char_start, chunk.char_end))).collect();
-        let mut chunks: Vec<(i64, String)> = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT id,payload_json FROM records WHERE kind=?1")?;
-            let rows = stmt.query_map([crate::types::RecordKind::Chunk.code()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (id, payload) = row?;
-                let value: serde_json::Value = serde_json::from_str(&payload)?;
-                if value.get("note_id").and_then(|v| v.as_i64()) == Some(note_id) { chunks.push((id, payload)); }
-            }
+    for (id, raw) in rows {
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        if let Some(object) = value.as_object_mut() {
+            for key in keys { object.remove(*key); }
         }
-        for (id, payload) in chunks {
-            let mut value: serde_json::Value = serde_json::from_str(&payload)?;
-            let ordinal = value.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let (char_start, char_end) = ranges.get(&ordinal).copied().unwrap_or((0, 0));
-            if let Some(object) = value.as_object_mut() {
-                object.remove("content");
-                object.insert("char_start".into(), serde_json::json!(char_start));
-                object.insert("char_end".into(), serde_json::json!(char_end));
-            }
-            tx.execute("UPDATE records SET payload_json=?2 WHERE id=?1", rusqlite::params![id, serde_json::to_string(&value)?])?;
-        }
+        tx.execute("UPDATE records SET payload_json=?2 WHERE id=?1", rusqlite::params![id, serde_json::to_string(&value)?])?;
     }
     Ok(())
 }
@@ -149,14 +125,17 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             2 => { tx.execute_batch("ALTER TABLE embedding_spaces ADD COLUMN encoding TEXT NOT NULL DEFAULT 'f32'")?; }
             // v3 -> v4：谓词元规则表。
             3 => { tx.execute_batch(MIGRATION_3_TO_4)?; }
-            // v4 -> v5：可检索正文交给 Tantivy（索引侧重建即可），SQLite 删掉两条派生文本列；
-            // 切片 payload 去 content，改存字符区间，正文由笔记原文派生。
-            4 => { tx.execute_batch(MIGRATION_4_TO_5)?; migrate_chunk_payloads(&tx)?; }
+            // v4 -> v5：可检索正文交给 Tantivy（索引侧重建即可），SQLite 删掉两条派生文本列，
+            // 切片 payload 里那副本正文一并摘除。
+            4 => { tx.execute_batch(MIGRATION_4_TO_5)?; strip_chunk_payload_keys(&tx, &["content"])?; }
             // v5 -> v6：笔记 payload 不再留正文与派生字段（路径只在 notes 表，标题由路径派生），
             // 正文改由宿主文件承载；旧库里的副本就地摘除。
             5 => { migrate_note_payloads(&tx)?; }
             // v6 -> v7：笔记路径从 strings 标签字典改存本表 path 列（原样）。
             6 => { migrate_note_paths(&tx)?; }
+            // v7 -> v8：切片 payload 摘掉字符区间。写入时切好的正文直接进索引、成为唯一副本，
+            // 从原文按区间二次取正文这条路径整个撤掉。
+            7 => { strip_chunk_payload_keys(&tx, &["char_start", "char_end"])?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -216,7 +195,7 @@ mod tests {
     }
 
     /// v4 形态的笔记 + 切片（带 content 与两条派生列）前滚到当前版本：
-    /// 两条派生列消失，切片 payload 改存字符区间，正文可由笔记原文派生。
+    /// 两条派生列消失，切片 payload 不再留正文，也不留字符区间。
     #[test]
     fn rolls_v4_forward_dropping_derived_columns() {
         let dir = tempfile::tempdir().unwrap();
@@ -245,8 +224,9 @@ mod tests {
         let payload: String = conn.query_row("SELECT payload_json FROM records WHERE id=2", [], |r| r.get(0)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert!(value.get("content").is_none(), "切片 payload 不再存正文");
-        assert_eq!(value.get("char_start").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(value.get("char_end").and_then(|v| v.as_u64()), Some(3));
+        assert!(value.get("char_start").is_none() && value.get("char_end").is_none(), "字符区间随 v8 一并摘除");
+        assert_eq!(value.get("offset").and_then(|v| v.as_u64()), Some(1), "行区间保留");
+        assert_eq!(value.get("limit").and_then(|v| v.as_u64()), Some(1));
         let note_payload: String = conn.query_row("SELECT payload_json FROM records WHERE id=1", [], |r| r.get(0)).unwrap();
         let note: serde_json::Value = serde_json::from_str(&note_payload).unwrap();
         assert!(note.get("content").is_none(), "笔记 payload 不再存正文");

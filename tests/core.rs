@@ -505,6 +505,8 @@ fn concurrent_readers_are_not_blocked_by_a_writer() {
         let mut n = 0usize;
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             writer_kb.memories().upsert(memory(&format!("并发写入 {n}"), "public")).unwrap();
+            // 写入只登记待办；使用方按自己的节奏追平索引，这也是读者不必替写者收尾的常态。
+            if n % 16 == 15 { writer_kb.update_index().unwrap(); }
             n += 1;
         }
         n
@@ -613,25 +615,30 @@ fn ties_and_chinese_queries_are_deterministic_across_rebuilds() {
     kb.rebuild_indexes().unwrap();assert_eq!(ids(&kb),first);
 }
 
+/// 标签列与路径列各自参与搜索：正文里根本没有的词，靠这两列也能搜到。
+/// 路径列属于笔记——命中路径词返回的是笔记记录本身，不随切片数放大。
 #[test]
-fn exact_keywords_recall_tags_and_parent_dirs() {
+fn tag_and_path_columns_carry_queries_the_body_cannot() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
-    // 正文不含"星见雅"，只有 tag 带它：靠精确整词关键字召回。
+    // 正文不含"星见雅"，只有标签列带它。
     let mut m = memory("她喜欢苹果", "public");
     m.record.tags = vec!["星见雅".into()];
     let id = kb.memories().upsert(m).unwrap().value.header.id;
     let hits = kb.search(&SearchRequest { query: "星见雅".into(), ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
-    // 正文不含"角色"，只有 source 的父目录带它：靠父目录整词关键字召回切片。
+    // 正文不含"角色"，只有路径的祖先目录带它：命中笔记一条，切片一条都不命中。
     let note_dir = dir.path().join("绝区零").join("角色");
     std::fs::create_dir_all(&note_dir).unwrap();
     let note_path = note_dir.join("雅.md");
     std::fs::write(&note_path, "这是一段无关内容").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&note_path)).unwrap().value;
+    let hits = kb.search(&SearchRequest { query: "角色".into(), kinds: vec![RecordKind::Note], ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 1, "路径词只由笔记的路径列承载");
+    assert_eq!(hits[0].key.id, note.header.id);
     let hits = kb.search(&SearchRequest { query: "角色".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-    assert!(hits.iter().any(|h| h.record["note_id"] == json!(note.header.id)));
+    assert!(hits.is_empty(), "路径词不落在切片上");
 }
 
 #[test]
@@ -816,21 +823,27 @@ fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
     assert!(kb.notes().upsert_file(NoteFileInput::new(&bad)).is_err());
 }
 
-/// 笔记正文只在宿主文件里：库内任何文本列都不留副本，切片正文读时从文件取回。
+/// 正文唯一副本在索引里：库内任何文本列都不留，切片正文按 ID 从索引取回（必要时先提交一次）。
 #[test]
-fn note_body_stays_in_the_file_not_in_sqlite() {
+fn note_body_lives_only_in_the_index_not_in_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let path = dir.path().join("note.md");
     std::fs::write(&path, "ZZBODYMARK 独有正文标记").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
 
-    // 显式读切片正文：由文件原文派生。
+    // 显式读切片正文：写入时切好、随文档进了索引，这里按 ID 取回。
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     assert!(chunks.iter().any(|chunk| chunk.content.contains("ZZBODYMARK")));
     drop(kb);
 
     // 库内所有文本列都不含正文标记。
+    // 库里任何字节都不含正文标记：整个库文件连同 WAL 一起扫。
+    for name in ["store.sqlite3", "store.sqlite3-wal"] {
+        if let Ok(bytes) = std::fs::read(dir.path().join(name)) {
+            assert!(!String::from_utf8_lossy(&bytes).contains("ZZBODYMARK"), "{name} 里出现正文标记");
+        }
+    }
     let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
     let mut stmt = conn.prepare("SELECT payload_json||metadata_json||evidence_json FROM records").unwrap();
     let hits = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()
@@ -838,18 +851,98 @@ fn note_body_stays_in_the_file_not_in_sqlite() {
     assert_eq!(hits, 0, "笔记正文不落 SQLite");
 }
 
-/// 文件缺失时：读正文（显式读取与全量重建索引）直接报错，不静默兜底——
-/// 按分工这是一致性被破坏，由上游主动删除记录来消除。
+/// 切片只装它自己那一段：同一篇的任何切片都不携带文件名或祖先目录，
+/// 所以搜路径词时一篇只浮出一条笔记，不因片数多而占更多位置。
 #[test]
-fn missing_source_file_surfaces_as_an_error() {
+fn chunks_carry_their_own_text_never_the_words_derived_from_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let note_dir = dir.path().join("绝区零").join("角色");
+    std::fs::create_dir_all(&note_dir).unwrap();
+    let short_path = note_dir.join("雅.md");
+    std::fs::write(&short_path, "苹果 香蕉 橘子").unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].content, "苹果 香蕉 橘子", "切片正文逐字符等于切片原文");
+    for word in ["雅", "角色", "绝区零"] {
+        assert!(!chunks[0].content.contains(word), "切片正文不携带路径派生词：{word}");
+        let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+        assert!(hits.is_empty(), "路径派生词不落在切片上：{word}");
+    }
+    // 长正文切成多片：路径词仍然一片都不带，搜文件名只返回笔记一条。
+    let long_path = note_dir.join("长文.md");
+    std::fs::write(&long_path, "青提".repeat(400)).unwrap();
+    let long_note = kb.notes().upsert_file(NoteFileInput::new(&long_path)).unwrap().value;
+    let long_chunks = kb.notes().chunks(long_note.header.id, &ReadFilter::default()).unwrap();
+    assert!(long_chunks.len() > 1, "长正文应当切成多片");
+    for chunk in &long_chunks { assert!(!chunk.content.contains("长文"), "切片正文不携带文件名"); }
+    let hits = kb.search(&SearchRequest { query: "长文".into(), kinds: vec![RecordKind::Note], ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 1, "路径词命中一篇笔记，不随片数放大");
+    assert_eq!(hits[0].key.id, long_note.header.id);
+}
+
+/// 正文只在索引里存一份，源文件在写入之后就可以消失：读切片正文不再回文件。
+/// 代价是索引全量重建必须回源——源不在时那批切片正文只能退化为空。
+#[test]
+fn indexed_text_survives_the_source_file_but_a_rebuild_needs_it() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let path = dir.path().join("gone.md");
     std::fs::write(&path, "会被删掉的正文").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     let chunk_id = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
     std::fs::remove_file(&path).unwrap();
 
-    assert!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).is_err(), "文件缺失时显式读正文报错");
-    assert!(kb.rebuild_indexes().is_err(), "全量重建索引遇到缺失文件报错");
+    assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "会被删掉的正文",
+        "正文随写入一起进了索引，源文件没了也读得到");
+    assert!(kb.rebuild_indexes().is_ok(), "重建遇到缺失文件不应整体失败");
+    assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "",
+        "重建要回源，源不在的那批切片正文只能为空");
+}
+
+/// 重排取候选正文也走索引：源文件删掉之后，回调拿到的仍是切片原文。
+#[test]
+fn rerank_reads_chunk_bodies_from_the_index_not_from_the_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let path = dir.path().join("唯一笔记.md");
+    std::fs::write(&path, "青提苹果 ZZTEXTMARK").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+    kb.update_index().unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    kb.register_reranker_with(move |_: &str, documents: &[String]| {
+        recorder.lock().unwrap().extend(documents.iter().cloned());
+        Ok(vec![0.5; documents.len()])
+    }, RerankerOptions::default()).unwrap();
+    // 注册本身会校验性地调一次回调，清掉只留检索那次。
+    seen.lock().unwrap().clear();
+    let result = kb.search(&SearchRequest { query: "青提苹果".into(), kinds: vec![RecordKind::Chunk],
+        vector: false, ..Default::default() }).unwrap();
+    assert!(result.diagnostics.reranked && !result.hits.is_empty());
+    assert!(seen.lock().unwrap().iter().any(|body| body.contains("ZZTEXTMARK")), "重排候选正文来自索引");
+}
+
+/// 记忆与切片是同一个结构：同一段文本落在谁的文本列上，得分就该一样。
+#[test]
+fn memory_and_chunk_score_the_same_text_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let text = "青提苹果";
+    kb.memories().upsert(memory(text, "public")).unwrap();
+    let path = dir.path().join("同文本.md");
+    std::fs::write(&path, text).unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+
+    let score = |kinds: Vec<RecordKind>| {
+        let request = SearchRequest { query: text.into(), kinds, vector: false, rerank: false, ..Default::default() };
+        let result = kb.search(&request).unwrap();
+        assert_eq!(result.hits.len(), 1, "该类型下只有一条记录");
+        result.hits[0].text_score.unwrap()
+    };
+    assert_eq!(score(vec![RecordKind::Memory]), score(vec![RecordKind::Chunk]), "同文本的文本列分数一致");
 }

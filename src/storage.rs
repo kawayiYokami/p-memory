@@ -5,7 +5,7 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet, HashMap}, fs::{File, OpenOptions}, path::{Path, PathBuf}, rc::Rc, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
 /// 写者：独占的写连接 + 跨进程文件锁。只挡其他写者，不挡读。
 pub(crate) struct Writer { pub conn: Connection, _file_lock: File }
@@ -102,6 +102,12 @@ impl KnowledgeBase {
     /// 取文本索引的共享句柄。只在这一瞬间持有索引锁，拿到 `Arc` 后即可并发使用。
     pub(crate) fn index(&self) -> Result<Arc<TextIndex>> {
         self.engine.index.read().clone().ok_or(Error::Closed)
+    }
+
+    /// 把写入流程就地交过来的索引文档写进 Tantivy：此刻只是写进 writer，
+    /// 对搜索不可见，commit 仍由 `update_index`（或关闭时的收尾）一次做完。
+    pub(crate) fn index_documents(&self, docs: &[crate::index::IndexDocument]) -> Result<()> {
+        self.index()?.stage(docs)
     }
 
     pub fn close(&self) -> Result<()> {
@@ -209,29 +215,13 @@ impl KnowledgeBase {
     ///
     /// 这条路径**绝不阻塞写入**：拿不到该空间的回调（另一个线程正在同步）就跳过，
     /// 记录留在待补状态，交给后续写入或 `sync` 补。失败只记降级档位，不向上抛错。
+    /// 正文取自索引的记录（切片）不在这条路径上——它们的正文要先随索引提交才取得到，
+    /// 由使用方在 `update_index` 之后显式调 `embeddings().sync` 补齐。
     pub(crate) fn vectorize(&self, ids: &[i64]) {
-        if ids.is_empty() || self.engine.embedders.is_empty() { return; }
+        if ids.is_empty() || !self.engine.embedders.any() { return; }
         for degrade in crate::embeddings::vectorize_records(self, ids) {
             self.note_degrade(degrade);
         }
-    }
-
-    /// 笔记写入后连同它在本次写入中更新的切片一起向量化（切片是独立记录）。
-    pub(crate) fn vectorize_note(&self, note_id: i64) {
-        if self.engine.embedders.is_empty() { return; }
-        let ids = match self.read() {
-            Ok(state) => {
-                let mut ids = vec![note_id];
-                match state.conn().prepare("SELECT record_id FROM chunks WHERE note_id=?1").and_then(|mut stmt|
-                    stmt.query_map([note_id], |r| r.get::<_, i64>(0)).map(|rows| rows.filter_map(|row| row.ok()).collect::<Vec<_>>())) {
-                    Ok(chunks) => ids.extend(chunks),
-                    Err(_) => return,
-                }
-                ids
-            }
-            Err(_) => return,
-        };
-        self.vectorize(&ids);
     }
 
     /// 追平待索引队列：把写入累积的待办一趟索引完、只提交一次。
@@ -357,7 +347,7 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInput,
-    payload: &Value, embedding_text: &str) -> Result<RecordHeader> {
+    payload: &Value, text: &str, path: &str) -> Result<(RecordHeader, crate::index::IndexDocument)> {
     validate_identity("namespace", &input.namespace)?;
     validate_identity("scope", &input.scope)?;
     for evidence in &input.evidence {
@@ -386,7 +376,9 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     let created = existing.as_ref().map(|v| v.0).unwrap_or(input.created_at_us.unwrap_or(now));
     let updated = input.updated_at_us.unwrap_or_else(|| now.max(existing.as_ref().map(|v| v.1).unwrap_or(created)));
     if updated < created { return Err(Error::Validation("updated_at_us precedes created_at_us".into())); }
-    let fingerprint = text::digest(&format!("text-v1\n{embedding_text}"));
+    // 指纹跟着「送进搜索的文本 + 标签」走：正文或标签一变，各空间的旧向量立即失效。
+    let normalized_tags = normalize_tags(&input.tags);
+    let fingerprint = text::digest(&format!("text-v1\n{text}\n{}", normalized_tags.join(" ")));
     let metadata_json = serde_json::to_string(&input.metadata)?;
     let evidence_json = serde_json::to_string(&input.evidence)?;
     let payload_json = serde_json::to_string(payload)?;
@@ -413,14 +405,17 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
         }
     };
     conn.execute("DELETE FROM record_tags WHERE record_id=?1", [id])?;
-    let tags = normalize_tags(&input.tags);
+    let tags = normalized_tags;
     for tag in &tags {
         let tag_id = term_id(conn, tag)?;
         conn.execute("INSERT OR IGNORE INTO record_tags(record_id,tag_id) VALUES (?1,?2)", params![id, tag_id])?;
     }
-    Ok(RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
+    // 索引文档就地拼好交回调用方：正文来自本次写入手上的那一份，索引阶段不再回源。
+    let document = crate::index::IndexDocument { id, namespace: text::normalized_tag(&input.namespace),
+        scope: text::normalized_tag(&input.scope), kind, text: text.to_string(), path: path.to_string(), tags: tags.clone() };
+    Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
-        evidence: input.evidence.clone(), metadata: input.metadata.clone() })
+        evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
 }
 
 pub(crate) fn record_value(conn: &Connection, key: &RecordKey) -> Result<Option<Value>> {
@@ -553,24 +548,6 @@ pub(crate) fn filter_sql(filter: &ReadFilter, kinds: &[RecordKind], by_ids: bool
     Ok((query, values))
 }
 
-/// 批量取回一批记录的可检索正文（按 kind 从 payload 现算）。
-/// 正常情况下重排候选正文取自 Tantivy 的 stored 字段；索引不可用时退到这里，仍然拿得到正文。
-pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
-    let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
-    let mut stmt = conn.prepare(&format!("SELECT id,kind,payload_json FROM records WHERE id IN ({placeholders})"))?;
-    let notes = NoteTexts::default();
-    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))? {
-        let (id, kind_code, payload_json) = row?;
-        let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
-        let payload: Value = serde_json::from_str(&payload_json)?;
-        out.insert(id, search_text(conn, id, kind, &payload, &notes)?);
-    }
-    Ok(out)
-}
-
 /// 过滤条件下的匹配总数（截断之前）。`with_total` 打开时才调用。
 pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<usize> {
     let (condition, values) = filter_sql(filter, kinds, false)?;
@@ -578,60 +555,18 @@ pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[Rec
     Ok(count as usize)
 }
 
-/// 一次批量派生内复用的笔记正文。同一篇笔记的多个切片共享一次文件读取，
-/// 避免「每个切片各读一遍整篇文件」造成读取量随切片数平方增长。
-/// 单条读取（按 id 取一条）建一个临时实例即可，跨记录复用由调用方持有。
-#[derive(Default)]
-pub(crate) struct NoteTexts { cache: RefCell<HashMap<i64, Rc<NoteText>>> }
-
-/// 一篇笔记的派生信息：由路径文件名派生的标题、文件正文。
-/// 正文只在文件里存一份，这里只是一次批量任务内的临时缓存。
-pub(crate) struct NoteText { pub title: String, pub content: String }
-
-impl NoteTexts {
-    /// 取一篇笔记的派生信息；同一实例内对同一 note_id 只读一次文件。
-    fn origin(&self, conn: &Connection, note_id: i64) -> Result<Rc<NoteText>> {
-        if let Some(hit) = self.cache.borrow().get(&note_id) { return Ok(hit.clone()); }
-        let path = note_source(conn, note_id)?;
-        let title = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let content = std::fs::read_to_string(&path)?;
-        let entry = Rc::new(NoteText { title, content });
-        self.cache.borrow_mut().insert(note_id, entry.clone());
-        Ok(entry)
-    }
-}
-
-/// 记录的可检索正文（写入时现算，不落 SQLite）。切片正文由其笔记原文按字符区间取出。
-pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, notes: &NoteTexts) -> Result<String> {
+/// 记录的正文列内容：这条记录自己的文本。
+/// 切片正文来自写入时切好的那一段，不在这里算，所以这条纯函数只覆盖其余四种记录。
+pub(crate) fn record_text(kind: RecordKind, payload: &Value) -> String {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    Ok(match kind {
+    match kind {
         RecordKind::Memory => field("judgment"),
-        // 笔记正文不进全文索引，检索面交给切片；笔记记录只留标题（由宿主路径文件名派生）。
-        RecordKind::Note => notes.origin(conn, id)?.title.clone(),
-        RecordKind::Chunk => {
-            let origin = chunk_origin(conn, payload, notes)?;
-            format!("{}\n{}", origin.title, char_slice(&origin.content, payload))
-        }
         RecordKind::Entity => entity_body(payload),
         RecordKind::Relation => format!("{} {} {} {}", field("subject_name"), field("predicate"), field("object_name"), field("reason")),
         RecordKind::Event => format!("{} {} {} {}", field("name"), field("summary"), name_list(payload), field("reason")),
-    })
-}
-
-/// 向量化的输入文本。记忆额外拼上标签，笔记带上正文（读自宿主文件），其余与可检索正文一致。
-pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, tags: &[String], notes: &NoteTexts) -> Result<String> {
-    let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
-    Ok(match kind {
-        RecordKind::Memory => format!("{}\n{}", field("judgment"), tags.join(" ")),
-        RecordKind::Note => { let origin = notes.origin(conn, id)?; format!("{}\n{}", origin.title, origin.content) }
-        _ => search_text(conn, id, kind, payload, notes)?,
-    })
-}
-
-/// 笔记的宿主路径：笔记自己的一列（原样），payload 里不再重复。
-fn note_source(conn: &Connection, note_id: i64) -> Result<String> {
-    Ok(conn.query_row("SELECT path FROM notes WHERE record_id=?1",
-        [note_id], |r| r.get::<_, String>(0)).optional()?.unwrap_or_default())
+        // 笔记与切片的正文另有来源：笔记的检索面交给切片，切片正文由写入流程就地提供。
+        RecordKind::Note | RecordKind::Chunk => String::new(),
+    }
 }
 
 fn name_list(payload: &Value) -> String {
@@ -652,29 +587,6 @@ fn entity_body(payload: &Value) -> String {
         }).collect::<Vec<_>>().join(" ")
     }).unwrap_or_default();
     format!("{name} {aliases} {summary} {attr_text}")
-}
-
-/// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间；
-/// 正文读时从笔记的宿主文件取，库里不留副本。文件缺失由上游负责删除记录，
-/// 因此这里直接报错，把不一致暴露出来，而不是静默兜底。
-fn chunk_origin(conn: &Connection, payload: &Value, notes: &NoteTexts) -> Result<Rc<NoteText>> {
-    let note_id = payload.get("note_id").and_then(Value::as_i64).ok_or_else(|| Error::Validation("chunk payload is missing note_id".into()))?;
-    notes.origin(conn, note_id)
-}
-
-/// 按 payload 里的 `char_start` / `char_end` 从原文取切片正文。
-fn char_slice(content: &str, payload: &Value) -> String {
-    let start = payload.get("char_start").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let end = payload.get("char_end").and_then(Value::as_u64).unwrap_or(0) as usize;
-    content.chars().skip(start).take(end.saturating_sub(start)).collect()
-}
-
-/// 取某条切片记录的正文（由所属笔记原文按字符区间切出）。
-pub(crate) fn chunk_content(conn: &Connection, chunk_id: i64) -> Result<String> {
-    let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [chunk_id], |r| r.get(0))?;
-    let payload: Value = serde_json::from_str(&raw)?;
-    let origin = chunk_origin(conn, &payload, &NoteTexts::default())?;
-    Ok(char_slice(&origin.content, &payload))
 }
 
 pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;

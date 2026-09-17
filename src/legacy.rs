@@ -357,28 +357,30 @@ fn build(req:&ImportRequest)->Result<Plan>{
     Ok(plan)
 }
 /// 两阶段写入：先建被引用方拿到内部 id，再按逻辑键把引用翻译成内部 id。
-fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut Vec<String>)->Result<()> {
-    for draft in &plan.memories { let memory=memory::upsert(conn,&draft.input)?;
+fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut Vec<String>,documents:&mut Vec<crate::index::IndexDocument>)->Result<()> {
+    for draft in &plan.memories { let (memory,document)=memory::upsert(conn,&draft.input)?; documents.push(document);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:memory.header.id}); }
     let mut map:HashMap<String,i64>=HashMap::new();
     for draft in &plan.entities {
-        let entity=graph::upsert_entity(conn,&draft.input)?;
+        let (entity,document)=graph::upsert_entity(conn,&draft.input)?; documents.push(document);
         map.insert(draft.key(),entity.header.id);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:entity.header.id});
     }
     for draft in &plan.relations {
         let (Some(&subject),Some(&object))=(map.get(&draft.subject),map.get(&draft.object)) else {
             conflicts.push(format!("skipped relation {}: unresolved entity reference {} -> {}",draft.source_id,draft.subject,draft.object));continue;};
-        let relation=graph::upsert_relation(conn,&RelationInput{record:draft.record.clone(),subject_id:subject,predicate:draft.predicate.clone(),object_id:object,confidence:draft.confidence,reason:draft.reason.clone()})?;
+        let (relation,document)=graph::upsert_relation(conn,&RelationInput{record:draft.record.clone(),subject_id:subject,predicate:draft.predicate.clone(),object_id:object,confidence:draft.confidence,reason:draft.reason.clone()})?;
+        documents.push(document);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:relation.header.id});
     }
     for draft in &plan.events {
         let mut participants=Vec::new();
         for participant in &draft.participants { match map.get(participant){Some(id)=>participants.push(*id),None=>conflicts.push(format!("event {}: dropped unresolved participant {participant}",draft.source_id))} }
-        let event=graph::upsert_event(conn,&EventInput{record:draft.record.clone(),name:draft.name.clone(),summary:draft.summary.clone(),participants,confidence:draft.confidence,reason:draft.reason.clone()})?;
+        let (event,document)=graph::upsert_event(conn,&EventInput{record:draft.record.clone(),name:draft.name.clone(),summary:draft.summary.clone(),participants,confidence:draft.confidence,reason:draft.reason.clone()})?;
+        documents.push(document);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:event.header.id});
     }
-    for draft in &plan.notes { let note=notes::sync_file(conn,&draft.input)?;
+    for draft in &plan.notes { let (note,staged)=notes::sync_file(conn,&draft.input)?; documents.extend(staged);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id}); }
     Ok(())
 }
@@ -394,7 +396,8 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     let tx=preview.transaction()?;
     let mut mappings=Vec::new();
     let mut preview_conflicts=Vec::new();
-    if let Err(e)=apply(&tx,&plan,&mut mappings,&mut preview_conflicts){preview_conflicts.push(e.to_string());report.conflicts=preview_conflicts;return Ok(report)}
+    let mut preview_documents=Vec::new();
+    if let Err(e)=apply(&tx,&plan,&mut mappings,&mut preview_conflicts,&mut preview_documents){preview_conflicts.push(e.to_string());report.conflicts=preview_conflicts;return Ok(report)}
     report.id_map=mappings;
     {
         let mut stmt=tx.prepare("SELECT kind,COUNT(*) FROM records GROUP BY kind")?;for row in stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))?{
@@ -417,14 +420,16 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     }
     if req.dry_run{report.conflicts=preview_conflicts;return Ok(report)}
     let kb=KnowledgeBase::open(&req.destination)?;
+    let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
     kb.mutate(|tx|{
         let count:i64=tx.query_row("SELECT COUNT(*) FROM records",[],|r|r.get(0))?;
         if count!=0{return Err(Error::Conflict("destination became nonempty during import".into()))}
-        let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts)?;report.id_map=mappings;report.applied=true;
+        let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts,&mut documents)?;report.id_map=mappings;report.applied=true;
         tx.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES (?1,?2,?3)",params![req.source_id,fingerprint,serde_json::to_string(&report)?])?;
         Ok(())
     })?;
-    // 导入只写数据，不逐条索引；收尾显式追平一次，报告如实反映结果。
+    // 导入只写数据，不逐条索引；导入时切好的正文在这里一次性交给索引，收尾显式追平一次。
+    kb.index_documents(&documents)?;
     match kb.update_index() { Ok(_) => {}, Err(error) => report.index_error = Some(error.to_string()) }
     report.index_ready = report.index_error.is_none();
     kb.write(|writer| Ok(writer.conn.execute("UPDATE import_runs SET report_json=?2 WHERE source_id=?1",params![req.source_id,serde_json::to_string(&report)?])?))?;

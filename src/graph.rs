@@ -73,15 +73,15 @@ fn referenced_entity(conn: &Connection, record: &RecordInput, id: i64) -> Result
         &ReadFilter { namespace: record.namespace.clone(), scopes: vec![record.scope.clone()], tags: vec![] })
 }
 
-pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<Entity> {
+pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<(Entity, crate::index::IndexDocument)> {
     storage::validate_identity("entity name", &input.name)?;
     storage::validate_identity("entity_type", &input.entity_type)?;
     let aliases: Vec<_> = input.aliases.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<BTreeSet<_>>().into_iter().collect();
     let attributes = input.attributes.clone();
     let attr_text = attributes.iter().map(|(k, values)| format!("{k} {}", values.join(" "))).collect::<Vec<_>>().join(" ");
     let body = format!("{} {} {} {}", input.name, aliases.join(" "), input.summary, attr_text);
-    let header = storage::put_record(conn, RecordKind::Entity, &input.record,
-        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body)?;
+    let (header, document) = storage::put_record(conn, RecordKind::Entity, &input.record,
+        &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body, "")?;
     let entity_type_id = storage::term_id(conn, &input.entity_type)?;
     conn.execute("INSERT INTO entities(record_id,name,entity_type_id) VALUES (?1,?2,?3)
         ON CONFLICT(record_id) DO UPDATE SET name=excluded.name,entity_type_id=excluded.entity_type_id",
@@ -98,60 +98,66 @@ pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<En
             conn.execute("INSERT OR IGNORE INTO entity_attributes(entity_id,attr_key_id,attr_value) VALUES (?1,?2,?3)", params![header.id, key_id, value])?;
         }
     }
-    Ok(Entity { header, name: input.name.clone(), entity_type: input.entity_type.clone(), aliases, attributes, summary: input.summary.clone() })
+    Ok((Entity { header, name: input.name.clone(), entity_type: input.entity_type.clone(), aliases, attributes, summary: input.summary.clone() }, document))
 }
 
-pub(crate) fn upsert_relation(conn: &Connection, input: &RelationInput) -> Result<Relation> {
+pub(crate) fn upsert_relation(conn: &Connection, input: &RelationInput) -> Result<(Relation, crate::index::IndexDocument)> {
     storage::validate_identity("predicate", &input.predicate)?;
     check_confidence(input.confidence)?;
     let subject = referenced_entity(conn, &input.record, input.subject_id)?;
     let object = referenced_entity(conn, &input.record, input.object_id)?;
     let body = format!("{} {} {} {}", subject.name, input.predicate, object.name, input.reason);
-    let header = storage::put_record(conn, RecordKind::Relation, &input.record,
+    let (header, document) = storage::put_record(conn, RecordKind::Relation, &input.record,
         &json!({"subject_id":input.subject_id,"predicate":input.predicate,"object_id":input.object_id,"confidence":input.confidence,"reason":input.reason,
-            "subject_name":subject.name,"object_name":object.name}), &body)?;
+            "subject_name":subject.name,"object_name":object.name}), &body, "")?;
     let predicate_id = storage::term_id(conn, &input.predicate)?;
     conn.execute("INSERT INTO relations(record_id,subject_id,predicate_id,object_id) VALUES (?1,?2,?3,?4)
         ON CONFLICT(record_id) DO UPDATE SET subject_id=excluded.subject_id,predicate_id=excluded.predicate_id,object_id=excluded.object_id",
         params![header.id, input.subject_id, predicate_id, input.object_id])?;
-    Ok(Relation { header, subject_id: input.subject_id, predicate: input.predicate.clone(), object_id: input.object_id, confidence: input.confidence, reason: input.reason.clone() })
+    Ok((Relation { header, subject_id: input.subject_id, predicate: input.predicate.clone(), object_id: input.object_id, confidence: input.confidence, reason: input.reason.clone() }, document))
 }
 
-pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<Event> {
+pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<(Event, crate::index::IndexDocument)> {
     storage::validate_identity("event name", &input.name)?;
     check_confidence(input.confidence)?;
     let participants: Vec<_> = input.participants.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
     let names = participants.iter().map(|id| referenced_entity(conn, &input.record, *id).map(|e| e.name)).collect::<Result<Vec<_>>>()?;
     let body = format!("{} {} {} {}", input.name, input.summary, names.join(" "), input.reason);
-    let header = storage::put_record(conn, RecordKind::Event, &input.record,
+    let (header, document) = storage::put_record(conn, RecordKind::Event, &input.record,
         &json!({"name":input.name,"summary":input.summary,"participants":participants,"confidence":input.confidence,"reason":input.reason,
-            "participant_names":names}), &body)?;
+            "participant_names":names}), &body, "")?;
     conn.execute("DELETE FROM event_participants WHERE event_id=?1", [header.id])?;
     for id in &participants {
         conn.execute("INSERT INTO event_participants(event_id,entity_id) VALUES (?1,?2)", params![header.id, id])?;
     }
-    Ok(Event { header, name: input.name.clone(), summary: input.summary.clone(), participants, confidence: input.confidence, reason: input.reason.clone() })
+    Ok((Event { header, name: input.name.clone(), summary: input.summary.clone(), participants, confidence: input.confidence, reason: input.reason.clone() }, document))
 }
 
-pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(GraphBatchResult, Vec<i64>)> {
+pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(GraphBatchResult, Vec<i64>, Vec<crate::index::IndexDocument>)> {
+    let mut documents = Vec::new();
     // Entities first permits references to entities created in this transaction.
-    let entities = batch.entities.iter().map(|v| upsert_entity(conn, v)).collect::<Result<Vec<_>>>()?;
-    let relations = batch.relations.iter().map(|v| upsert_relation(conn, v)).collect::<Result<Vec<_>>>()?;
-    let events = batch.events.iter().map(|v| upsert_event(conn, v)).collect::<Result<Vec<_>>>()?;
-    // 改名会改写引用它的关系与事件正文，这些记录的向量必须一并重算。
-    let refreshed = refresh_dependents(conn, &entities)?;
+    let mut entities = Vec::new();
+    for input in &batch.entities { let (entity, document) = upsert_entity(conn, input)?; entities.push(entity); documents.push(document); }
+    let mut relations = Vec::new();
+    for input in &batch.relations { let (relation, document) = upsert_relation(conn, input)?; relations.push(relation); documents.push(document); }
+    let mut events = Vec::new();
+    for input in &batch.events { let (event, document) = upsert_event(conn, input)?; events.push(event); documents.push(document); }
+    // 改名会改写引用它的关系与事件正文，这些记录的索引与向量都要一并刷新。
+    let (refreshed, rewritten_documents) = refresh_dependents(conn, &entities)?;
+    documents.extend(rewritten_documents);
     let mut ids: Vec<i64> = entities.iter().map(|e| e.header.id)
         .chain(relations.iter().map(|r| r.header.id)).chain(events.iter().map(|e| e.header.id)).collect();
     ids.extend(refreshed);
     ids.sort_unstable();
     ids.dedup();
-    Ok((GraphBatchResult { entities, relations, events }, ids))
+    Ok((GraphBatchResult { entities, relations, events }, ids, documents))
 }
 
-/// 返回因引用正文变化而被重写的记录 id。
-fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>> {
+/// 返回因引用正文变化而被重写的记录 id 与它们的新索引文档。
+fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<(Vec<i64>, Vec<crate::index::IndexDocument>)> {
     let mut keys = BTreeSet::new();
     let mut rewritten = Vec::new();
+    let mut documents = Vec::new();
     for entity in entities {
         let mut stmt = conn.prepare("SELECT record_id FROM relations WHERE subject_id=?1 OR object_id=?1
             UNION SELECT event_id FROM event_participants WHERE entity_id=?1")?;
@@ -173,7 +179,7 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>
             let names = e.participants.iter().map(|id| referenced_entity(conn, &e.header.as_input(), *id).map(|v| v.name)).collect::<Result<Vec<_>>>()?;
             (format!("{} {} {} {}", e.name, e.summary, names.join(" "), e.reason), json!({"participant_names":names}))
         };
-        let old = storage::search_text(conn, key.id, kind, &value, &storage::NoteTexts::default())?;
+        let old = storage::record_text(kind, &value);
         if old != body {
             let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [key.id], |r| r.get(0))?;
             let mut payload: serde_json::Value = serde_json::from_str(&raw)?;
@@ -182,24 +188,33 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>
                     for (name, value) in extra { object.insert(name.clone(), value.clone()); }
                 }
             }
+            let tags: Vec<String> = value.get("tags").and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default();
+            let fingerprint = text::digest(&format!("text-v1\n{body}\n{}", tags.join(" ")));
             let revision = storage::next_revision(conn, key.id)?;
             conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
-                params![key.id, serde_json::to_string(&payload)?, text::digest(&format!("text-v1\n{body}")), revision, storage::now_us()])?;
+                params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
             conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
+            let namespace = value.get("namespace").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let scope = value.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            documents.push(crate::index::IndexDocument { id: key.id, namespace, scope, kind, text: body.clone(), path: String::new(), tags });
             rewritten.push(key.id);
         }
     }
-    Ok(rewritten)
+    Ok((rewritten, documents))
 }
 
 impl GraphStore {
     pub fn apply_batch(&self, batch: &GraphBatch) -> Result<WriteReceipt<GraphBatchResult>> {
         let mut ids: Vec<i64> = Vec::new();
+        let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
         let receipt = self.0.mutate(|tx| {
-            let (result, written) = apply_batch(tx, batch)?;
+            let (result, written, staged) = apply_batch(tx, batch)?;
             ids = written;
+            documents = staged;
             Ok(result)
         })?;
+        self.0.index_documents(&documents)?;
         self.0.vectorize(&ids);
         Ok(receipt)
     }

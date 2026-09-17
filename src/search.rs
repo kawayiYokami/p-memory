@@ -248,10 +248,8 @@ impl KnowledgeBase {
                 ranked.truncate(options.max_docs);
                 let ids: Vec<i64> = ranked.iter().map(|(key, _)| key.id).collect();
                 // 候选正文取自索引的 stored 字段（切片正文在这里）；索引不可用时退回按 payload 现算。
-                let bodies = match self.index() {
-                    Ok(index) => index.bodies(&ids)?,
-                    Err(_) => storage::search_texts(conn, &ids)?,
-                };
+                // 候选正文只存在索引里：取不到（索引不可用）就按融合分排序，标记降级。
+                let bodies = match self.index() { Ok(index) => index.bodies(&ids)?, Err(_) => BTreeMap::new() };
                 let documents: Vec<String> = ids.iter()
                     .map(|id| bodies.get(id).map(String::as_str).unwrap_or(""))
                     .map(|body| text::truncate_to_tokens(body, options.max_tokens_per_doc))

@@ -2,7 +2,7 @@ use crate::{storage::{self, KnowledgeBase}, text, types::*, Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::{BinaryHeap, HashMap, HashSet}, sync::Arc};
+use std::{cmp::Ordering, collections::{BTreeMap, BinaryHeap, HashMap, HashSet}, sync::Arc};
 
 fn text_version() -> u32 { 1 }
 fn default_encoding() -> String { "sq8".into() }
@@ -113,7 +113,7 @@ pub(crate) struct EmbedderRegistry { entries: Mutex<HashMap<String, Arc<Mutex<Em
 
 impl EmbedderRegistry {
     pub fn new() -> Self { Self::default() }
-    pub fn is_empty(&self) -> bool { self.entries.lock().is_empty() }
+    pub fn any(&self) -> bool { !self.entries.lock().is_empty() }
     pub fn space_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.entries.lock().keys().cloned().collect();
         ids.sort();
@@ -274,7 +274,7 @@ pub(crate) fn namespace_vectorization(conn: &Connection, namespace: &str) -> Res
 ///
 /// 合格判定全部落在 SQL 里：记录类型默认开关、namespace 开关、指纹是否已补齐。
 /// 这样游标推进永远不会跳过仍需处理的记录，也不会把不合格记录反复取回来。
-pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, after: Option<i64>, ids: Option<&[i64]>) -> Result<Vec<EmbeddingInput>> {
+pub(crate) fn pending_batch(conn: &Connection, index: &crate::index::TextIndex, space_id: &str, limit: usize, after: Option<i64>, ids: Option<&[i64]>) -> Result<Vec<EmbeddingInput>> {
     let mut sql = String::from("SELECT r.id,r.kind,r.payload_json,r.fingerprint FROM records r JOIN strings n ON n.id=r.namespace_id WHERE 1=1");
     let mut values: Vec<SqlValue> = Vec::new();
     let disabled: Vec<RecordKind> = [RecordKind::Memory, RecordKind::Entity, RecordKind::Relation, RecordKind::Event, RecordKind::Note, RecordKind::Chunk]
@@ -299,15 +299,26 @@ pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, aft
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
-    let notes = storage::NoteTexts::default();
+    let mut candidates: Vec<(i64, i64, String, String)> = Vec::new();
     for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
-        let (id, kind_code, payload_json, fingerprint) = row?;
-        // 向量输入文本不落盘：按 kind 从 payload 现算（记忆额外拼标签，切片由其笔记正文取出）。
+        candidates.push(row?);
+    }
+    // 切片正文唯一的副本在索引里，按记录 ID 取回；其余记录的正文由 payload 现算，不碰文件。
+    let chunk_ids: Vec<i64> = candidates.iter().filter(|(_, kind, _, _)| *kind == RecordKind::Chunk.code()).map(|(id, _, _, _)| *id).collect();
+    let bodies = if chunk_ids.is_empty() { BTreeMap::new() } else { index.bodies(&chunk_ids)? };
+    for (id, kind_code, payload_json, fingerprint) in candidates {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
-        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
-        let tags = record_tags(conn, id)?;
-        let body = storage::embedding_text(conn, id, kind, &payload, &tags, &notes)?;
-        items.push(EmbeddingInput { key: RecordKey { id }, text: body, fingerprint });
+        let body = match kind {
+            RecordKind::Chunk => bodies.get(&id).cloned().unwrap_or_default(),
+            _ => serde_json::from_str::<serde_json::Value>(&payload_json)
+                .map(|payload| storage::record_text(kind, &payload)).unwrap_or_default(),
+        };
+        // 记忆是短句，标签是它的另一半特征，两者一起送进向量；其余记录只用正文。
+        let text = match (kind, record_tags(conn, id)?) {
+            (RecordKind::Memory, tags) if !tags.is_empty() => format!("{body}\n{}", tags.join(" ")),
+            _ => body,
+        };
+        items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint });
     }
     Ok(items)
 }
@@ -444,7 +455,8 @@ impl EmbeddingStore {
             let limit = batch.min(guard.effective_batch).max(1);
             let pending = {
                 let state = self.0.read()?;
-                pending_batch(state.conn(), space_id, limit, cursor, ids)?
+                let index = self.0.index()?;
+                pending_batch(state.conn(), &index, space_id, limit, cursor, ids)?
             };
             if pending.is_empty() { break; }
             report.scanned += pending.len();
@@ -509,6 +521,7 @@ fn validate_vectors(produced: &[Vec<f32>], expected: usize, space: &EmbeddingSpa
 
 /// 写入路径的内部向量化：对每个已注册空间补齐这批记录的向量。
 /// 拿不到回调（另一个线程正在同步）就跳过，不阻塞写入；失败返回降级档位。
+/// 切片的正文只存在索引里，所以它的向量只能等索引提交之后才补得上。
 pub(crate) fn vectorize_records(kb: &KnowledgeBase, ids: &[i64]) -> Vec<Degrade> {
     let mut degraded = Vec::new();
     for space_id in kb.engine.embedders.space_ids() {

@@ -55,18 +55,6 @@ pub(crate) fn query_terms(text: &str, strict: bool) -> Vec<String> {
     }).collect()
 }
 
-/// 从宿主传入的 source 路径里取出每一级父目录名，作为精确整词关键字。
-/// 只读传入的字符串、不碰文件系统；分隔符兼容 `/` 与 `\`，末段视为叶子（文件名/资源）丢弃。
-pub(crate) fn ancestor_dirs(source: &str) -> Vec<String> {
-    let normalized = normalize_text(source);
-    let parts: Vec<&str> = normalized.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
-    if parts.len() < 2 { return Vec::new(); }
-    let mut dirs: Vec<String> = parts[..parts.len() - 1].iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs
-}
-
 /// 查询侧关键字词：不做 1+2 切分，按空白切成整词后归一化，用于命中精确整词字段。
 pub(crate) fn keyword_terms(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
