@@ -178,7 +178,7 @@ impl EmbeddingStore {
     fn set_namespace_vectorization(&self, namespace: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
     fn vectorization(&self, namespace: &str, target: &str) -> Result<bool>;
     fn set_vectorization(&self, namespace: &str, target: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
-    fn vector_ready(&self, namespace: &str, space_id: &str) -> Result<bool>;
+    fn vector_ready(&self, namespace: &str, space_id: &str, target: &str) -> Result<bool>;
     fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>>;
     fn delete_space(&self, id: &str) -> Result<WriteReceipt<bool>>;
 }
@@ -186,10 +186,10 @@ impl EmbeddingStore {
 
 - 空间定义不可变；重复注册相同定义幂等。
 - `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
-- `sync(space_id, batch)` 是**批次结束后的补齐**，宿主不参与向量计算。它按固定顺序走完三件事：先追平索引（切片正文只存在索引里，不追平就取不到文本）→ 再按缺口分批补齐 → 最后核对缺口、把缺口为 0 的领域标成**就绪**。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
-- `vector_ready(namespace, space_id)` 读的是「领域 × 向量空间」的就绪标记（落盘在 `meta`）。未就绪的领域检索只走全文并记 `vector_not_ready`。写入、删除记录、改总闸或改档位都会让标记当场作废，要重新走一次 `sync` 核对过才会再标。
+- `sync(space_id, batch)` 是**批次结束后的补齐**，宿主不参与向量计算。它按固定顺序走完三件事：先追平索引（切片正文只存在索引里，不追平就取不到文本）→ 再按缺口分批补齐 → 最后逐档核对缺口，把缺口为 0 的档标成**就绪**。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
+- `vector_ready(namespace, space_id, target)` 读的是「领域 × 向量空间 × 档位」的就绪标记（落盘在 `meta`），`target` 取 `memory` / `graph` / `notes`，三档各自独立记、各自放行：记忆补完了不表示图谱也补完了。未就绪的档在检索里被剔出向量路，其余已就绪的档照常走向量；三档全被剔才记 `vector_not_ready`。写入、删除记录、改总闸或改档位都会让标记当场作废，要重新走一次 `sync` 核对过才会再标。
 - 写入路径**不产生向量**：`upsert` 一条记忆或笔记只做两件事——入库与把文档写进索引 writer。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一留到批次结束调 `sync`。落库后没有人调用 `sync` 的情形由库内后台线程兜底。
-- 后台线程在开库时启动、关库时停下并等它收尾。它每 2 秒看一次，只在「这一拍里有新写入、且这一拍之内没有新写入」时动手补齐——前者说明有活可干，后者说明这批写完了；因此调用方自己先调 `sync` 时不会和它抢模型。
+- 后台线程在开库时启动、关库时停下并等它收尾。它是**纯事件触发**，不轮询、不设定时：开库、注册或切换向量模型、改档位、写入提交后各叫它一次；一轮补齐跑完若还写出过向量，就接着再跑一轮收掉漏网的。线程没被叫时一直睡在条件变量上。
 - `namespace_vectorization` / `set_namespace_vectorization` 是某知识域的**总闸**；`vectorization(ns, target)` / `set_vectorization(ns, target, enabled)` 是域内的**档位开关**，`target` 取 `memory` / `graph` / `notes`，三者互不牵连。读数时没设置过的档位落到内置默认（记忆开、图谱开、笔记关），非法档位名报 `validation`。四者都落盘在 `meta` 表。
 - 开关只决定是否生成向量：已有向量保留，检索时按启用档位过滤；总闸关闭时该域既不生成向量、也不走向量路。
 

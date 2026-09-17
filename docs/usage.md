@@ -114,7 +114,7 @@ kb.embeddings().register_embedder_with("e5", my_embed_fn, EmbedderOptions {
     max_batch: 50, max_tokens_per_text: Some(512),
 })?;
 
-// 批次结束后调一次：先追平索引，再把缺口补完，最后核对并把该领域标成就绪。
+// 批次结束后调一次：先追平索引，再把缺口补完，最后逐档核对并标成就绪（记忆 / 图谱 / 笔记各自记）。
 kb.embeddings().sync("e5", 50)?;
 
 // 写入路径不产生向量：upsert 只入库、写索引，一行向量都不算。

@@ -6,9 +6,10 @@ Rust 侧 `tests/core.rs` 覆盖核心语义；这里保护的是绑定自己的�
 """
 import asyncio
 import sqlite3
+import threading
+import time
 
 import pytest
-
 from p_memory import (
     AsyncKnowledgeBase,
     ClosedError,
@@ -21,6 +22,16 @@ from p_memory import (
     ValidationError,
     import_legacy,
 )
+
+
+def wait_until_ready(kb, namespace: str, space_id: str, target: str, budget_s: float = 15.0) -> bool:
+    """等某一档补齐。补齐由库内线程按事件触发，这里只等结果，不假定是谁补的。"""
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        if kb.embeddings.vector_ready(namespace, space_id, target):
+            return True
+        time.sleep(0.025)
+    return False
 
 
 # ── 记忆 ──────────────────────────────────────────────────────────────
@@ -237,30 +248,35 @@ def test_note_body_lives_in_the_index_and_path_tags_ride_on_every_chunk(kb, tmp_
 # ── 向量与重排 ────────────────────────────────────────────────────────
 
 def test_embedder_registers_validates_and_search_embeds_query(kb):
-    """注册即校验；写入只入库不入向量，批次结束 sync 之后向量路才放行；检索只给搜索词。"""
+    """注册即校验；写入只入库不入向量，补齐之后向量路才放行；检索只给搜索词。"""
     kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 4})
     assert kb.embeddings.spaces() == [
         {"id": "e5", "model": "e5-base", "dimension": 4, "text_version": 1, "encoding": "sq8"}
     ]
 
-    calls: list[int] = []
+    calls: list[tuple[str, int]] = []
 
     def embedder(texts):
-        calls.append(len(texts))
+        calls.append((threading.current_thread().name, len(texts)))
         return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
 
-    kb.embeddings.register_embedder("e5", embedder, max_batch=4)
-    assert calls and max(calls) <= 4, "注册即用样本真跑一遍校验"
-
+    # 还没有模型可用：写入照样成功，一行向量都不产生。
     target = kb.memories.upsert_by_judgment(judgment="需要向量化的记忆")["value"]["id"]
-    assert len(calls) == 1, "写入不碰模型：注册校验那次之后回调没再被调到"
-    assert kb.embeddings.vector_ready("default", "e5") is False, "还没补过，谈不上就绪"
+    assert kb.embeddings.vector_ready("default", "e5", "memory") is False, "还没补过，谈不上就绪"
 
     gated = kb.search("向量化", embed_space="e5", text=False, rerank=False)
     assert gated["hits"] == [] and "vector_not_ready" in gated["diagnostics"]["degraded"]
 
-    assert kb.embeddings.sync("e5")["value"]["written"] == 1, "批次结束补一次"
-    assert kb.embeddings.vector_ready("default", "e5") is True
+    # 接上回调：注册这个动作自己就触发一次补齐。
+    kb.embeddings.register_embedder("e5", embedder, max_batch=4)
+    mine = [length for name, length in calls if name == threading.current_thread().name]
+    assert mine and max(mine) <= 4, "注册即用样本真跑一遍校验"
+    # 模型已就位的情况下再写一条：调用方这条线程上依然一次模型都不调。
+    before = len(mine)
+    kb.memories.upsert_by_judgment(judgment="第二条需要向量化的记忆")
+    mine = [length for name, length in calls if name == threading.current_thread().name]
+    assert len(mine) == before, "写入不碰模型"
+    assert wait_until_ready(kb, "default", "e5", "memory"), "补齐之后该放行"
 
     hits = kb.search("向量化", embed_space="e5", text=False, rerank=False)["hits"]
     assert hits[0]["key"]["id"] == target

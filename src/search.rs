@@ -204,16 +204,22 @@ impl KnowledgeBase {
             if !gated {
                 diagnostics.degraded.push(Degrade::NamespaceDisabled);
             } else {
-                let enabled = { let state = self.read()?; embeddings::enabled_kinds(state.conn(), &request.filter.namespace)? };
-                vector_kinds = request.kinds.iter().copied().filter(|kind| enabled.contains(kind)).collect();
-                // 空间没登记过是配置错误，直接报；登记过但没绑回调才是可降级的情形。
-                if !vector_kinds.is_empty() {
+                // 只让「已启用、且这一档自己已经补齐」的类型走向量：
+                // 某一档没补完，就把它从向量路里剔除，它的存量向量先不参与打分。
+                // 半个领域的向量参会比只用全文更糟——排名会偏向「先补完的那部分」。
+                let (enabled, ready) = {
+                    let state = self.read()?;
+                    let conn = state.conn();
+                    let namespace = &request.filter.namespace;
+                    (embeddings::enabled_kinds(conn, namespace)?, embeddings::ready_kinds(conn, namespace, space_id)?)
+                };
+                let requested: Vec<RecordKind> = request.kinds.iter().copied().filter(|kind| enabled.contains(kind)).collect();
+                vector_kinds = requested.iter().copied().filter(|kind| ready.contains(kind)).collect();
+                if !requested.is_empty() {
                     // 空间没登记过是配置错误，直接报；登记过但没绑回调才是可降级的情形。
                     let space = { let state = self.read()?; embeddings::get_space(state.conn(), space_id)? };
-                    // 该领域还没补齐就整条向量路不走：半个领域的向量参与打分，
-                    // 比只用全文更糟——排名会偏向「先补完的那部分」。
-                    let ready = { let state = self.read()?; embeddings::vector_ready(state.conn(), &request.filter.namespace, space_id)? };
-                    if !ready {
+                    if vector_kinds.is_empty() {
+                        // 请求要的类型都启用了，但没有一档补齐：这一轮只给全文。
                         diagnostics.degraded.push(Degrade::VectorNotReady);
                     } else {
                         match self.engine.embedders.get(space_id) {

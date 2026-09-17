@@ -7,6 +7,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
+/// 读路径自愈索引时最多试几次拿写锁（每次退避 1ms，合计约 1s）。
+/// 只在库内补向量那条线程正在补齐时才试：它提交的正是读者要看的待办，
+/// 而那份提交一落地待办就空了，循环随即结束。别的时候（例如批量导入的写者占着写锁）
+/// 一律不试，读路径绝不为索引排队——那正是当初吞吐塌方的成因。
+const SELF_HEAL_ATTEMPTS: usize = 1000;
+
 /// 写者：独占的写连接 + 跨进程文件锁。只挡其他写者，不挡读。
 pub(crate) struct Writer { pub conn: Connection, _file_lock: File }
 
@@ -173,14 +179,27 @@ impl KnowledgeBase {
     pub(crate) fn sync_index_if_behind(&self, conn: &Connection) -> Result<()> {
         let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
         if pending == 0 { return Ok(()); }
-        // 抢不到写锁就说明写者正在提交索引，读路径绝不能为此排队。
-        match self.engine.writer.try_lock() {
-            Some(mut guard) => match guard.as_mut() {
-                Some(writer) => self.index()?.sync(&writer.conn),
-                None => Ok(()),
-            },
-            None => Ok(()),
+        // 库内补向量那条线程也会提交索引，而它提交的正是读者要看的待办：
+        // 它补齐期间允许读者短暂等一等。别的写者一概不等——批量导入时写者会长期占着写锁，
+        // 读路径为它排队就是当初那次吞吐塌方的成因。
+        let filling = self.engine.vectorizer.get().map(|vectorizer| vectorizer.clone());
+        for _ in 0..SELF_HEAL_ATTEMPTS {
+            match self.engine.writer.try_lock() {
+                Some(mut guard) => return match guard.as_mut() {
+                    Some(writer) => self.index()?.sync(&writer.conn),
+                    None => Ok(()),
+                },
+                None => {
+                    // 待办已经被提交掉了（多半就是那条线程提交的）：不必再等。
+                    let still: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
+                    if still == 0 { return Ok(()); }
+                    // 它没在补齐就说明是别的写者占着写锁，读路径不为它排队。
+                    if !filling.as_ref().is_some_and(|vectorizer| vectorizer.is_filling()) { return Ok(()); }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn mutate<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<WriteReceipt<T>> {
@@ -196,8 +215,8 @@ impl KnowledgeBase {
         // 记录一变，「应向量化集合」就变了：受影响领域的就绪标记就地作废，
         // 等补齐核对过再重新标。这样检索侧读到的永远是「核对过的那一份」。
         self.invalidate_readiness(&writer.conn);
-        // 也给库内线程说一声：有新活可干，等这批写完它就会去补。
-        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.note_work(); }
+        // 也给库内线程说一声：切片更新了就有一批该补的，叫它起来干活。
+        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(WriteReceipt { value, revision })
     }
 

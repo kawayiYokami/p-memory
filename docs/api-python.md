@@ -47,8 +47,8 @@ kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
 ```python
 kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 768})
 kb.embeddings.register_embedder("e5", my_embed_fn, max_batch=50)   # 注册即用样本校验
-kb.embeddings.sync("e5", batch=50)                                # 追平索引 → 补齐缺口 → 核对并标记就绪
-kb.embeddings.vector_ready("akasha/gi", "e5")                     # 该领域是否已补齐；未就绪检索只走全文
+kb.embeddings.sync("e5", batch=50)                                # 追平索引 → 补齐缺口 → 逐档核对并标记就绪
+kb.embeddings.vector_ready("akasha/gi", "e5", "memory")           # 记忆档补完了没有；未就绪的档不走向量
 kb.memories.upsert_by_judgment(judgment="……")                      # 写入不碰向量，向量留给批次结束的 sync
 kb.search("偏好", embed_space="e5")                                # 库嵌入查询词，宿主只给词
 kb.register_reranker(my_rerank_fn, max_docs=64)                    # 进程内单例重排回调
