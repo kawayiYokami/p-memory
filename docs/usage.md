@@ -92,7 +92,7 @@ use p_memory::notes::NoteFileInput;
 kb.notes().upsert_file(NoteFileInput::new("docs/readme.md"))?;
 ```
 
-写入时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。正文不落库——权威是文件，笔记 payload 只留切片粒度；切片正文由文件原文按字符区间取出；可检索正文交给全文索引承载。
+写入时，库在**同一事务**内重切切片；`chunks(note_id, &filter)` 取回带行号的片段。正文不进库——切片正文在写入时从文件读一次、切好就随文档进全文索引，库内只留路径与切片粒度；索引还没提交时取正文会先提交一次。
 
 ## 向量与重排（宿主提供模型接口，库内部执行）
 

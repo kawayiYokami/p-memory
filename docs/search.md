@@ -106,7 +106,15 @@ flowchart LR
 | 严格 | 全部词项 `Must` 命中 | 精确匹配优先 |
 | 宽松 | 词项 `Should` 命中 | 补充召回 |
 
-结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（正文照旧保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/keywords/text/body`：`text` 使用预切分的空白分词器（`pretokenized`）承担正文 1+2 分词召回；`body` 是同一段未分词正文的 stored 字段，供重排取候选正文与命中回读，索引不可用时改由 payload（笔记读文件）现算；`tags` 与 `keywords` 是精确整词字段（`STRING`），`keywords` 收纳各记录的 tags 与笔记 `source` 的各级父目录名，查询时按整词与正文并行 `Should` 召回——打关键字即能命中，且专有名词不被切碎。
+结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（`body` 列照旧保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/path/text/body`：
+
+- `text`（正文列）：这条记录自己的文本——记忆是 `judgment`，切片是它那一段，笔记不填（检索面交给切片）。用预切分的空白分词器（`pretokenized`）承担 1+2 分词召回。
+- `path`（路径列）：笔记的路径，同一套分词器。文档名不一定出现在正文里（搜「史记」，那篇正文里可能一次都没有这两个字），所以路径要有自己的路。只有笔记那条记录带它，切片不复制——复制就是同一串字在一篇里按片数被重复计分。
+- `tags`（标签列）：整串一个词项（`STRING`）。既参与搜索（打一个标签词就给这条记录加分），也用于按标签筛记录；标签文本仍只存库里一份，索引不存值。
+- `body`：正文原值（stored），供重排取候选正文与命中回读；库里不留正文副本，取正文只走这一列。
+- `key`：记录 ID，用于删除与取回，不参与打分。
+
+三列各算一次分、同一条记录内相加；RRF 只用在全文路与向量路之间，与记录内相加是两回事。
 
 ## 向量检索
 
@@ -143,8 +151,8 @@ flowchart LR
 
 ## 索引一致性
 
-- SQLite 与 Tantivy 之间用可重放的 `index_updates` 日志衔接，每条日志记录 `(revision, record_id)`：
-  `revision` 既是主键也是重放游标，`record_id` 指向待同步的那条记录。
-- 索引提交带 payload `p-memory-text-v3:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符即整体重建。
+- `index_updates` 是待提交信号：写入事务里登记 `(revision, record_id)`，同一个调用把文档写进索引 writer。`update_index` 一趟提交、把 `indexed_revision` 记到本次实际覆盖的最大 revision，并删掉已覆盖的队列行。
 - 索引目录损坏时**隔离并重建**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再新建空索引，权威数据库不受影响。
-- 检索前若有待处理更新会先重放，保证结果与已提交数据一致。
+- 检索前若还有待处理更新，会先提交一次，保证结果与已提交数据一致。
+- 索引提交带 payload `p-memory-text-v4:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
+- 重建是唯一回读源文件的路径：切片正文没有第二份副本，按同一套切分规则重新读文件切一遍，文件缺失的那批切片正文退化为空。

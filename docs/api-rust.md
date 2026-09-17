@@ -154,9 +154,9 @@ impl NoteStore {
 ```
 
 - `upsert_file` 按给定文件路径同步一篇笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；**路径即身份**，写入 `(namespace, scope, source)` 的 `source` 就是路径字符串，同一路径定位到同一笔记。监听与对账在使用方，库只处理给到的这一个文件。
-- **正文不落库**：笔记 payload 只留切片粒度，正文权威是文件；`Note` 无 `content` 字段。
+- **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。
 - 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
-- 切片只在 payload 里存 `note_id` 与行/字符区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 由文件原文按 `char_start`/`char_end` 取出。文件缺失时读正文直接报错（含索引全量重建），由上游删除记录来消除不一致。
+- 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引还没提交就先提交一次）。写入时文件缺失直接报错；索引重建时文件缺失只让那批切片正文为空。
 - `delete` 先删切片再删笔记。
 - `chunk_text(content, target)` 是公开辅助函数，可脱离数据库单独调用。
 

@@ -1,6 +1,6 @@
 # 数据模型
 
-所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。记忆的正文（`judgment`）权威在 payload；笔记的正文权威在宿主文件，库内只留路径。可检索正文不落 SQLite：写入时按 payload（或文件）现算，交给全文索引的 stored 字段承载。
+所有领域记录共享同一个公共记录头，领域正文以 JSON payload 存放在同一个 `records` 表里，图谱完整性由关系投影表额外约束。记忆的正文（`judgment`）权威在 payload，可由 payload 现算；笔记切片的正文唯一副本在全文索引的 stored 列（写入时从源文件读一次、切一次就带过去），库内只留路径与行区间。可检索文本不落 SQLite。
 
 ## 记录类型
 
@@ -121,7 +121,7 @@ struct Page<T> { items: Vec<T>, next_cursor: Option<String> }
 struct WriteReceipt<T> { value: T, revision: i64 }
 ```
 
-写入只提交数据；全文索引由使用方调用 `update_index` 追平，索引落后**不是**写入失败。
+写入提交数据，并在同一个调用里把文档就地写进索引 writer（不 commit）；提交由使用方调用 `update_index` 一次完成，索引落后**不是**写入失败。
 
 ## 统一类型词表
 
@@ -223,16 +223,16 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 struct NoteFileInput { record, path, chunk_chars }   // 库自己读 path
 struct Note   { header, source, title, chunk_chars }
 struct Chunk  { header, note_id, ordinal, offset, limit, content }
-struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
+struct TextChunk { ordinal, offset, limit, content }
 ```
 
 - `path` 必填：写入时路径逐字符原样存进 `notes.path` 这一列；`UNIQUE(namespace_id, scope_id, path)` 只用于「同一文件重复同步定位到同一条」，路径不是笔记的身份，更不是标签。
-- `upsert_file` 按 `path` 读文件：正文取文件原文，标题取文件名（去扩展名）。
-- **库内不留正文**：笔记 payload 只存切片粒度 `chunk_chars`，正文权威是宿主文件；`Note` 已无 `content` 字段，正文经 `chunks()` 返回的切片 `content` 由文件原文按字符区间取出。
+- `upsert_file` 按 `path` 读一次文件、切一次片：正文取文件原文，标题取文件名（去扩展名）。
+- **正文读一次、切一次，一路带到索引**：笔记 payload 只存切片粒度 `chunk_chars`，`Note` 没有 `content` 字段；切片正文在写入时就地写好、随文档进全文索引，`chunks()` 返回的 `content` 按记录 ID 从索引取回（索引还没提交就先提交一次），不回源文件、也不再按字符区间二次取正文。
 - **路径只在 `notes` 表存一次**：它既用来读文件、也用来定位同一条，`payload` 不重复存 `source`；标题由路径派生，也不落库。
-- **切片正文不落库**：切片只在 payload 里存 `note_id`、行区间（`offset`/`limit`）与字符区间（`char_start`/`char_end`），`content` 读取时由文件原文按字符区间取出。
-- 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；正文照旧保留原文。
-- 文件缺失时读正文直接报错（显式读取与索引全量重建都一样），不静默兜底——按分工这是一致性被破坏，由上游主动删除记录来消除。
+- **切片 payload 只存 `note_id` 与行区间**（`offset`/`limit`），不含正文、不含字符区间。
+- 送进全文索引的文本先经统一 `clean_markdown` 清洗（去 HTML 标签、标题符、强调标记、链接与图片、代码块与行内代码、列表与引用符号等）；索引里存的正文原值照旧是切片原文。
+- 写入时文件缺失或非 UTF-8 直接报错，不落库；索引全量重建时单个文件读不到只让那批切片正文退化为空，不让整次恢复失败。
 - 切片规则见 [笔记切片](#笔记切片)。
 - 正文替换时在同一事务内原子重建切片投影：`chunks` 存内容指纹 `fingerprint`，`ordinal` 与内容都未变的切片保留其整数 `record_id`，向量继续有效；失效的旧切片连同向量一并删除。
 
@@ -241,8 +241,8 @@ struct TextChunk { ordinal, offset, limit, char_start, char_end, content }
 - 按段落切分，目标 `chunk_chars`（范围 16..=100000，默认 220）。
 - **围栏代码块与表格整体保留**，即使超过目标大小也不拆分。
 - `offset` 从 **1** 开始（起始行），`limit` 为行数；两者的计数单位都是**行**。
-- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；`char_start`/`char_end` 是切片在文件原文里的字符区间（含起、不含止），行号因此无法唯一定位的超长段落靠它精确取回切片正文。
-- 标题由路径文件名派生；`source` 路径作为精确整词关键字进 `keywords` 字段（含各级父目录名），不进正文参与切分。
+- 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；切片正文自己带在索引里，行号只用于定位，不需要额外记字符区间。
+- 标题由路径文件名派生；整条路径进索引的**路径列**（同一套 1+2 分词），所以只出现在文件名或目录名里的词也搜得到。路径列只挂在笔记那条记录上，切片不复制——复制会让同一串字在一篇里按片数被重复计分。
 
 ## 领域四：向量与重排（EmbeddingSpace / Embedder / Reranker）
 
@@ -287,12 +287,13 @@ struct RerankerOptions  { max_docs: usize, max_tokens_per_doc: usize, max_tokens
 ### 默认值与命名空间开关
 
 - 记忆正文与 tags 默认启用向量化；笔记与切片默认关闭；图谱记录沿用现状。
+- 切片正文只存在索引里，所以要给切片补向量得先 `update_index`（正文进索引），再由使用方显式调用 `embeddings().sync` 补齐；写入路径本身不为切片生成向量。
 - 开关粒度到 `namespace`，落盘在 `meta` 表（键 `vectorize:<namespace>`），配置一次即生效。
 - 某 namespace 关闭向量化后，该域记录不生成向量，但全文路仍能命中。
 
 ### 多档降级
 
-- 写入侧：模型可用则正常生成；模型不可用或该 namespace 关了向量化时，**记录照常写入**、向量留待补齐，不抛错。
+- 写入侧：模型可用则正常生成；模型不可用或该 namespace 关了向量化时，**记录照常写入**、向量留待补齐，不抛错。切片是例外：它的正文只存在索引里，写入时不生成向量，等 `update_index` 与 `embeddings().sync` 之后才补。
 - 检索侧：全档是文本 + 向量融合；往下依次是「关向量化的 namespace → 纯全文」「回调挂了 → 纯全文」。任一档都返回结果、不抛错、不返回空，当前落在哪一档见 `SearchDiagnostics.degraded` 与 `HealthReport.last_degraded`。
 - 检索的降级只到纯全文为止，不设比 BM25 更弱的检索档；索引查询失败先当场从权威数据重建并重试，重建后仍失败才隔离文本路（向量路照常，记 `text_index_unavailable`），索引目录损坏则在打开时隔离重建。
 
