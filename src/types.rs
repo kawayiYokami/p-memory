@@ -172,6 +172,8 @@ pub enum Degrade {
     NoEmbedder,
     /// 嵌入回调调用失败：只走全文。
     EmbedFailed,
+    /// 该领域的向量还没补齐：只走全文，补齐后自动放行。
+    VectorNotReady,
     /// 重排回调调用失败或返回不符：按融合分排序。
     RerankFailed,
     /// 全文派生索引不可用：退到 SQLite 直查。

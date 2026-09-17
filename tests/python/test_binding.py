@@ -237,7 +237,7 @@ def test_note_body_lives_in_the_index_and_path_tags_ride_on_every_chunk(kb, tmp_
 # ── 向量与重排 ────────────────────────────────────────────────────────
 
 def test_embedder_registers_validates_and_search_embeds_query(kb):
-    """注册即校验；写入即向量化；检索只给搜索词，库用该空间回调嵌入查询词。"""
+    """注册即校验；写入只入库不入向量，批次结束 sync 之后向量路才放行；检索只给搜索词。"""
     kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 4})
     assert kb.embeddings.spaces() == [
         {"id": "e5", "model": "e5-base", "dimension": 4, "text_version": 1, "encoding": "sq8"}
@@ -253,6 +253,14 @@ def test_embedder_registers_validates_and_search_embeds_query(kb):
     assert calls and max(calls) <= 4, "注册即用样本真跑一遍校验"
 
     target = kb.memories.upsert_by_judgment(judgment="需要向量化的记忆")["value"]["id"]
+    assert len(calls) == 1, "写入不碰模型：注册校验那次之后回调没再被调到"
+    assert kb.embeddings.vector_ready("default", "e5") is False, "还没补过，谈不上就绪"
+
+    gated = kb.search("向量化", embed_space="e5", text=False, rerank=False)
+    assert gated["hits"] == [] and "vector_not_ready" in gated["diagnostics"]["degraded"]
+
+    assert kb.embeddings.sync("e5")["value"]["written"] == 1, "批次结束补一次"
+    assert kb.embeddings.vector_ready("default", "e5") is True
 
     hits = kb.search("向量化", embed_space="e5", text=False, rerank=False)["hits"]
     assert hits[0]["key"]["id"] == target

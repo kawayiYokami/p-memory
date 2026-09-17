@@ -44,6 +44,8 @@ pub(crate) struct Engine {
     /// 宿主注册的模型能力。它们是运行时状态（闭包 / Python 函数无法序列化），不落盘。
     pub embedders: crate::embeddings::EmbedderRegistry,
     pub rerankers: crate::search::RerankerRegistry,
+    /// 库内的向量化线程。它在 `open` 里启动，线程自己持弱引用，因此只能在这里设一次。
+    pub vectorizer: std::sync::OnceLock<Arc<crate::embeddings::Vectorizer>>,
     /// 最近观察到的降级档位，供健康检查读出「结果为什么变差」。
     pub degraded: Mutex<Vec<Degrade>>,
     pub root: PathBuf,
@@ -87,14 +89,18 @@ impl KnowledgeBase {
         index.recover(&write_conn)?;
         // 只读连接在 schema 建好之后再开，保证它看到的是完整结构。
         let reader = open_reader(&root)?;
-        Ok(Self { engine: Arc::new(Engine {
+        let engine = Arc::new(Engine {
             writer: Mutex::new(Some(Writer { conn: write_conn, _file_lock: file_lock })),
             readers: Mutex::new(Some(Readers { idle: vec![reader] })),
             index: RwLock::new(Some(index)), vectors: VectorCache::new(),
             embedders: crate::embeddings::EmbedderRegistry::new(),
             rerankers: crate::search::RerankerRegistry::new(),
+            vectorizer: std::sync::OnceLock::new(),
             degraded: Mutex::new(Vec::new()), root,
-        }) })
+        });
+        // 向量化线程在开库时启动，由 `close` 停下并等它收尾。
+        engine.vectorizer.set(crate::embeddings::Vectorizer::start(&engine)?).unwrap_or_else(|_| unreachable!("vectorizer starts once"));
+        Ok(Self { engine })
     }
 
     pub fn directory(&self) -> &Path { &self.engine.root }
@@ -111,6 +117,8 @@ impl KnowledgeBase {
     }
 
     pub fn close(&self) -> Result<()> {
+        // 先叫停向量化线程并等它收尾：它可能正在补一批向量，不能在库拆到一半时还在写。
+        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.stop(); }
         let mut guard = self.engine.writer.lock();
         let result = match guard.as_ref() {
             Some(writer) => self.index()?.sync(&writer.conn),
@@ -185,7 +193,23 @@ impl KnowledgeBase {
         // 向量缓存必须失效；索引不在写入路径上追平——写入只把待办记进
         // index_updates，由使用方稍后调用 `update_index` 一趟索引完、只提交一次。
         self.engine.vectors.invalidate();
+        // 记录一变，「应向量化集合」就变了：受影响领域的就绪标记就地作废，
+        // 等补齐核对过再重新标。这样检索侧读到的永远是「核对过的那一份」。
+        self.invalidate_readiness(&writer.conn);
+        // 也给库内线程说一声：有新活可干，等这批写完它就会去补。
+        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.note_work(); }
         Ok(WriteReceipt { value, revision })
+    }
+
+    /// 作废待办记录所属领域的就绪标记。待办队列记着这次动了哪些记录，
+    /// 按记录所属领域取名字；已经删掉的记录查不到领域，不影响（删记录不会造出缺口）。
+    fn invalidate_readiness(&self, conn: &Connection) {
+        let Ok(mut stmt) = conn.prepare("SELECT DISTINCT s.text FROM index_updates u
+            JOIN records r ON r.id=u.record_id JOIN strings s ON s.id=r.namespace_id") else { return };
+        let Ok(namespaces) = stmt.query_map([], |r| r.get::<_, String>(0)) else { return };
+        for namespace in namespaces.flatten() {
+            let _ = crate::embeddings::clear_vector_ready(conn, &namespace);
+        }
     }
 
     pub fn memories(&self) -> crate::memory::MemoryStore { crate::memory::MemoryStore(self.clone()) }
@@ -211,29 +235,20 @@ impl KnowledgeBase {
         }
     }
 
-    /// 写入后的内部向量化：库自己取文本 → 调宿主回调 → 短事务写回，宿主全程不碰向量。
-    ///
-    /// 这条路径**绝不阻塞写入**：拿不到该空间的回调（另一个线程正在同步）就跳过，
-    /// 记录留在待补状态，交给后续写入或 `sync` 补。失败只记降级档位，不向上抛错。
-    /// 正文取自索引的记录（切片）不在这条路径上——它们的正文要先随索引提交才取得到，
-    /// 由使用方在 `update_index` 之后显式调 `embeddings().sync` 补齐。
-    pub(crate) fn vectorize(&self, ids: &[i64]) {
-        if ids.is_empty() || !self.engine.embedders.any() { return; }
-        for degrade in crate::embeddings::vectorize_records(self, ids) {
-            self.note_degrade(degrade);
-        }
-    }
-
     /// 追平待索引队列：把写入累积的待办一趟索引完、只提交一次。
     /// 写入不再就地索引，使用方（尤其批量导入）在合适时机调用本方法即可；
     /// 期间读取走 `sync_index_if_behind` 自愈兜底。
     pub fn update_index(&self) -> Result<HealthReport> {
-        {
-            let mut guard = self.engine.writer.lock();
-            let writer = guard.as_mut().ok_or(Error::Closed)?;
-            self.index()?.sync(&writer.conn)?;
-        }
+        self.catch_up_index()?;
         self.health()
+    }
+
+    /// 只追平索引、不做健康检查。向量化前必须走一次：
+    /// 切片正文只存在索引里，索引没追平就取不到正文，只能拿到空串。
+    pub(crate) fn catch_up_index(&self) -> Result<()> {
+        let mut guard = self.engine.writer.lock();
+        let writer = guard.as_mut().ok_or(Error::Closed)?;
+        self.index()?.sync(&writer.conn)
     }
 
     pub fn rebuild_indexes(&self) -> Result<HealthReport> {
@@ -322,6 +337,15 @@ pub(crate) fn term_id(conn: &Connection, text_value: &str) -> Result<i64> {
 
 pub(crate) fn term_text(conn: &Connection, id: i64) -> Result<String> {
     Ok(conn.query_row("SELECT text FROM strings WHERE id=?1", [id], |r| r.get(0))?)
+}
+
+/// 库里实际出现过的知识领域（记录用到的 namespace），按字典序。
+/// 就绪核对按它逐个领域做：没有记录的领域没有缺口可言。
+pub(crate) fn record_namespaces(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT s.text FROM records r JOIN strings s ON s.id=r.namespace_id ORDER BY s.text")?;
+    let mut namespaces = Vec::new();
+    for row in stmt.query_map([], |r| r.get::<_, String>(0))? { namespaces.push(row?); }
+    Ok(namespaces)
 }
 
 pub(crate) fn validate_identity(label: &str, value: &str) -> Result<()> {

@@ -118,10 +118,9 @@ impl MemoryStore {
     pub fn upsert(&self, input: MemoryInput) -> Result<WriteReceipt<Memory>> {
         let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
         let WriteReceipt { value: (memory, document), revision } = receipt;
-        // 索引文档由写入流程就地交过来，这里只写进 writer，提交交给 update_index。
+        // 写入只做两件事：入库（上面的 mutate）与把索引文档交给 writer。
+        // 索引提交交给 `update_index`，向量化交给 `embeddings().sync` 或库内线程。
         self.0.index_documents(&[document])?;
-        // 写入即向量化：库内部补齐，宿主只给正文。
-        self.0.vectorize(&[memory.header.id]);
         Ok(WriteReceipt { value: memory, revision })
     }
     pub fn upsert_many(&self, inputs: &[MemoryInput]) -> Result<WriteReceipt<Vec<Memory>>> {
@@ -129,8 +128,6 @@ impl MemoryStore {
         let WriteReceipt { value, revision } = receipt;
         let (memories, documents): (Vec<Memory>, Vec<crate::index::IndexDocument>) = value.into_iter().unzip();
         self.0.index_documents(&documents)?;
-        let ids: Vec<i64> = memories.iter().map(|memory| memory.header.id).collect();
-        self.0.vectorize(&ids);
         Ok(WriteReceipt { value: memories, revision })
     }
     pub fn upsert_by_judgment(&self, mut input: MemoryInput) -> Result<WriteReceipt<Memory>> {
@@ -154,7 +151,6 @@ impl MemoryStore {
         })?;
         let WriteReceipt { value: (memory, document), revision } = receipt;
         self.0.index_documents(&[document])?;
-        self.0.vectorize(&[memory.header.id]);
         Ok(WriteReceipt { value: memory, revision })
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory> {

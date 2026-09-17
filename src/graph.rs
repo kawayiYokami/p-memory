@@ -133,7 +133,7 @@ pub(crate) fn upsert_event(conn: &Connection, input: &EventInput) -> Result<(Eve
     Ok((Event { header, name: input.name.clone(), summary: input.summary.clone(), participants, confidence: input.confidence, reason: input.reason.clone() }, document))
 }
 
-pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(GraphBatchResult, Vec<i64>, Vec<crate::index::IndexDocument>)> {
+pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(GraphBatchResult, Vec<crate::index::IndexDocument>)> {
     let mut documents = Vec::new();
     // Entities first permits references to entities created in this transaction.
     let mut entities = Vec::new();
@@ -143,20 +143,13 @@ pub(crate) fn apply_batch(conn: &Connection, batch: &GraphBatch) -> Result<(Grap
     let mut events = Vec::new();
     for input in &batch.events { let (event, document) = upsert_event(conn, input)?; events.push(event); documents.push(document); }
     // 改名会改写引用它的关系与事件正文，这些记录的索引与向量都要一并刷新。
-    let (refreshed, rewritten_documents) = refresh_dependents(conn, &entities)?;
-    documents.extend(rewritten_documents);
-    let mut ids: Vec<i64> = entities.iter().map(|e| e.header.id)
-        .chain(relations.iter().map(|r| r.header.id)).chain(events.iter().map(|e| e.header.id)).collect();
-    ids.extend(refreshed);
-    ids.sort_unstable();
-    ids.dedup();
-    Ok((GraphBatchResult { entities, relations, events }, ids, documents))
+    documents.extend(refresh_dependents(conn, &entities)?);
+    Ok((GraphBatchResult { entities, relations, events }, documents))
 }
 
-/// 返回因引用正文变化而被重写的记录 id 与它们的新索引文档。
-fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<(Vec<i64>, Vec<crate::index::IndexDocument>)> {
+/// 返回因引用正文变化而被重写的记录的索引文档。
+fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<crate::index::IndexDocument>> {
     let mut keys = BTreeSet::new();
-    let mut rewritten = Vec::new();
     let mut documents = Vec::new();
     for entity in entities {
         let mut stmt = conn.prepare("SELECT record_id FROM relations WHERE subject_id=?1 OR object_id=?1
@@ -196,24 +189,20 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<(Vec<i64
                 params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
             conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
             documents.push(storage::index_document(conn, key.id, kind, body.clone())?);
-            rewritten.push(key.id);
         }
     }
-    Ok((rewritten, documents))
+    Ok(documents)
 }
 
 impl GraphStore {
     pub fn apply_batch(&self, batch: &GraphBatch) -> Result<WriteReceipt<GraphBatchResult>> {
-        let mut ids: Vec<i64> = Vec::new();
         let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
         let receipt = self.0.mutate(|tx| {
-            let (result, written, staged) = apply_batch(tx, batch)?;
-            ids = written;
+            let (result, staged) = apply_batch(tx, batch)?;
             documents = staged;
             Ok(result)
         })?;
         self.0.index_documents(&documents)?;
-        self.0.vectorize(&ids);
         Ok(receipt)
     }
     pub fn get(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<serde_json::Value> {

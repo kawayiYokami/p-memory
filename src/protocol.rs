@@ -53,6 +53,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "embeddings.spaces"=>encode(kb.embeddings().spaces()?),
         "embeddings.embedder_space"=>encode(kb.embeddings().embedder_space(&field::<String>(&args,"space_id")?)?),
         "embeddings.sync"=>encode(kb.embeddings().sync(&field::<String>(&args,"space_id")?,field(&args,"batch")?)?),
+        "embeddings.vector_ready"=>encode(kb.embeddings().vector_ready(&field::<String>(&args,"namespace")?,&field::<String>(&args,"space_id")?)?),
         "embeddings.unregister_embedder"=>encode(kb.embeddings().unregister_embedder(&field::<String>(&args,"space_id")?)?),
         "embeddings.namespace_vectorization"=>encode(kb.embeddings().namespace_vectorization(&field::<String>(&args,"namespace")?)?),
         "embeddings.set_namespace_vectorization"=>encode(kb.embeddings().set_namespace_vectorization(&field::<String>(&args,"namespace")?,field(&args,"enabled")?)?),

@@ -208,14 +208,22 @@ impl KnowledgeBase {
                 vector_kinds = request.kinds.iter().copied().filter(|kind| enabled.contains(kind)).collect();
                 // 空间没登记过是配置错误，直接报；登记过但没绑回调才是可降级的情形。
                 if !vector_kinds.is_empty() {
+                    // 空间没登记过是配置错误，直接报；登记过但没绑回调才是可降级的情形。
                     let space = { let state = self.read()?; embeddings::get_space(state.conn(), space_id)? };
-                    match self.engine.embedders.get(space_id) {
-                        None => diagnostics.degraded.push(Degrade::NoEmbedder),
-                        Some(entry) => {
-                            let produced = { let mut guard = entry.lock(); guard.embed(&[query.to_string()]) };
-                            match produced {
-                                Ok(mut values) if values.len() == 1 => embedded_query = Some((space, values.remove(0))),
-                                _ => diagnostics.degraded.push(Degrade::EmbedFailed),
+                    // 该领域还没补齐就整条向量路不走：半个领域的向量参与打分，
+                    // 比只用全文更糟——排名会偏向「先补完的那部分」。
+                    let ready = { let state = self.read()?; embeddings::vector_ready(state.conn(), &request.filter.namespace, space_id)? };
+                    if !ready {
+                        diagnostics.degraded.push(Degrade::VectorNotReady);
+                    } else {
+                        match self.engine.embedders.get(space_id) {
+                            None => diagnostics.degraded.push(Degrade::NoEmbedder),
+                            Some(entry) => {
+                                let produced = { let mut guard = entry.lock(); guard.embed(&[query.to_string()]) };
+                                match produced {
+                                    Ok(mut values) if values.len() == 1 => embedded_query = Some((space, values.remove(0))),
+                                    _ => diagnostics.degraded.push(Degrade::EmbedFailed),
+                                }
                             }
                         }
                     }

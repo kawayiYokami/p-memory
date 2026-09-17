@@ -114,8 +114,10 @@ kb.embeddings().register_embedder_with("e5", my_embed_fn, EmbedderOptions {
     max_batch: 50, max_tokens_per_text: Some(512),
 })?;
 
-// 库拿该回调把缺失向量分批补齐；写入路径也会「写入即向量化」。
+// 批次结束后调一次：先追平索引，再把缺口补完，最后核对并把该领域标成就绪。
 kb.embeddings().sync("e5", 50)?;
+
+// 写入路径不产生向量：upsert 只入库、写索引，一行向量都不算。
 
 // 领域总闸之外，还有记忆 / 图谱 / 笔记三个独立开关；没设过的档位取内置默认。
 kb.embeddings().set_vectorization("akasha/gi", "notes", false)?;

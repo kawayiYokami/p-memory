@@ -281,8 +281,13 @@ class EmbeddingStore:
         return self._kb.invoke("embeddings.set_vectorization", {"namespace": namespace, "target": target, "enabled": enabled})
 
     def sync(self, space_id: str, *, batch: int = 32) -> WriteReceipt:
-        """库拿该空间注册的回调，把缺失向量的记录分批补齐；宿主不参与向量计算。"""
+        """批次处理完之后触发一次补齐：先把索引追平，再把缺失向量的记录分批补齐，
+        最后核对缺口、把补齐的领域标成就绪。宿主不参与向量计算。"""
         return self._kb.invoke("embeddings.sync", {"space_id": space_id, "batch": batch})
+
+    def vector_ready(self, namespace: str, space_id: str) -> bool:
+        """该领域（namespace × 向量空间）是否已补齐。未就绪时该领域检索只走全文。"""
+        return self._kb.invoke("embeddings.vector_ready", {"namespace": namespace, "space_id": space_id})
 
     def delete_space(self, id: str) -> WriteReceipt:
         return self._kb.invoke("embeddings.delete_space", {"id": id})

@@ -47,15 +47,16 @@ kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
 ```python
 kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 768})
 kb.embeddings.register_embedder("e5", my_embed_fn, max_batch=50)   # 注册即用样本校验
-kb.embeddings.sync("e5", batch=50)                                # 库调回调补齐缺失向量
-kb.memories.upsert_by_judgment(judgment="……")                      # 写入即向量化
+kb.embeddings.sync("e5", batch=50)                                # 追平索引 → 补齐缺口 → 核对并标记就绪
+kb.embeddings.vector_ready("akasha/gi", "e5")                     # 该领域是否已补齐；未就绪检索只走全文
+kb.memories.upsert_by_judgment(judgment="……")                      # 写入不碰向量，向量留给批次结束的 sync
 kb.search("偏好", embed_space="e5")                                # 库嵌入查询词，宿主只给词
 kb.register_reranker(my_rerank_fn, max_docs=64)                    # 进程内单例重排回调
 ```
 
 - `register_embedder(space_id, callback, *, max_batch=32, max_tokens_per_text=None)`：`callback(texts: list[str]) -> list[list[float]]`。一个向量模型对应一个向量空间，注册即校验，产出不符即拒绝绑定并报 `InvalidVectorError`。
 - `register_reranker(callback, *, max_docs=64, max_tokens_per_doc=1024, max_tokens_query=None)`：`callback(query: str, documents: list[str]) -> list[float]`。
-- `EmbeddingStore` 另有 `unregister_embedder` / `embedder_space` / `spaces` / `namespace_vectorization` / `set_namespace_vectorization` / `vectorization` / `set_vectorization` / `delete_space`。
+- `EmbeddingStore` 另有 `vector_ready` / `unregister_embedder` / `embedder_space` / `spaces` / `namespace_vectorization` / `set_namespace_vectorization` / `vectorization` / `set_vectorization` / `delete_space`。
 - `vectorization(namespace, target)` / `set_vectorization(namespace, target, enabled)`：`target` 取 `"memory"` / `"graph"` / `"notes"`，是该领域下三个独立开关；`namespace_vectorization` / `set_namespace_vectorization` 则是整个领域的总闸。没设置过的档位返回内置默认（记忆与图谱为 `True`，笔记为 `False`），档位名不在这三个之一时报 `ValidationError`。
 - 回调是运行时状态，不进数据库：宿主启动时注册一次即可。
 - 检索时宿主只给 `embed_space`，库用它注册的回调嵌入查询词；`search` 的 `text` / `vector` / `rerank` / `with_total` 各自独立开关，未给 `embed_space` 时向量路自动让位（不是错误）。
