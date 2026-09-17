@@ -172,6 +172,8 @@ impl EmbeddingStore {
     fn embedder_space(&self, space_id: &str) -> Result<Option<EmbeddingSpace>>;
     fn namespace_vectorization(&self, namespace: &str) -> Result<bool>;
     fn set_namespace_vectorization(&self, namespace: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
+    fn vectorization(&self, namespace: &str, target: &str) -> Result<bool>;
+    fn set_vectorization(&self, namespace: &str, target: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
     fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>>;
     fn delete_space(&self, id: &str) -> Result<WriteReceipt<bool>>;
 }
@@ -181,7 +183,8 @@ impl EmbeddingStore {
 - `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
 - `sync(space_id, batch)` 是**内部同步**：库拿该空间注册的回调，把缺失向量的记录分批补齐，宿主不参与向量计算。循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留。
 - 写入路径也是「写入即向量化」：`upsert` 一条记忆或笔记时，库在写入路径里补齐向量，拿不到回调就跳过留待下次补齐，不阻塞写入、不抛错。
-- `namespace_vectorization` / `set_namespace_vectorization` 控制某知识域是否启用向量化，落盘在 `meta` 表。
+- `namespace_vectorization` / `set_namespace_vectorization` 是某知识域的**总闸**；`vectorization(ns, target)` / `set_vectorization(ns, target, enabled)` 是域内的**档位开关**，`target` 取 `memory` / `graph` / `notes`，三者互不牵连。读数时没设置过的档位落到内置默认（记忆开、图谱开、笔记关），非法档位名报 `validation`。四者都落盘在 `meta` 表。
+- 开关只决定是否生成向量：已有向量保留，检索时按启用档位过滤；总闸关闭时该域既不生成向量、也不走向量路。
 
 ## 类型与常量
 

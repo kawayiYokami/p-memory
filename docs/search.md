@@ -135,7 +135,7 @@ flowchart LR
 
 | 档位 | 触发 | Degrade |
 |---|---|---|
-| 纯全文 | 该 namespace 关了向量化 | `namespace_disabled` |
+| 纯全文 | 该 namespace 的总闸关了向量化 | `namespace_disabled` |
 | 纯全文 | 目标空间没注册嵌入回调 | `no_embedder` |
 | 纯全文 | 嵌入回调调用失败 | `embed_failed` |
 | 按融合分排序 | 重排回调失败或产出不符 | `rerank_failed` |
@@ -147,7 +147,7 @@ flowchart LR
 
 - 命名空间、作用域、记录类型、标签（AND、归一化、大小写不敏感）在构造查询或打分前统一应用。
 - 图谱展开（`neighbors`/`events_for_entity`）遵守同样的作用域约束：标签只约束返回的关系，作用域同时约束端点实体。
-- 向量路径按 `row.key.namespace`、`row.scope`、`kinds`、`row.tags` 在打分前过滤。
+- 向量路径按 `row.key.namespace`、`row.scope`、`kinds`、`row.tags` 在打分前过滤。这里的 `kinds` 是「请求要的记录类型」与「该领域启用了向量化的类型」的交集：某档关掉后，它的存量向量不参与打分；交集为空时整条向量路不走（总闸关闭时同理，并记 `namespace_disabled`）。
 
 ## 索引一致性
 

@@ -111,6 +111,9 @@ kb.embeddings().register_embedder_with("e5", my_embed_fn, EmbedderOptions {
 // 库拿该回调把缺失向量分批补齐；写入路径也会「写入即向量化」。
 kb.embeddings().sync("e5", 50)?;
 
+// 领域总闸之外，还有记忆 / 图谱 / 笔记三个独立开关；没设过的档位取内置默认。
+kb.embeddings().set_vectorization("akasha/gi", "notes", false)?;
+
 // 检索：宿主只给搜索词与目标空间，库自己嵌入查询词。
 ```
 
