@@ -154,13 +154,12 @@ impl Default for PageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> { pub items: Vec<T>, pub next_cursor: Option<String> }
 
-/// A committed write remains committed if the derived index cannot be updated.
+/// 一次已提交的写入。派生索引不在写入路径上追平——由使用方在合适时机调用
+/// `update_index` 一趟索引完；期间读取走自愈兜底，保证仍查得到。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteReceipt<T> {
     pub value: T,
     pub revision: i64,
-    pub index_ready: bool,
-    pub index_error: Option<String>,
 }
 
 /// 一次检索实际落在了哪一档。多档降级要求「结果为什么变差」可被宿主读到。

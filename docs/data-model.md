@@ -118,10 +118,10 @@ struct Page<T> { items: Vec<T>, next_cursor: Option<String> }
 ## 写入回执
 
 ```rust
-struct WriteReceipt<T> { value: T, revision: i64, index_ready: bool, index_error: Option<String> }
+struct WriteReceipt<T> { value: T, revision: i64 }
 ```
 
-`index_ready == false` 表示数据已提交但全文索引未同步，`index_error` 给出原因；这**不是**写入失败。
+写入只提交数据；全文索引由使用方调用 `update_index` 追平，索引落后**不是**写入失败。
 
 ## 统一类型词表
 

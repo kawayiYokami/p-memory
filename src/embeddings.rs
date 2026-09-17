@@ -299,13 +299,14 @@ pub(crate) fn pending_batch(conn: &Connection, space_id: &str, limit: usize, aft
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
+    let notes = storage::NoteTexts::default();
     for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
         let (id, kind_code, payload_json, fingerprint) = row?;
         // 向量输入文本不落盘：按 kind 从 payload 现算（记忆额外拼标签，切片由其笔记正文取出）。
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
         let tags = record_tags(conn, id)?;
-        let body = storage::embedding_text(conn, id, kind, &payload, &tags)?;
+        let body = storage::embedding_text(conn, id, kind, &payload, &tags, &notes)?;
         items.push(EmbeddingInput { key: RecordKey { id }, text: body, fingerprint });
     }
     Ok(items)
@@ -429,9 +430,7 @@ impl EmbeddingStore {
             .ok_or_else(|| Error::Validation(format!("no embedder registered for space {space_id}")))?;
         let report = self.drain(space_id, &entry, batch, None, true)?;
         let state = self.0.read()?;
-        let conn = state.conn();
-        let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-        Ok(WriteReceipt { value: report, revision: storage::current_revision(conn)?, index_ready: pending == 0, index_error: None })
+        Ok(WriteReceipt { value: report, revision: storage::current_revision(state.conn())? })
     }
 
     /// 分段补齐的实际循环。`ids` 为 `Some` 时只处理这批记录（写入路径用）。

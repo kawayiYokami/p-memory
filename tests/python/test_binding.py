@@ -41,8 +41,6 @@ def test_memory_roundtrip_is_a_flat_dict(kb):
         assert field in memory, f"记录头字段 {field} 未平铺"
 
     assert kb.memories.get(memory["id"]) == memory
-    assert receipt["index_ready"] is True
-    assert receipt["index_error"] is None
 
     hits = kb.search("简短回答")["hits"]
     assert [h["record"]["judgment"] for h in hits] == ["用户偏好简短回答"]
@@ -319,6 +317,9 @@ def test_feedback_boosts_useful_recall(kb):
 def test_health_exposes_core_counters(kb):
     """健康报告含库归属、修订号、索引进度与完整性检查。"""
     kb.memories.upsert_by_judgment(judgment="一条记忆")
+    # 写入只登记待办、不就地索引：显式追平之前进度是落后的。
+    assert kb.health()["pending_index_updates"] >= 1
+    kb.update_index()
     report = kb.health()
 
     assert report["schema_version"] == 7

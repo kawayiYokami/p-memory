@@ -39,7 +39,7 @@ impl KnowledgeBase {
 ### 并发语义
 
 - **一个数据目录在同一时刻只允许一个进程持有写锁**，同进程内可通过 `Clone` 共享句柄。
-- 所有写入走 `mutate`，事务失败即整体回滚；提交与索引同步的先后见 [architecture](architecture.md)。
+- 所有写入走 `mutate`，事务失败即整体回滚；写入不就地索引，由 `update_index()` 一趟追平（见 [architecture](architecture.md)）。
 - 写入提交后会清空向量缓存，保证后续检索看到最新向量。
 - **写是串行的，读是并发的**：所有写入共用一把写锁、按到达顺序排队；读取不经过写锁，
   每次从空闲池取一条只读连接（池空则新建），所以同一句柄上的多个读可以真正并行执行。
@@ -53,6 +53,7 @@ impl KnowledgeBase {
 ### 健康检查
 
 - `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、`pending_index_updates`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
+- `update_index()` 追平写入累积的待办、只提交一次，返回新的健康报告。写入路径不调用它；批量导入后调用一次即可，期间读取走自愈兜底。
 - `rebuild_indexes()` 强制重建全文索引并清空向量缓存，随后返回新的健康报告。
 
 ### 注册模型回调

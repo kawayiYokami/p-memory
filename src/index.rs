@@ -69,7 +69,7 @@ impl TextIndex {
         else { self.sync(conn) }
     }
 
-    fn add_current(&self, writer: &mut IndexWriter, conn: &Connection, id: i64) -> Result<()> {
+    fn add_current(&self, writer: &mut IndexWriter, conn: &Connection, id: i64, notes: &storage::NoteTexts) -> Result<()> {
         let encoded = id.to_string();
         writer.delete_term(Term::from_field_text(self.fields.key, &encoded));
         let row = conn.query_row("SELECT n.text,r.kind,s.text,r.payload_json FROM records r
@@ -79,7 +79,7 @@ impl TextIndex {
             let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Index("invalid stored record kind".into()))?;
             let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|e| Error::Index(e.to_string()))?;
             // 可检索正文不落 SQLite，写入索引时按 kind 从 payload 现算。
-            let body = storage::search_text(conn, id, kind, &payload)?;
+            let body = storage::search_text(conn, id, kind, &payload, notes)?;
             let mut document = doc!(self.fields.key => encoded, self.fields.namespace => namespace,
                 self.fields.scope => scope, self.fields.kind => kind.as_str(),
                 self.fields.body => body,
@@ -142,7 +142,8 @@ impl TextIndex {
             covered = covered.max(revision);
         }
         if ids.is_empty() { return Ok(()); }
-        for id in ids { self.add_current(&mut writer, conn, id)?; }
+        let notes = storage::NoteTexts::default();
+        for id in ids { self.add_current(&mut writer, conn, id, &notes)?; }
         self.finish(&mut writer, conn, covered)
     }
 
@@ -152,7 +153,8 @@ impl TextIndex {
         let mut writer = self.writer.lock();
         writer.delete_all_documents()?;
         let mut stmt = conn.prepare("SELECT id FROM records ORDER BY id")?;
-        for row in stmt.query_map([], |r| r.get::<_, i64>(0))? { self.add_current(&mut writer, conn, row?)?; }
+        let notes = storage::NoteTexts::default();
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0))? { self.add_current(&mut writer, conn, row?, &notes)?; }
         self.finish(&mut writer, conn, storage::current_revision(conn)?)
     }
 

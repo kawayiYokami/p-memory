@@ -417,14 +417,16 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     }
     if req.dry_run{report.conflicts=preview_conflicts;return Ok(report)}
     let kb=KnowledgeBase::open(&req.destination)?;
-    let receipt=kb.mutate(|tx|{
+    kb.mutate(|tx|{
         let count:i64=tx.query_row("SELECT COUNT(*) FROM records",[],|r|r.get(0))?;
         if count!=0{return Err(Error::Conflict("destination became nonempty during import".into()))}
         let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts)?;report.id_map=mappings;report.applied=true;
         tx.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES (?1,?2,?3)",params![req.source_id,fingerprint,serde_json::to_string(&report)?])?;
         Ok(())
     })?;
-    report.index_ready=receipt.index_ready;report.index_error=receipt.index_error;
+    // 导入只写数据，不逐条索引；收尾显式追平一次，报告如实反映结果。
+    match kb.update_index() { Ok(_) => {}, Err(error) => report.index_error = Some(error.to_string()) }
+    report.index_ready = report.index_error.is_none();
     kb.write(|writer| Ok(writer.conn.execute("UPDATE import_runs SET report_json=?2 WHERE source_id=?1",params![req.source_id,serde_json::to_string(&report)?])?))?;
     kb.close()?;Ok(report)
 }

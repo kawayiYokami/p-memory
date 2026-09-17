@@ -119,6 +119,10 @@ class KnowledgeBase:
     def rebuild_indexes(self) -> dict[str, Any]:
         return self.invoke("rebuild_indexes")
 
+    def update_index(self) -> dict[str, Any]:
+        """追平写入累积的待索引待办（批量导入后调用一次即可）。"""
+        return self.invoke("update_index")
+
     def backup(self, path: str | os.PathLike) -> None:
         self.invoke("backup", {"path": os.fspath(path)})
 
@@ -348,6 +352,10 @@ class AsyncKnowledgeBase:
     async def rebuild_indexes(self) -> dict:
         kb = await self._ensure_open()
         return await asyncio.to_thread(kb.rebuild_indexes)
+
+    async def update_index(self) -> dict:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.update_index)
 
     async def close(self) -> None:
         async with self._lock:

@@ -128,7 +128,7 @@ kb.embeddings().sync("e5", 50)?;
 let receipt = kb.memories().upsert(m)?;
 receipt.value;         // 写入结果
 receipt.revision;      // 提交后的库版本
-receipt.index_ready;   // 全文索引是否就绪（false 时数据仍已提交，可稍后重建）
+kb.update_index()?;    // 追平待办（写入不就地索引；批量导入后调用一次即可）
 ```
 
 所有错误是 `p_memory::Error`，`err.code()` 给稳定字符串码，便于跨进程 / 跨语言处理。

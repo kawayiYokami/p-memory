@@ -173,7 +173,7 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<i64>
             let names = e.participants.iter().map(|id| referenced_entity(conn, &e.header.as_input(), *id).map(|v| v.name)).collect::<Result<Vec<_>>>()?;
             (format!("{} {} {} {}", e.name, e.summary, names.join(" "), e.reason), json!({"participant_names":names}))
         };
-        let old = storage::search_text(conn, key.id, kind, &value)?;
+        let old = storage::search_text(conn, key.id, kind, &value, &storage::NoteTexts::default())?;
         if old != body {
             let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [key.id], |r| r.get(0))?;
             let mut payload: serde_json::Value = serde_json::from_str(&raw)?;

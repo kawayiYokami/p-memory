@@ -15,6 +15,7 @@ kb.embeddings      # EmbeddingStore
 kb.search("关键词") # -> SearchResult
 kb.register_reranker(callback, max_docs=64)
 kb.health()        # -> dict
+kb.update_index()  # 追平写入累积的索引待办（批量导入后调用一次）
 kb.rebuild_indexes()
 kb.backup(target)
 kb.close()
@@ -79,7 +80,7 @@ def my_embed_fn(texts):
 | `RecordKind` | `str`（`"memory"`/`"entity"`/…） |
 | 领域结构（`Memory`/`Entity`/…） | `dict`（`models.py` 用 `TypedDict` 标注，运行时就是普通字典） |
 | `Page<T>` | `dict`，含 `items: list[T]`、`next_cursor: str \| None` |
-| `WriteReceipt<T>` | `dict`，含 `value`、`revision`、`index_ready`、`index_error` |
+| `WriteReceipt<T>` | `dict`，含 `value`、`revision` |
 
 - 输入统一接受**同构 dict**（`TypedDict` 只作静态标注，运行时不校验、不做字段转换）。
 - 输出统一为 `dict`，内嵌的 `RecordHeader` 字段平铺在同一层（与 Rust `serde(flatten)` 一致）。

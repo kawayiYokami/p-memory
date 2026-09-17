@@ -121,8 +121,6 @@ class SearchDiagnostics(TypedDict, total=False):
 class WriteReceipt(TypedDict):
     value: Any
     revision: int
-    index_ready: bool
-    index_error: str | None
 
 
 class Page(TypedDict):

@@ -192,8 +192,9 @@ sequenceDiagram
     S->>S: 字符串 → strings id（不存在则插入新行）
     S->>S: 写 records 与投影表，revision += 1，登记 index_updates
     S-->>K: 提交事务
-    K->>I: 同步全文索引（可检索正文按 payload / 文件现算，写入 stored 字段）
-    K-->>H: WriteReceipt{ revision, index_ready }
+    K-->>H: WriteReceipt{ revision }
+    H->>K: update_index()（批量导入后调用一次）
+    K->>I: 一趟追平待办（正文按 payload / 文件现算，同篇笔记只读一次，只提交一次）
 ```
 
-- 数据提交与索引更新分离：事务先提交，再写索引。`index_ready=false` 只表示索引未同步，数据仍然已提交。
+- 数据提交与索引更新分开：写入只登记待办（`index_updates`）并返回回执，不碰索引；索引由使用方在合适时机调用 `update_index()` 一趟追平、只提交一次。读取若发现待办会尽力自愈（抢不到写锁就跳过，绝不排队），所以写入后照样能查到，只是索引可能滞后到那一刻。

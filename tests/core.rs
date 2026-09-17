@@ -76,7 +76,6 @@ fn transactions_scopes_pagination_and_persistence() {
     let mut first = memory("上海 茶 Rust ＡＰＩ", "public");
     first.record.tags = vec![" RUST ".into(), "rust".into()];
     let receipt = kb.memories().upsert(first.clone()).unwrap();
-    assert!(receipt.index_ready);
     let a = receipt.value.header.id;
     let b = kb.memories().upsert(memory("其他内容", "public")).unwrap().value.header.id;
     let c = kb.memories().upsert(memory("上海 茶", "private")).unwrap().value.header.id;
@@ -492,6 +491,8 @@ fn read_rounds(kb: &KnowledgeBase, request: &SearchRequest, threads: usize, roun
 fn concurrent_readers_are_not_blocked_by_a_writer() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("初始内容", "public")).unwrap();
+    // 写入不再就地索引：先把基线追平，之后写者产生的待办由读者自愈或被忽略都不影响这条。
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "初始内容".into(), limit: 5, ..Default::default() };
     // 读路径曾经这样退化成串行：待索引队列非空时读者去抢写锁，而写者每次索引提交要二十毫秒量级，
     // 于是读者全排到写者后面，吞吐掉到基线的百分之七。这里用同一个读者组在写者存在前后各跑一遍，

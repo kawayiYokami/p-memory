@@ -5,7 +5,7 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet, HashMap}, fs::{File, OpenOptions}, path::{Path, PathBuf}, rc::Rc, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
 /// 写者：独占的写连接 + 跨进程文件锁。只挡其他写者，不挡读。
 pub(crate) struct Writer { pub conn: Connection, _file_lock: File }
@@ -176,11 +176,10 @@ impl KnowledgeBase {
         let value = f(&tx)?;
         let revision = current_revision(&tx)?;
         tx.commit()?;
-        // 失效与索引提交都放在写锁内、数据库提交之后：读路径不经过这把锁，
-        // 所以索引再慢也只让其他写者排队，不会挡住任何一次读。
+        // 向量缓存必须失效；索引不在写入路径上追平——写入只把待办记进
+        // index_updates，由使用方稍后调用 `update_index` 一趟索引完、只提交一次。
         self.engine.vectors.invalidate();
-        let index_error = self.index()?.sync(&writer.conn).err().map(|e| e.to_string());
-        Ok(WriteReceipt { value, revision, index_ready: index_error.is_none(), index_error })
+        Ok(WriteReceipt { value, revision })
     }
 
     pub fn memories(&self) -> crate::memory::MemoryStore { crate::memory::MemoryStore(self.clone()) }
@@ -233,6 +232,18 @@ impl KnowledgeBase {
             Err(_) => return,
         };
         self.vectorize(&ids);
+    }
+
+    /// 追平待索引队列：把写入累积的待办一趟索引完、只提交一次。
+    /// 写入不再就地索引，使用方（尤其批量导入）在合适时机调用本方法即可；
+    /// 期间读取走 `sync_index_if_behind` 自愈兜底。
+    pub fn update_index(&self) -> Result<HealthReport> {
+        {
+            let mut guard = self.engine.writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            self.index()?.sync(&writer.conn)?;
+        }
+        self.health()
     }
 
     pub fn rebuild_indexes(&self) -> Result<HealthReport> {
@@ -550,11 +561,12 @@ pub(crate) fn search_texts(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i6
     let placeholders = vec!["?"; ids.len()].join(",");
     let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
     let mut stmt = conn.prepare(&format!("SELECT id,kind,payload_json FROM records WHERE id IN ({placeholders})"))?;
+    let notes = NoteTexts::default();
     for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))? {
         let (id, kind_code, payload_json) = row?;
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: Value = serde_json::from_str(&payload_json)?;
-        out.insert(id, search_text(conn, id, kind, &payload)?);
+        out.insert(id, search_text(conn, id, kind, &payload, &notes)?);
     }
     Ok(out)
 }
@@ -566,16 +578,39 @@ pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[Rec
     Ok(count as usize)
 }
 
+/// 一次批量派生内复用的笔记正文。同一篇笔记的多个切片共享一次文件读取，
+/// 避免「每个切片各读一遍整篇文件」造成读取量随切片数平方增长。
+/// 单条读取（按 id 取一条）建一个临时实例即可，跨记录复用由调用方持有。
+#[derive(Default)]
+pub(crate) struct NoteTexts { cache: RefCell<HashMap<i64, Rc<NoteText>>> }
+
+/// 一篇笔记的派生信息：由路径文件名派生的标题、文件正文。
+/// 正文只在文件里存一份，这里只是一次批量任务内的临时缓存。
+pub(crate) struct NoteText { pub title: String, pub content: String }
+
+impl NoteTexts {
+    /// 取一篇笔记的派生信息；同一实例内对同一 note_id 只读一次文件。
+    fn origin(&self, conn: &Connection, note_id: i64) -> Result<Rc<NoteText>> {
+        if let Some(hit) = self.cache.borrow().get(&note_id) { return Ok(hit.clone()); }
+        let path = note_source(conn, note_id)?;
+        let title = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let content = std::fs::read_to_string(&path)?;
+        let entry = Rc::new(NoteText { title, content });
+        self.cache.borrow_mut().insert(note_id, entry.clone());
+        Ok(entry)
+    }
+}
+
 /// 记录的可检索正文（写入时现算，不落 SQLite）。切片正文由其笔记原文按字符区间取出。
-pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value) -> Result<String> {
+pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, notes: &NoteTexts) -> Result<String> {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     Ok(match kind {
         RecordKind::Memory => field("judgment"),
         // 笔记正文不进全文索引，检索面交给切片；笔记记录只留标题（由宿主路径文件名派生）。
-        RecordKind::Note => note_title(conn, id)?,
+        RecordKind::Note => notes.origin(conn, id)?.title.clone(),
         RecordKind::Chunk => {
-            let (title, content) = chunk_origin(conn, payload)?;
-            format!("{title}\n{}", char_slice(&content, payload))
+            let origin = chunk_origin(conn, payload, notes)?;
+            format!("{}\n{}", origin.title, char_slice(&origin.content, payload))
         }
         RecordKind::Entity => entity_body(payload),
         RecordKind::Relation => format!("{} {} {} {}", field("subject_name"), field("predicate"), field("object_name"), field("reason")),
@@ -584,15 +619,12 @@ pub(crate) fn search_text(conn: &Connection, id: i64, kind: RecordKind, payload:
 }
 
 /// 向量化的输入文本。记忆额外拼上标签，笔记带上正文（读自宿主文件），其余与可检索正文一致。
-pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, tags: &[String]) -> Result<String> {
+pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, payload: &Value, tags: &[String], notes: &NoteTexts) -> Result<String> {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("");
     Ok(match kind {
         RecordKind::Memory => format!("{}\n{}", field("judgment"), tags.join(" ")),
-        RecordKind::Note => {
-            let source = note_source(conn, id)?;
-            format!("{}\n{}", note_title(conn, id)?, std::fs::read_to_string(&source)?)
-        }
-        _ => search_text(conn, id, kind, payload)?,
+        RecordKind::Note => { let origin = notes.origin(conn, id)?; format!("{}\n{}", origin.title, origin.content) }
+        _ => search_text(conn, id, kind, payload, notes)?,
     })
 }
 
@@ -600,11 +632,6 @@ pub(crate) fn embedding_text(conn: &Connection, id: i64, kind: RecordKind, paylo
 fn note_source(conn: &Connection, note_id: i64) -> Result<String> {
     Ok(conn.query_row("SELECT path FROM notes WHERE record_id=?1",
         [note_id], |r| r.get::<_, String>(0)).optional()?.unwrap_or_default())
-}
-
-/// 笔记标题由宿主路径的文件名派生，不落库。
-fn note_title(conn: &Connection, note_id: i64) -> Result<String> {
-    Ok(std::path::Path::new(&note_source(conn, note_id)?).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())
 }
 
 fn name_list(payload: &Value) -> String {
@@ -630,10 +657,9 @@ fn entity_body(payload: &Value) -> String {
 /// 取切片所属笔记的（标题，正文）。切片 payload 里只存 note_id 与字符区间；
 /// 正文读时从笔记的宿主文件取，库里不留副本。文件缺失由上游负责删除记录，
 /// 因此这里直接报错，把不一致暴露出来，而不是静默兜底。
-fn chunk_origin(conn: &Connection, payload: &Value) -> Result<(String, String)> {
+fn chunk_origin(conn: &Connection, payload: &Value, notes: &NoteTexts) -> Result<Rc<NoteText>> {
     let note_id = payload.get("note_id").and_then(Value::as_i64).ok_or_else(|| Error::Validation("chunk payload is missing note_id".into()))?;
-    let source = note_source(conn, note_id)?;
-    Ok((note_title(conn, note_id)?, std::fs::read_to_string(&source)?))
+    notes.origin(conn, note_id)
 }
 
 /// 按 payload 里的 `char_start` / `char_end` 从原文取切片正文。
@@ -647,8 +673,8 @@ fn char_slice(content: &str, payload: &Value) -> String {
 pub(crate) fn chunk_content(conn: &Connection, chunk_id: i64) -> Result<String> {
     let raw: String = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [chunk_id], |r| r.get(0))?;
     let payload: Value = serde_json::from_str(&raw)?;
-    let (_, content) = chunk_origin(conn, &payload)?;
-    Ok(char_slice(&content, &payload))
+    let origin = chunk_origin(conn, &payload, &NoteTexts::default())?;
+    Ok(char_slice(&origin.content, &payload))
 }
 
 pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;
