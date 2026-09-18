@@ -219,8 +219,8 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
         kb.notes.upsert_file(path=str(bad))
 
 
-def test_note_body_lives_in_the_index_and_path_tags_ride_on_every_chunk(kb, tmp_path):
-    """切片正文随写入进索引：源文件删掉仍读得到；登记根目录后路径段拆成标签，挂在每个切片上。"""
+def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(kb, tmp_path):
+    """切片正文随写入进索引：源文件删掉仍读得到；登记根目录后路径段拆成标签，拼在第一片的正文前面。"""
     root = tmp_path / "domain"
     directory = root / "绝区零" / "角色"
     directory.mkdir(parents=True)
@@ -233,8 +233,9 @@ def test_note_body_lives_in_the_index_and_path_tags_ride_on_every_chunk(kb, tmp_
     path.unlink()
     chunks = kb.notes.chunks(note["id"])
     assert [c["content"] for c in chunks] == ["苹果 香蕉 橘子"], "正文在索引里，源文件没了也读得到"
-    assert [c["tags"] for c in chunks] == [["绝区零", "角色", "雅"]], "路径段标签挂在切片上"
-    assert kb.search("角色", kinds=["chunk"])["hits"], "路径段标签让切片被搜到"
+    assert [c["tags"] for c in chunks] == [["绝区零", "角色", "雅"]], "路径段标签挂在切片记录上"
+    hits = kb.search("角色", kinds=["chunk"])["hits"]
+    assert [h["key"]["id"] for h in hits] == [chunks[0]["id"]], "路径段标签让第一片被搜到"
     assert kb.search("角色", kinds=["note"])["hits"] == [], "笔记不占索引文档"
     page = kb.notes.list(filter={"tags": ["角色"]})
     assert [item["id"] for item in page["items"]] == [note["id"]], "按标签翻笔记仍能筛出这一篇"

@@ -389,6 +389,17 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
     tags.iter().map(|label| text::normalized_tag(label)).filter(|tag| !tag.is_empty()).collect::<BTreeSet<_>>().into_iter().collect()
 }
 
+/// 标签集拼进哪一条的可搜正文：笔记这条自己不占索引文档，由它的第一片承载；
+/// 其余记录没有切片，就是它自己。返回空格连接的标签文本，不带标签时是空串。
+pub(crate) fn tags_prefix(kind: RecordKind, tags: &[String], payload: &Value) -> String {
+    let carries = match kind {
+        RecordKind::Note => false,
+        RecordKind::Chunk => payload.get("ordinal").and_then(Value::as_u64) == Some(0),
+        _ => true,
+    };
+    if carries { tags.join(" ") } else { String::new() }
+}
+
 pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInput,
     payload: &Value, text: &str) -> Result<(RecordHeader, crate::index::IndexDocument)> {
     validate_identity("namespace", &input.namespace)?;
@@ -451,7 +462,7 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     // 索引文档就地拼好交回调用方：正文来自本次写入手上的那一份，索引阶段不再回源。
     // 标记一律带整数 id 给索引：namespace、scope、kind、tags 都不写第二份文本。
     let document = crate::index::IndexDocument { id, namespace_id, scope_id, kind,
-        text: text.to_string(), tags: tags.clone(), tag_ids };
+        text: text.to_string(), tags_prefix: tags_prefix(kind, &tags, payload), tag_ids };
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
@@ -484,11 +495,13 @@ pub(crate) fn record_tag_pairs(conn: &Connection, id: i64) -> Result<Vec<(i64, S
 
 /// 按库里现有状态给一条记录拼索引文档：标记（namespace / scope / tags）一律取 strings 表的 id。
 pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text: String) -> Result<crate::index::IndexDocument> {
-    let (namespace_id, scope_id): (i64, i64) = conn.query_row("SELECT namespace_id,scope_id FROM records WHERE id=?1",
-        [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let (namespace_id, scope_id, payload_json): (i64, i64, String) = conn.query_row("SELECT namespace_id,scope_id,payload_json FROM records WHERE id=?1",
+        [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let payload: Value = serde_json::from_str(&payload_json)?;
     let pairs = record_tag_pairs(conn, id)?;
+    let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
     Ok(crate::index::IndexDocument { id, namespace_id, scope_id, kind, text,
-        tags: pairs.iter().map(|(_, tag)| tag.clone()).collect(),
+        tags_prefix: tags_prefix(kind, &tags, &payload),
         tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() })
 }
 

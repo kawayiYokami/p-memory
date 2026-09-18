@@ -55,12 +55,6 @@ pub(crate) fn query_terms(text: &str, strict: bool) -> Vec<String> {
     }).collect()
 }
 
-/// 查询侧关键字词：不做 1+2 切分，按空白切成整词后归一化，用于命中精确整词字段。
-pub(crate) fn keyword_terms(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    normalize_text(query).split_whitespace().filter(|w| seen.insert(w.to_string())).map(|w| w.to_string()).collect()
-}
-
 /// 按与 `tokenize` 同源的规则，把文本截断到不超过 `budget` 个 token。
 ///
 /// 计数方式是分词规则的直接映射：一个 CJK 字算 1 个 token，它与前一个字的

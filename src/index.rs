@@ -10,9 +10,9 @@ use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityS
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v5";
+const FORMAT: &str = "p-memory-text-v6";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, tags_text: Field, text: Field, body: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, body: Field }
 
 /// 一条要写进索引的记录：正文、标签全部由写入流程就地提供。
 /// 写入时读一次源文件、切一次，切片正文一路带到这里，索引阶段不再回头读文件。
@@ -23,8 +23,9 @@ pub(crate) struct IndexDocument {
     pub kind: RecordKind,
     /// 正文列：这条记录自己的文本。记忆是 judgment，切片是它那一段。笔记不进索引。
     pub text: String,
-    /// 标签文本列：每个标签一个词项，与正文列各算一次分，相加定名次。
-    pub tags: Vec<String>,
+    /// 拼在可搜正文前面的标签集（空格连接，空串表示不带）。索引里没有单独的标签文本列：
+    /// 标签只有承载它的那一条带——切片是第一片，其余记录是它自己；取值规则见 `storage::tags_prefix`。
+    pub tags_prefix: String,
     /// 标签 id 列：只用来按标签过滤，不参与打分。
     pub tag_ids: Vec<i64>,
 }
@@ -60,10 +61,8 @@ impl TextIndex {
             kind: builder.add_u64_field("kind", INDEXED),
             // 标签 id 列（多值）：按标签过滤只在这一列上做精确匹配，不参与打分。
             tags: builder.add_u64_field("tags", INDEXED),
-            // 标签文本列：BM25 要有词可算，标签文本不能只有 id。每个标签一个词项，
-            // 与正文列各算一次分、相加。这一列不存原值，取标签读库。
-            tags_text: builder.add_text_field("tags_text", STRING),
             // 正文列：唯一承载「这条记录讲了什么」的列，也是相关性打分的主力。
+            // 标签集拼在承载它的那一条的正文前面，与正文同列、同长度、共同参与打分。
             text: builder.add_text_field("text", tokenized()),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
             body: builder.add_text_field("body", STORED),
@@ -117,9 +116,12 @@ impl TextIndex {
         document.add_u64(self.fields.namespace, item.namespace_id as u64);
         document.add_u64(self.fields.scope, item.scope_id as u64);
         document.add_u64(self.fields.kind, item.kind.code() as u64);
-        for tag in &item.tags { document.add_text(self.fields.tags_text, tag.clone()); }
         for tag_id in &item.tag_ids { document.add_u64(self.fields.tags, *tag_id as u64); }
-        let cleaned = text::clean_markdown(&item.text);
+        // 标签集拼在可搜正文前面，进的是同一条正文列：它跟着这一条的文档长度一起被归一化，
+        // 命中标签的分会被这一条的正文稀释。`body` 仍是纯正文——取回给人看的、送进模型的都不带标签。
+        let searchable = if item.tags_prefix.is_empty() { item.text.clone() }
+            else { format!("{}\n{}", item.tags_prefix, item.text) };
+        let cleaned = text::clean_markdown(&searchable);
         if !cleaned.is_empty() { document.add_text(self.fields.text, text::tokenize(&cleaned).join(" ")); }
         writer.add_document(document)?;
         Ok(())
@@ -189,8 +191,9 @@ impl TextIndex {
                 _ => storage::record_text(kind, &payload),
             };
             let pairs = storage::record_tag_pairs(conn, id).unwrap_or_default();
+            let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
             documents.push(IndexDocument { id, namespace_id, scope_id, kind, text,
-                tags: pairs.iter().map(|(_, tag)| tag.clone()).collect(),
+                tags_prefix: storage::tags_prefix(kind, &tags, &payload),
                 tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
         documents
@@ -220,22 +223,15 @@ impl TextIndex {
         (occurrence, Box::new(TermQuery::new(Term::from_field_text(field, value), IndexRecordOption::WithFreqs)) as Box<dyn Query>)
     }
 
-    fn filtered_query(&self, tokens: &[String], tags: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
+    fn filtered_query(&self, tokens: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
         let occurrence = if strict { Occur::Must } else { Occur::Should };
-        // 两列各算一次分、相加：正文列吃查询词的词元，标签文本列按整词命中。
-        // 标签挂在每个切片上，所以查「澜川」时同篇的每一片都自己拿到一份标签分。
-        let text_query = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
-        let mut relevance: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Should, Box::new(text_query))];
-        if !tags.is_empty() {
-            let tag_query = BooleanQuery::new(tags.iter().map(|word| (Occur::Should,
-                Box::new(TermQuery::new(Term::from_field_text(self.fields.tags_text, word), IndexRecordOption::Basic)) as Box<dyn Query>)).collect());
-            relevance.push((Occur::Should, Box::new(tag_query)));
-        }
-        // 这一层只放 Should，所以至少要命中一个才算相关，过滤维度另起一层放 Must。
+        // 相关性只有正文这一层：标签文本已经拼在承载它的那条正文里，不再单独成列。
+        let relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
+        // 相关性这层只放 Should，所以至少要命中一个词元才算相关，过滤维度另起一层放 Must。
         // 两层不能合并：同一层里一旦存在 Must，全部 Should 都会降级为「有则加分、无也无妨」，
         // 正文条件就形同虚设，检索退化成「只按过滤条件取记录」——
         // 查一个正文里根本不存在的词，也会返回该过滤域下的任意记录。
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, Box::new(BooleanQuery::new(relevance)))];
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, Box::new(relevance))];
         let scopes = BooleanQuery::new(filter.scopes.iter().map(|scope| (Occur::Should, Self::exact_u64(self.fields.scope, *scope))).collect());
         clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Self::exact_u64(self.fields.namespace, filter.namespace), 0.0))));
         clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(Box::new(scopes), 0.0))));
@@ -256,12 +252,11 @@ impl TextIndex {
         let mut seen = HashSet::new();
         let searcher = self.reader.searcher();
         let mut strict_rank = HashMap::new();
-        let tags = text::keyword_terms(query);
         for strict in [true, false] {
             if !strict && result.len() >= limit { break; }
             let tokens = text::query_terms(query, strict);
             if tokens.is_empty() { continue; }
-            let query = self.filtered_query(&tokens, &tags, strict, filter);
+            let query = self.filtered_query(&tokens, strict, filter);
             let collector = TopDocs::with_limit(limit).order_by(((SortBySimilarityScore, Order::Desc), (SortByString::for_field("key"), Order::Asc)));
             let hits = searcher.search(&*query, &collector)?;
             for ((score, _), address) in hits {

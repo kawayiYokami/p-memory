@@ -622,7 +622,9 @@ fn swapping_models_keeps_the_old_space_usable() {
     // 换模型：新建空间 + 新回调 + sync；旧空间不动，退回只是检索改回旧空间。
     kb.embeddings().register_space(EmbeddingSpace { id: "new".into(), model: "fixture/v2".into(), dimension: 8, text_version: 1, encoding: "sq8".into() }).unwrap();
     kb.embeddings().register_embedder("new", FakeEmbedder::new(8)).unwrap();
-    assert_eq!(kb.embeddings().sync("new", 32).unwrap().value.written, 3);
+    kb.embeddings().sync("new", 32).unwrap();
+    // 后台线程可能在同一时刻已经把这三条补掉，所以只断言终态，不数这一次写了多少。
+    assert!(wait_until_ready(&kb, "default", "new", "memory", 15_000), "换上新模型后补齐并标记就绪");
     let kinds = vec![RecordKind::Memory];
     let old_hits = kb.search(&vector_query("old", "换模型 1", kinds.clone())).unwrap().hits;
     let new_hits = kb.search(&vector_query("new", "换模型 1", kinds.clone())).unwrap().hits;
@@ -672,7 +674,9 @@ fn packed_and_precise_spaces_rank_the_same_vectors_together() {
     for (id, encoding) in [("precise", "f32"), ("packed", "sq8")] {
         kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension: 8, text_version: 1, encoding: encoding.into() }).unwrap();
         kb.embeddings().register_embedder(id, FakeEmbedder::new(8)).unwrap();
-        assert_eq!(kb.embeddings().sync(id, 50).unwrap().value.written, 8);
+        // 注册回调自己就触发一次补齐，谁补的不重要，只等终态。
+        kb.embeddings().sync(id, 50).unwrap();
+        assert!(wait_until_ready(&kb, "default", id, "memory", 15_000), "空间 {id} 补齐并标记就绪");
     }
     let kinds = vec![RecordKind::Memory];
     let precise = kb.search(&vector_query("precise", "记录3", kinds.clone())).unwrap().hits;
@@ -870,20 +874,20 @@ fn ties_and_chinese_queries_are_deterministic_across_rebuilds() {
     kb.rebuild_indexes().unwrap();assert_eq!(ids(&kb),first);
 }
 
-/// 标签列参与打分：正文里根本没有的词，靠标签也能搜到。
-/// 路径信息以标签形态存在，领域登记了根目录之后，目录段与文件名都挂在这一篇的每个切片上。
+/// 标签集拼在承载它的那一条正文前面：记忆是它自己，笔记是它的第一片。
+/// 正文里根本没有的词，靠这份标签也能搜到。
 #[test]
-fn tag_and_path_columns_carry_queries_the_body_cannot() {
+fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
-    // 正文不含"星见雅"，只有标签列带它。
+    // 正文不含"星见雅"，只有拼在它前面的标签带它。
     let mut m = memory("她喜欢苹果", "public");
     m.record.tags = vec!["星见雅".into()];
     let id = kb.memories().upsert(m).unwrap().value.header.id;
     let hits = kb.search(&SearchRequest { query: "星见雅".into(), ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
-    // 正文不含"角色"：登记根目录之后，相对路径的目录段拆成标签挂到切片上，靠标签命中。
+    // 笔记：登记根目录之后，相对路径的目录段拆成标签，拼在这一篇第一片的正文前面。
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let note_dir = dir.path().join("绝区零").join("角色");
     std::fs::create_dir_all(&note_dir).unwrap();
@@ -894,9 +898,11 @@ fn tag_and_path_columns_carry_queries_the_body_cannot() {
     assert_eq!(chunks.len(), 1);
     for word in ["绝区零", "角色", "雅"] {
         let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-        assert_eq!(hits.len(), 1, "路径段的标签挂在切片上：{word}");
+        assert_eq!(hits.len(), 1, "路径段的标签拼在第一片的正文前面：{word}");
         assert_eq!(hits[0].key.id, chunks[0].header.id);
     }
+    // 取回的切片正文只有它自己那一段，标签不在里面。
+    assert_eq!(chunks[0].content, "这是一段无关内容", "取回的是纯正文");
     // 笔记不占索引文档：要文件列表按库里的标签翻。
     let hits = kb.search(&SearchRequest { query: "雅".into(), kinds: vec![RecordKind::Note], ..Default::default() }).unwrap().hits;
     assert!(hits.is_empty(), "笔记不进索引");
@@ -1116,10 +1122,10 @@ fn note_body_lives_only_in_the_index_not_in_sqlite() {
     assert_eq!(hits, 0, "笔记正文不落 SQLite");
 }
 
-/// 切片只装它自己那一段正文；文件名与祖先目录以标签形态挂在这一篇的每个切片上。
+/// 切片只装它自己那一段正文；标签集只拼在这一篇的第一片前面，其余片一份都不带。
 /// 没登记领域根目录就不拆路径标签，路径词谁都搜不到。
 #[test]
-fn chunks_carry_their_own_text_while_the_path_tags_ride_on_every_chunk() {
+fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let root = dir.path().to_string_lossy().into_owned();
@@ -1135,7 +1141,7 @@ fn chunks_carry_their_own_text_while_the_path_tags_ride_on_every_chunk() {
         assert!(kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits.is_empty(),
             "没登记根目录就不拆路径标签：{word}");
     }
-    // 登记根目录后重新写入：相对路径按段拆成标签，挂到这一篇的每个切片上。
+    // 登记根目录后重新写入：相对路径按段拆成标签，拼到这一篇第一片的正文前面。
     kb.notes().set_root("default", &root).unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
     let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
@@ -1145,21 +1151,26 @@ fn chunks_carry_their_own_text_while_the_path_tags_ride_on_every_chunk() {
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     for word in ["绝区零", "角色", "雅"] {
         let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-        assert_eq!(hits.len(), 1, "路径段的标签挂在切片上：{word}");
+        assert_eq!(hits.len(), 1, "路径段的标签拼在第一片上：{word}");
         assert_eq!(hits[0].key.id, chunks[0].header.id);
     }
-    // 长正文切成多片：文件名标签一片不落，内容里一个路径词都没有。
+    // 长正文切成多片：标签只在第一片上，其余片连文件名都搜不到。
     let long_path = note_dir.join("长文.md");
     std::fs::write(&long_path, "青提".repeat(400)).unwrap();
     let long_note = kb.notes().upsert_file(NoteFileInput::new(&long_path)).unwrap().value;
     let long_chunks = kb.notes().chunks(long_note.header.id, &ReadFilter::default()).unwrap();
     assert!(long_chunks.len() > 1, "长正文应当切成多片");
     for chunk in &long_chunks { assert!(!chunk.content.contains("长文"), "切片正文不携带文件名"); }
+    // 文件名只在它自己那一篇的第一片上：搜「长文」只有一条。
     let hits = kb.search(&SearchRequest { query: "长文".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 1, "文件名标签只拼在第一片上");
+    assert_eq!(hits[0].key.id, long_chunks[0].header.id);
+    // 目录段两篇都带：每篇各出一条，多片的那篇不会一片一条。
+    let hits = kb.search(&SearchRequest { query: "角色".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     let mut hit_ids: Vec<i64> = hits.iter().map(|hit| hit.key.id).collect();
-    let mut chunk_ids: Vec<i64> = long_chunks.iter().map(|chunk| chunk.header.id).collect();
-    hit_ids.sort(); chunk_ids.sort();
-    assert_eq!(hit_ids, chunk_ids, "同一篇的每一片都带这份标签");
+    let mut expected = vec![chunks[0].header.id, long_chunks[0].header.id];
+    hit_ids.sort(); expected.sort();
+    assert_eq!(hit_ids, expected, "目录段两篇各出一条，都落在各自的第一片");
 }
 
 /// 正文只在索引里存一份，源文件在写入之后就可以消失：读切片正文不再回文件。
@@ -1227,9 +1238,9 @@ fn memory_and_chunk_score_the_same_text_identically() {
     assert_eq!(score(vec![RecordKind::Memory]), score(vec![RecordKind::Chunk]), "同文本的文本列分数一致");
 }
 
-/// 领域根目录：写入路径必须在根目录之内，库里存相对路径，路径段标签挂到每个切片上。
+/// 领域根目录：写入路径必须在根目录之内，库里存相对路径，标签集拼在这一篇的第一片前面。
 #[test]
-fn domain_root_relative_paths_and_path_tags_reach_every_chunk() {
+fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let root = dir.path().join("data").join("domain").join("gi");
@@ -1243,7 +1254,7 @@ fn domain_root_relative_paths_and_path_tags_reach_every_chunk() {
     std::fs::write(&outside, "根目录之外的正文").unwrap();
     assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&outside)), Err(Error::Validation(_))));
     assert_eq!(kb.health().unwrap().record_count, 0, "越界路径一条记录都不许落库");
-    // 正文里不出现路径词：它们只以标签形态存在。
+    // 正文里不出现路径词：它们只以拼在第一片前面的标签形态存在。
     let mut input = NoteFileInput::new(&note_path);
     input.record.tags = vec!["人物".into()];
     let note = kb.notes().upsert_file(input).unwrap().value;
@@ -1256,11 +1267,16 @@ fn domain_root_relative_paths_and_path_tags_reach_every_chunk() {
         assert_eq!(tags, vec!["bwiki".to_string(), "人物".to_string(), "沧州".to_string(), "澜川".to_string()],
             "调用方标签与路径段标签合并去重后挂在每一片上");
     }
-    // 查「澜川」：每一片自己都既有正文分也有标签分。
+    // 查「澜川」：正文里全是它，每一片都由自己的正文命中。
     let hits = kb.search(&SearchRequest { query: "澜川".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), chunks.len(), "每片都能被搜到");
-    assert!(hits.iter().all(|hit| hit.text_score.is_some_and(|score| score > 0.0)), "每片都拿到正文分");
-    assert!(hits[0].text_score.unwrap() > 1.0, "正文与标签各算一次分，同一条记录内相加");
+    assert!(hits.iter().all(|hit| hit.text_score.is_some_and(|score| score > 0.0)), "每片都拿到分");
+    // 查路径段与调用方标签：这份标签只拼在第一片上，所以只有第一片命中。
+    for word in ["bwiki", "沧州", "人物"] {
+        let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
+        assert_eq!(hits.len(), 1, "标签集只拼在第一片上：{word}");
+        assert_eq!(hits[0].key.id, chunks[0].header.id, "命中的是第一片：{word}");
+    }
     // 按标签筛切片：`沧州` 筛得到，库里没有的标签换不到 id 就是空结果。
     let by_tag = |tag: &str| kb.search(&SearchRequest { query: "澜川".into(),
         filter: ReadFilter { tags: vec![tag.into()], ..Default::default() }, kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() })

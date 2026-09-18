@@ -178,7 +178,9 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
                     params![id, fingerprint, header.updated_at_us])?;
                 conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
                 (id, crate::index::IndexDocument { id, namespace_id, scope_id, kind: RecordKind::Chunk,
-                    text: chunk.content.clone(), tags: header.tags.clone(), tag_ids })
+                    text: chunk.content.clone(),
+                    tags_prefix: storage::tags_prefix(RecordKind::Chunk, &header.tags, &payload),
+                    tag_ids })
             }
             None => {
                 let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(), tags: header.tags.clone(),
