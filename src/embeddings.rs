@@ -771,7 +771,8 @@ pub(crate) struct Vectorizer {
     stopping: Mutex<bool>,
     /// 唤醒信号。有活的一方 notify，线程据此醒来。
     signal: Condvar,
-    /// 有活待补的记号。置位发生在唤醒之前，所以不会被丢掉。
+    /// 有活待补的记号。置位与唤醒必须在同一把锁里做：线程是「持锁看记号、再睡」的，
+    /// 只在锁外置位会落进这两步之间，信号丢了线程就一直睡到下一次唤醒。
     pending: AtomicBool,
     /// 后台正在补齐。读路径据此决定要不要为「索引待办」稍等：等的是这一次补齐，
     /// 它会把待办提交掉；别的写者占着写锁时读路径一律不等。
@@ -812,14 +813,18 @@ impl Vectorizer {
     /// 叫一次：有活要补。写入提交、注册模型、改档位都会说一声。
     /// 只置记号并唤醒，不阻塞调用方，也不叫模型。
     pub(crate) fn notify_work(&self) {
+        let _guard = self.stopping.lock();
         self.pending.store(true, AtomicOrdering::SeqCst);
         self.signal.notify_all();
     }
 
     /// 停下并等它收尾；重复调用无副作用。
     pub(crate) fn stop(&self) {
-        *self.stopping.lock() = true;
-        self.signal.notify_all();
+        {
+            let mut stopping = self.stopping.lock();
+            *stopping = true;
+            self.signal.notify_all();
+        }
         if let Some(handle) = self.handle.lock().take() { let _ = handle.join(); }
     }
 }
@@ -831,11 +836,11 @@ fn work_loop(engine: &Weak<crate::storage::Engine>, vectorizer: &Vectorizer) {
     loop {
         {
             let mut stopping = vectorizer.stopping.lock();
-            if *stopping { return; }
-            if !vectorizer.pending.load(AtomicOrdering::SeqCst) {
+            // 没被叫就一直睡；醒来后重判一次，空唤醒不至于白跑一轮全库扫描。
+            while !*stopping && !vectorizer.pending.load(AtomicOrdering::SeqCst) {
                 vectorizer.signal.wait(&mut stopping);
-                if *stopping { return; }
             }
+            if *stopping { return; }
         }
         // 记号在手，先清掉再去干活：干活期间新来的写入会重新置位，不会被吞掉。
         vectorizer.pending.store(false, AtomicOrdering::SeqCst);
