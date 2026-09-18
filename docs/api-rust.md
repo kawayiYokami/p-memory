@@ -17,6 +17,7 @@ impl KnowledgeBase {
 
     fn search(&self, request: &SearchRequest) -> Result<SearchResult>;
     fn search_with_context(&self, request: &SearchRequest, limit: usize) -> Result<Vec<ContextualHit>>;
+    fn search_preset(&self, request: &PresetRequest) -> Result<PresetResult>;
     fn register_reranker<F: Reranker + 'static>(&self, reranker: F) -> Result<()>;
     fn register_reranker_with<F: Reranker + 'static>(&self, reranker: F, options: RerankerOptions) -> Result<()>;
     fn unregister_reranker(&self) -> bool;
@@ -60,6 +61,59 @@ impl KnowledgeBase {
 
 - `register_reranker` / `register_reranker_with` 注册重排回调：进程内单例，不绑定向量空间。库在调用前按 `RerankerOptions` 强制截断候选与文本。注册时用样本真跑一遍校验产出条数与有限性；回调当场不可用时无从校验形状，允许绑定，可用性留到检索时降级。
 - 嵌入回调在 `EmbeddingStore` 上注册（见下）。
+
+### 预设检索
+
+`search_preset` 是预先配好的搜索方法，调用方按名字取用：
+
+```rust
+enum SearchPreset { Memory, Graph, Notes, Rag, Broad }   // "memory"/"graph"/"notes"/"rag"/"broad"
+
+impl SearchPreset {
+    const ALL: [Self; 5];
+    fn as_str(self) -> &'static str;
+    fn parse(value: &str) -> Result<Self>;     // 别的名字报 validation
+    fn uses_memory(self) -> bool;              // memory / rag / broad
+    fn uses_graph(self) -> bool;               // graph / rag / broad
+    fn uses_notes(self) -> bool;               // notes / broad
+}
+
+struct PresetRequest {
+    preset: SearchPreset,        // 默认 Rag
+    query: String,               // 必填，空即 validation
+    filter: ReadFilter,
+    embed_space: Option<String>,
+    text: bool, vector: bool, rerank: bool,     // 默认全真
+    budget: PresetBudget,
+    candidate_limit: usize,      // 默认 64，不得为 0
+}
+struct PresetBudget {            // 都可被调用方覆盖
+    memory_chars: usize,         // 默认 2000
+    notes_chars: usize,          // 默认 3000
+    seed_entities: usize,        // 默认 4，不得为 0；唯一按个数的阈值
+    graph_relations_chars: usize,   // 默认 1000
+    graph_context_chars: usize,     // 默认 2000
+}
+struct PresetResult {
+    preset: SearchPreset,
+    memories: Vec<SearchHit>,    // 记忆那一路
+    graph: GraphSection,         // 图谱那一路
+    notes: Vec<SearchHit>,       // 笔记那一路
+    revision: i64,
+    indexed_revision: i64,
+    diagnostics: SearchDiagnostics,
+}
+struct GraphSection {
+    entities: Vec<Entity>,              // 第一步的种子，按分排，带别名
+    relations: Vec<Relation>,           // 第二步命中的关系，按相关度排
+    context_relations: Vec<Relation>,   // 第三步铺开的关系，不筛，按 id 升序
+    context_events: Vec<Event>,         // 第三步铺开的事件，不筛，按 id 升序
+}
+```
+
+- 三个字段各自独立排序、各自按字符数封顶，互不挤占；这次没走的那一路是空数组，图谱字段全空。
+- 记忆、笔记两路复用 `search`（全文 + 向量 + 可选重排），按字符数截断后返回；图谱那一路按三步流程走，见 [search](search.md#预设检索)。
+- 预设带的默认阈值只是起点，实例化时按场景覆盖即可。
 
 ## MemoryStore
 

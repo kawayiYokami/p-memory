@@ -105,6 +105,23 @@ class KnowledgeBase:
             payload["kinds"] = list(kinds)
         return self.invoke("search", payload)
 
+    def search_preset(self, preset: str = "rag", query: str = "", *,
+                      filter: ReadFilter | None = None, embed_space: str | None = None,
+                      text: bool = True, vector: bool = True, rerank: bool = True,
+                      budget: Mapping[str, int] | None = None,
+                      candidate_limit: int = 64) -> dict[str, Any]:
+        """按预设检索：库预先配好的搜索方法，`preset` 取 memory / graph / notes
+        / rag / broad。返回的记忆、图谱、笔记三个字段各自独立排序，不混在一起；
+        字符数等阈值可在 `budget` 里逐项覆盖。"""
+        payload = {"preset": preset, "query": query, "filter": self._filter(filter),
+                   "text": text, "vector": vector, "rerank": rerank,
+                   "candidate_limit": candidate_limit}
+        if embed_space is not None:
+            payload["embed_space"] = embed_space
+        if budget is not None:
+            payload["budget"] = dict(budget)
+        return self.invoke("preset", payload)
+
     def register_reranker(self, callback: Callable, *, max_docs: int = 64,
                           max_tokens_per_doc: int = 1024,
                           max_tokens_query: int | None = None) -> None:
@@ -354,6 +371,10 @@ class AsyncKnowledgeBase:
     async def search(self, query: str = "", **options: Any) -> SearchResult:
         kb = await self._ensure_open()
         return await asyncio.to_thread(kb.search, query, **options)
+
+    async def search_preset(self, query: str = "", **options: Any) -> dict[str, Any]:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.search_preset, options.pop("preset", "rag"), query, **options)
 
     async def health(self) -> dict:
         kb = await self._ensure_open()

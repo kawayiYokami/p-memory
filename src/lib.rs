@@ -15,6 +15,7 @@ pub mod graph_search;
 pub mod notes;
 pub mod embeddings;
 pub mod search;
+pub mod preset;
 pub mod legacy;
 pub mod protocol;
 
@@ -26,4 +27,5 @@ pub use graph::{Entity, EntityInput, Relation, RelationInput, Event, EventInput,
 pub use notes::{Note, NoteFileInput, Chunk};
 pub use embeddings::{EmbeddingSpace, Embedder, EmbedderOptions, EmbedCallbackError, EmbedErrorKind, SyncReport};
 pub use search::{SearchRequest, SearchResult, SearchHit, GraphPrune, ContextualHit, Reranker, RerankerOptions};
+pub use preset::{SearchPreset, PresetBudget, PresetRequest, PresetResult, GraphSection};
 

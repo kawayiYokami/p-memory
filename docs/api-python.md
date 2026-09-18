@@ -13,6 +13,7 @@ kb.graph           # GraphStore
 kb.notes           # NoteStore
 kb.embeddings      # EmbeddingStore
 kb.search("关键词") # -> SearchResult
+kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_docs=64)
 kb.health()        # -> dict
 kb.update_index()  # 追平写入累积的索引待办（批量导入后调用一次）
@@ -39,6 +40,15 @@ kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
 ```
 
 登记之后库里存的是相对路径 `bwiki/沧州/澜川.md`，拆出的 `bwiki` / `沧州` / `澜川` 与调用方标签合并、挂到这一篇的每条切片上；`path` 不在根目录之内报 `ValidationError`。没登记根目录的领域维持原样：路径逐字符存，不拆标签。
+
+预设检索：
+
+```python
+kb.search_preset("rag", "朱樱和白露的同学是谁", embed_space="e5")
+# -> {"preset": "rag", "memories": [...], "graph": {...}, "notes": [...], ...}
+```
+
+签名是 `search_preset(preset="rag", query="", *, filter=None, embed_space=None, text=True, vector=True, rerank=True, budget=None, candidate_limit=64)`；`preset` 取 `memory` / `graph` / `notes` / `rag` / `broad`。返回的 `memories` / `graph` / `notes` 三个字段各自独立排序、各自按字符数封顶，不混在一起，没走的那一路是空列表；`graph` 里再分 `entities` / `relations` / `context_relations` / `context_events` 四块。阈值按 `budget` 逐项覆盖（`dict[str, int]`，键名与 `PresetBudget` 字段一致），默认值见 [search](search.md#预设检索)。异步封装：`await kb.search_preset("关键词", preset="broad")`。
 
 ## 向量与重排回调
 

@@ -125,6 +125,78 @@ flowchart LR
 - 用**有界堆**保留 Top-K。
 - 检索为**精确检索**，不做近似索引。
 
+## 预设检索
+
+预设是库预先配好的搜索方法，调用方按名字取用，不必自己拼参数：
+
+```rust
+fn search_preset(&self, request: &PresetRequest) -> Result<PresetResult>;
+```
+
+| 预设 | 走哪几路 | 填哪些字段 |
+|---|---|---|
+| `memory` | 记忆 | 记忆 |
+| `graph` | 图谱 | 图谱 |
+| `notes` | 切片 | 笔记 |
+| `rag` | 记忆 + 图谱 | 记忆 + 图谱 |
+| `broad` | 记忆 + 图谱 + 切片 | 记忆 + 图谱 + 笔记 |
+
+返回恒为三个字段，**各自独立排序，不混在一起**；这次没走的那一路是空数组：
+
+```rust
+struct PresetResult {
+    preset: SearchPreset,
+    memories: Vec<SearchHit>,     // 只含记忆记录
+    graph: GraphSection,          // 实体 / 关系 / 事件，见下
+    notes: Vec<SearchHit>,        // 只含切片
+    revision: i64,
+    indexed_revision: i64,
+    diagnostics: SearchDiagnostics,   // 各路的开关取或、候选数累加、降级去重
+}
+struct PresetRequest {
+    preset: SearchPreset,             // 默认 rag
+    query: String,                    // 必填，空即 validation
+    filter: ReadFilter,
+    embed_space: Option<String>,      // 走向量路时用哪条空间
+    text: bool, vector: bool, rerank: bool,   // 默认全真
+    budget: PresetBudget,             // 阈值，逐项可覆盖
+    candidate_limit: usize,           // 按字符数封顶前先取多少条候选，默认 64
+}
+```
+
+阈值按**字符数**封顶（重排模型按字符数算，不看条数），缺口等实测再调：
+
+```rust
+struct PresetBudget {                 // 默认值
+    memory_chars: usize,              // 2000
+    notes_chars: usize,               // 3000
+    seed_entities: usize,             // 4，中间量，仍按个数
+    graph_relations_chars: usize,     // 1000
+    graph_context_chars: usize,       // 2000，铺开的关系与事件共用
+}
+```
+
+单路（记忆、笔记）的候选直接复用 `search`，也就是全文 + 向量 + 可选重排一次走完，再按字符数截断：长度取索引里的纯正文，取不到正文的条目按 0 计；第一条无论多长都留下，避免预算略小就整条路空掉；`chars` 为 0 表示这一路不出。
+
+图谱那一路按三步走，产物按阶段分块：
+
+```rust
+struct GraphSection {
+    entities: Vec<Entity>,          // 第一步的种子，按分排，带别名
+    relations: Vec<Relation>,       // 第二步命中的关系，按相关度排
+    context_relations: Vec<Relation>,   // 第三步铺开的关系，不筛，按 id 升序
+    context_events: Vec<Event>,         // 第三步铺开的事件，不筛，按 id 升序
+}
+```
+
+1. **搜种子**：查询词搜实体，按分取前 `seed_entities` 个当种子。种子为空则整段为空。
+2. **敲关系**：每个种子各自到「以它为端点」的关系里敲查询词，命中的留下。打分是查询词元在这条关系正文里的命中权重——二字及以上词元算 2 分、单字算 1 分，降序，同分按记录 id 升序。命中的关系算结果、进重排，按 `graph_relations_chars` 封顶。
+3. **铺开**：实体集合 = 种子 + 命中关系的另一端；两端都落在集合内的关系、参与者至少两个落在集合内的**事件**全部保留、不筛，且排除第二步已命中的关系。关系按 `graph_context_chars` 吃掉一份，剩下多少给事件，两者共用这一份上限。
+
+分块而不合榜是有意的：第三步那批本来就没跑过相关性，硬按分排等于把「不筛」又变成「按分排」；前几块的分也不在同一根尺上——种子的分来自实体正文，命中关系的分来自关系正文。下游因此一眼看得出哪块是答、哪块是背景。
+
+准入与降级沿用 `search` 的口径：预设里的路走全文 + 向量，向量按**各档是否补齐**逐档判（记忆档 = 记忆，图谱档 = 实体 / 关系 / 事件，笔记档 = 切片），某档未就绪只让这一档不走向量，别的档照常。
+
 ## 重排
 
 - 重排回调是进程内单例，不绑定向量空间：`rerank(query, documents) -> [score]`，与输入文档等长、按序给出。

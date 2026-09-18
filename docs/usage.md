@@ -59,6 +59,26 @@ for hit in kb.search(&req)?.hits {
 - `query` 走关键词（严格 + 宽松两轮）；给了 `embed_space` 走向量（库自己嵌入查询词）；两者都开就是混合，用 RRF 融合，可选重排。详见 [search](search.md)。
 - 过滤在截取 Top-K **之前**生效。
 
+预设检索：库预先配好五种搜索方法，按名字取用，返回的记忆 / 图谱 / 笔记三个字段各自独立排序：
+
+```rust
+use p_memory::{PresetRequest, SearchPreset};
+
+let req = PresetRequest {
+    preset: SearchPreset::Rag,        // memory / graph / notes / rag / broad
+    query: "朱樱和白露的同学是谁".into(),
+    embed_space: Some("e5".into()),
+    filter: ReadFilter { namespace: "akasha/gi".into(), ..Default::default() },
+    ..Default::default()
+};
+let result = kb.search_preset(&req)?;
+for hit in &result.memories { println!("记忆 {:.3}\t{}", hit.score, hit.key.id); }
+for entity in &result.graph.entities { println!("种子实体 {}", entity.name); }
+for relation in &result.graph.relations { println!("关系 {}", relation.predicate); }
+```
+
+`rag` 出记忆与图谱两路，`broad` 再多出一路笔记；单路预设只填自己那一个字段。阈值默认按字符数封顶（记忆 2000、笔记 3000、命中关系 1000、铺开的关系与事件 2000、种子实体 4 个），在 `budget` 里逐项覆盖。详见 [search](search.md#预设检索)。
+
 ## 图谱
 
 写入（单事务，顺序实体 → 关系 → 事件，允许批内互相引用）：

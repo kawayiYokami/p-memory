@@ -1293,3 +1293,130 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     assert_eq!(again[0].key.id, hits[0].key.id, "重建后名次一致");
     assert_eq!(kb.health().unwrap().index_document_count, before.record_count - 1);
 }
+
+// ── 预设检索 ──────────────────────────────────────────────────────────
+
+fn relation_of(subject_id: i64, predicate: &str, object_id: i64) -> RelationInput {
+    RelationInput { record: RecordInput::default(), subject_id, predicate: predicate.into(), object_id, confidence: 1.0, reason: String::new() }
+}
+
+fn event_of(name: &str, participants: Vec<i64>) -> EventInput {
+    EventInput { record: RecordInput::default(), name: name.into(), summary: String::new(), participants, confidence: 1.0, reason: String::new() }
+}
+
+/// 「朱樱和白露的同学是谁」：搜实体得种子 → 种子各自敲自己的关系 → 两两之间铺开关系与事件。
+#[test]
+fn preset_graph_walks_entities_then_relations_then_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let mut hua = entity("朱樱");
+    hua.aliases = vec!["堂主".into()];
+    let created = kb.graph().apply_batch(&GraphBatch {
+        entities: vec![hua, entity("白露"), entity("青萍"), entity("玄霜"), entity("长夜堂")], ..Default::default()
+    }).unwrap().value;
+    let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
+    kb.graph().apply_batch(&GraphBatch {
+        relations: vec![
+            relation_of(id("朱樱"), "同学", id("青萍")),
+            relation_of(id("白露"), "同学", id("玄霜")),
+            relation_of(id("青萍"), "同门", id("玄霜")),
+            relation_of(id("朱樱"), "客卿于", id("长夜堂")),
+        ],
+        events: vec![
+            event_of("别鹤典仪", vec![id("朱樱"), id("青萍")]),
+            event_of("堂中自语", vec![id("青萍")]),
+            event_of("开张", vec![id("长夜堂")]),
+        ],
+        ..Default::default()
+    }).unwrap();
+    kb.memories().upsert(memory("朱樱的同学是青萍", "public")).unwrap();
+
+    let result = kb.search_preset(&PresetRequest {
+        preset: SearchPreset::Rag, query: "朱樱和白露的同学是谁".into(), ..Default::default()
+    }).unwrap();
+
+    // 种子实体：查询词命中的实体，按分排，别名一起给出。
+    let mut names: Vec<&str> = result.graph.entities.iter().map(|entity| entity.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["朱樱", "白露"], "查询词命中的实体成为种子");
+    let hua = result.graph.entities.iter().find(|entity| entity.name == "朱樱").unwrap();
+    assert_eq!(hua.aliases, vec!["堂主".to_string()], "实体连别名一起给出");
+
+    // 第二步：种子实体各自到自己的关系里敲查询词，命中的留下。
+    let hits: Vec<(i64, String, i64)> = result.graph.relations.iter()
+        .map(|relation| (relation.subject_id, relation.predicate.clone(), relation.object_id)).collect();
+    assert!(hits.contains(&(id("朱樱"), "同学".into(), id("青萍"))), "朱樱那边的同学关系是结果");
+    assert!(hits.contains(&(id("白露"), "同学".into(), id("玄霜"))), "白露那边的同学关系是结果");
+
+    // 第三步：实体集合两两之间的关系与事件，不筛。
+    let context: Vec<String> = result.graph.context_relations.iter().map(|relation| relation.predicate.clone()).collect();
+    assert!(context.contains(&"同门".to_string()), "两端都落在集合内的关系进第三段");
+    assert!(!context.contains(&"客卿于".to_string()), "只有一端落在集合内的关系不进第三段");
+    let events: Vec<&str> = result.graph.context_events.iter().map(|event| event.name.as_str()).collect();
+    assert_eq!(events, vec!["别鹤典仪"], "参与者至少两个落在集合内才算第三段的事件");
+
+    // 记忆那一路独立出结果，字段不混。
+    assert!(result.memories.iter().any(|hit| hit.record["judgment"].as_str().unwrap_or_default().contains("朱樱的同学")));
+    assert!(result.notes.is_empty(), "RAG 不出笔记那一路");
+}
+
+/// 单路预设只填自己那一个字段；广撒网三个字段都填。
+#[test]
+fn preset_fields_stay_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.memories().upsert(memory("预设字段分离用的记忆", "public")).unwrap();
+    kb.graph().apply_batch(&GraphBatch { entities: vec![entity("预设字段分离用的实体")], ..Default::default() }).unwrap();
+    let path = dir.path().join("预设字段分离用的笔记.md");
+    std::fs::write(&path, "预设字段分离用的正文".repeat(20)).unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+
+    let query = "预设字段分离用";
+    let of = |preset| kb.search_preset(&PresetRequest { preset, query: query.into(), ..Default::default() }).unwrap();
+
+    let memory_only = of(SearchPreset::Memory);
+    assert!(!memory_only.memories.is_empty());
+    assert!(memory_only.graph.entities.is_empty() && memory_only.notes.is_empty(), "记忆预设只填记忆那一个字段");
+
+    let graph_only = of(SearchPreset::Graph);
+    assert!(graph_only.memories.is_empty() && graph_only.notes.is_empty(), "图谱预设只填图谱那一个字段");
+    assert!(graph_only.graph.entities.iter().any(|entity| entity.name == "预设字段分离用的实体"));
+
+    let notes_only = of(SearchPreset::Notes);
+    assert!(!notes_only.notes.is_empty());
+    assert!(notes_only.memories.is_empty() && notes_only.graph.entities.is_empty(), "笔记预设只填笔记那一个字段");
+
+    let broad = of(SearchPreset::Broad);
+    assert!(!broad.memories.is_empty() && !broad.notes.is_empty() && !broad.graph.entities.is_empty(), "广撒网三路都出");
+}
+
+/// 阈值按字符数而不是条数：预算装不下下一条就停，第一条无论多长都留下。
+#[test]
+fn preset_budgets_cap_by_characters_not_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for index in 0..5 {
+        kb.memories().upsert(memory(&format!("字符封顶样例 {index} {}", "长".repeat(300)), "public")).unwrap();
+    }
+    let request = |chars| PresetRequest { preset: SearchPreset::Memory, query: "字符封顶样例".into(),
+        budget: PresetBudget { memory_chars: chars, ..Default::default() }, ..Default::default() };
+
+    assert_eq!(kb.search_preset(&request(10_000)).unwrap().memories.len(), 5, "预算够时全部返回");
+    assert_eq!(kb.search_preset(&request(600)).unwrap().memories.len(), 1, "三百多字的正文只装得下一条");
+    assert!(kb.search_preset(&request(0)).unwrap().memories.is_empty(), "预算为 0 就是空");
+}
+
+/// 没有种子实体时图谱那一路空着，记忆那一路照常出结果。
+#[test]
+fn preset_without_seed_entities_keeps_other_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.memories().upsert(memory("只写在记忆里的独有措辞", "public")).unwrap();
+
+    let result = kb.search_preset(&PresetRequest {
+        preset: SearchPreset::Rag, query: "只写在记忆里的独有措辞".into(), ..Default::default()
+    }).unwrap();
+    assert!(result.graph.entities.is_empty() && result.graph.relations.is_empty() && result.graph.context_events.is_empty(),
+        "没有实体命中，图谱那一路整体空着");
+    assert!(!result.memories.is_empty(), "记忆那一路不受影响");
+}

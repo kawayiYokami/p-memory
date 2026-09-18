@@ -32,6 +32,7 @@ flowchart TD
     lib --> notes["notes.rs — 笔记与切片"]
     lib --> embed["embeddings.rs — 向量空间"]
     lib --> search["search.rs — 关键词 / 向量 / RRF"]
+    lib --> preset["preset.rs — 预设检索：库预先配好的搜索方法"]
 
     memory --> storage
     gstore --> storage
@@ -39,6 +40,8 @@ flowchart TD
     embed --> storage
     search --> storage
     search --> index["index.rs — Tantivy 全文投影"]
+    preset --> search
+    preset --> storage
     gstore --> gsearch["graph_search.rs — 内存态图搜索（petgraph）"]
 
     storage["storage.rs — 事务 / 读写 / strings 映射 / 锁 / 备份"]
@@ -60,6 +63,7 @@ flowchart TD
 | `error.rs` | 错误类型与错误码 |
 | `schema.rs` / `schema.sql` | 建表语句、schema 版本、初始化 |
 | `memory.rs` / `graph.rs` / `notes.rs` / `embeddings.rs` / `search.rs` | 五个领域 |
+| `preset.rs` | 预设检索：按预设名组织记忆 / 图谱 / 笔记三路，各自独立排序、各自按字符数封顶 |
 | `index.rs` | Tantivy 全文投影，可重放 |
 | `graph_search.rs` | 内存态图搜索：按 `ReadFilter` 读一次快照建 petgraph 图，补虚拟边与 `sys:same_as` 缩点，用完即弃 |
 | `legacy.rs` | 三来源离线导入 |

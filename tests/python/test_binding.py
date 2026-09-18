@@ -518,3 +518,42 @@ def test_import_legacy_dry_run_then_apply(tmp_path):
 def kb_judgments(kb) -> list[str]:
     """当前 filter 下可见的全部记忆论断，按 id 升序。"""
     return [m["judgment"] for m in kb.memories.list(limit=100)["items"]]
+
+
+# ── 预设检索 ──────────────────────────────────────────────────────────
+
+def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
+    """预设检索：记忆、图谱、笔记各占一个字段，互不混排；图谱走实体 → 关系 → 事件。"""
+    created = kb.graph.apply_batch(entities=[{"name": "朱樱"}, {"name": "白露"},
+                                             {"name": "青萍"}, {"name": "玄霜"}])["value"]["entities"]
+    ids = {item["name"]: item["id"] for item in created}
+    kb.graph.apply_batch(
+        relations=[
+            {"subject_id": ids["朱樱"], "predicate": "同学", "object_id": ids["青萍"]},
+            {"subject_id": ids["白露"], "predicate": "同学", "object_id": ids["玄霜"]},
+            {"subject_id": ids["青萍"], "predicate": "同门", "object_id": ids["玄霜"]},
+        ],
+        events=[
+            {"name": "别鹤典仪", "participants": [ids["朱樱"], ids["青萍"]]},
+            {"name": "堂中自语", "participants": [ids["青萍"]]},
+        ],
+    )
+    kb.memories.upsert({"judgment": "朱樱的同学是青萍"})
+    path = tmp_path / "预设笔记.md"
+    path.write_text("朱樱的同学是青萍" * 20, encoding="utf-8", newline="")
+    kb.notes.upsert_file(path=str(path))
+
+    rag = kb.search_preset("rag", "朱樱和白露的同学是谁")
+    assert kb_judgments(kb) and [item["record"]["judgment"] for item in rag["memories"]], "记忆那一路有结果"
+    assert rag["notes"] == [], "RAG 不出笔记那一路"
+    assert sorted(entity["name"] for entity in rag["graph"]["entities"]) == ["朱樱", "白露"], "命中的实体成为种子"
+    predicates = [relation["predicate"] for relation in rag["graph"]["relations"]]
+    assert predicates.count("同学") == 2, "种子实体各自敲出的同学关系都在结果里"
+    assert [relation["predicate"] for relation in rag["graph"]["context_relations"]] == ["同门"], "两两之间的关系进第三段"
+    assert [event["name"] for event in rag["graph"]["context_events"]] == ["别鹤典仪"], "参与者至少两个才算"
+
+    broad = kb.search_preset("broad", "朱樱和白露的同学是谁")
+    assert broad["memories"] and broad["notes"] and broad["graph"]["entities"], "广撒网三个字段都填"
+
+    memory_only = kb.search_preset("memory", "朱樱和白露的同学是谁")
+    assert memory_only["memories"] and memory_only["notes"] == [] and memory_only["graph"]["entities"] == []

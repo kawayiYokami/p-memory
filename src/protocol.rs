@@ -22,6 +22,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "backup"=>{kb.backup(field::<String>(&args,"path")?)?;Ok(Value::Null)},
         "close"=>{kb.close()?;Ok(Value::Null)},
         "search"=>encode(kb.search(&decode(args)?)?),
+        "preset"=>encode(kb.search_preset(&decode(args)?)?),
         "memories.upsert"=>encode(kb.memories().upsert(decode(args)?)?),
         "memories.upsert_many"=>encode(kb.memories().upsert_many(&decode::<Vec<_>>(args)?)?),
         "memories.upsert_by_judgment"=>encode(kb.memories().upsert_by_judgment(decode(args)?)?),
