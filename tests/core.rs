@@ -576,6 +576,53 @@ fn reranker_reorders_candidates_and_enforces_length_limits() {
 }
 
 #[test]
+fn rerank_consumes_the_merged_paths_before_fusion() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 8);
+    let texts = ["重排合并 甲", "重排合并 乙", "重排合并 丙", "重排合并 丁", "重排合并 戊", "重排合并 己"];
+    let mut id_to_text: BTreeMap<i64, String> = BTreeMap::new();
+    for text in texts {
+        let id = kb.memories().upsert(memory(text, "public")).unwrap().value.header.id;
+        id_to_text.insert(id, text.to_string());
+    }
+    fill(&kb, "v");
+    let kinds = vec![RecordKind::Memory];
+
+    // 两路各自的名次：只走一路、不重排。
+    let text_only = SearchRequest { query: "重排合并".into(), kinds: kinds.clone(), vector: false, rerank: false, limit: 6, ..Default::default() };
+    let text_order: Vec<i64> = kb.search(&text_only).unwrap().hits.iter().map(|hit| hit.key.id).collect();
+    let vector_only = SearchRequest { query: "重排合并".into(), kinds: kinds.clone(), text: false, rerank: false, limit: 6, embed_space: Some("v".into()), ..Default::default() };
+    let vector_order: Vec<i64> = kb.search(&vector_only).unwrap().hits.iter().map(|hit| hit.key.id).collect();
+
+    // 期望：两路名次交替、去重。
+    let mut seen = std::collections::HashSet::new();
+    let mut expected: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < text_order.len() || index < vector_order.len() {
+        if let Some(key) = text_order.get(index) { if seen.insert(*key) { expected.push(id_to_text[key].clone()); } }
+        if let Some(key) = vector_order.get(index) { if seen.insert(*key) { expected.push(id_to_text[key].clone()); } }
+        index += 1;
+    }
+
+    let seen_docs: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen_docs.clone();
+    kb.register_reranker_with(move |_: &str, documents: &[String]| {
+        recorder.lock().unwrap().push(documents.to_vec());
+        Ok(vec![0.0f32; documents.len()])
+    }, RerankerOptions { max_docs: 3, max_tokens_per_doc: 1024, max_tokens_query: None }).unwrap();
+    seen_docs.lock().unwrap().clear(); // 注册校验会先调一次，清掉只留检索那次。
+
+    let result = kb.search(&SearchRequest { query: "重排合并".into(), kinds, limit: 6, embed_space: Some("v".into()), ..Default::default() }).unwrap();
+    assert!(result.diagnostics.reranked);
+    assert_eq!(result.diagnostics.rerank_candidates, 3);
+
+    let seen = seen_docs.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let expected_docs: Vec<String> = expected.into_iter().take(3).collect();
+    assert_eq!(seen[0], expected_docs, "送重排的候选是两路名次交替合并，不是 RRF 截断出来的");
+}
+
+#[test]
 fn reranker_registration_validates_and_failures_degrade() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..3 { kb.memories().upsert(memory(&format!("降级目标 {i}"), "public")).unwrap(); }

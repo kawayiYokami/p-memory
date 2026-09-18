@@ -103,6 +103,20 @@ where F: FnMut(&str, &[String]) -> std::result::Result<Vec<f32>, String> + Send 
 fn default_max_docs() -> usize { 64 }
 fn default_max_tokens_per_doc() -> usize { 1024 }
 
+/// 两路候选按名次交替合并、去重：全文第 0 名、向量第 0 名、全文第 1 名、向量第 1 名……
+/// 用于把两路结果直接交给重排——按 `max_docs` 截断时两路各占约一半名额，不偏向任何一路。
+fn merge_candidates(text: &[(RecordKey, f64)], vector: &[(RecordKey, f64)]) -> Vec<(RecordKey, f64)> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(text.len() + vector.len());
+    let mut index = 0;
+    while index < text.len() || index < vector.len() {
+        if let Some(item) = text.get(index) { if seen.insert(item.0) { merged.push(*item); } }
+        if let Some(item) = vector.get(index) { if seen.insert(item.0) { merged.push(*item); } }
+        index += 1;
+    }
+    merged
+}
+
 /// 宿主注册重排回调时一并声明的定长约束。重排模型普遍有硬上限，
 /// 超出的候选不是变慢就是直接报错，所以库在调用前强制截断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +252,7 @@ impl KnowledgeBase {
         }
         let state = self.read()?;
         let conn = state.conn();
-        let mut scores: BTreeMap<RecordKey, (f64, Option<f64>, BTreeMap<String,f64>)> = BTreeMap::new();
+        let mut text_rank: Vec<(RecordKey, f64)> = Vec::new();
         if request.text {
             let text_hits = match self.search_text(conn, query, &request.filter, &request.kinds, limit) {
                 Ok(hits) => Some(hits),
@@ -254,12 +268,11 @@ impl KnowledgeBase {
                 // 库已关闭是调用错误，不该被降级吞掉。
                 Err(error) => return Err(error),
             };
-            for (rank, (key, score)) in text_hits.unwrap_or_default().into_iter().enumerate() {
-                let hit = scores.entry(key).or_default();
-                hit.0 += request.text_weight / (60.0 + (rank + 1) as f64); hit.1 = Some(score);
-            }
+            text_rank = text_hits.unwrap_or_default();
             diagnostics.text_used = true;
         }
+        let mut vector_rank: Vec<(RecordKey, f64)> = Vec::new();
+        let mut vector_space_id: Option<String> = None;
         if let Some((space, vector)) = &embedded_query {
             // 分区键与载入查询同源：都用归一化后的 namespace / scope，避免大小写差异导致重复分区。
             let namespace = text::normalized_tag(&request.filter.namespace);
@@ -274,22 +287,36 @@ impl KnowledgeBase {
             scored.sort_by(|a,b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             scored.truncate(limit);
             diagnostics.vector_used = true;
-            for (rank, (key, score)) in scored.into_iter().enumerate() {
-                let hit = scores.entry(key).or_default();
-                hit.0 += 1.0 / (60.0 + (rank + 1) as f64); hit.2.insert(space.id.clone(), score);
+            vector_space_id = Some(space.id.clone());
+            vector_rank = scored;
+        }
+        // 两路各自的分数与 RRF 融合分：融合分只用来充当 `score` 字段与「没法重排」时的兜底排序，
+        // 重排可用时它不参与候选取舍，也不参与名次决定。
+        let mut scores: BTreeMap<RecordKey, (f64, Option<f64>, BTreeMap<String,f64>)> = BTreeMap::new();
+        for (rank, (key, score)) in text_rank.iter().enumerate() {
+            let hit = scores.entry(*key).or_default();
+            hit.0 += request.text_weight / (60.0 + (rank + 1) as f64); hit.1 = Some(*score);
+        }
+        if let Some(space_id) = &vector_space_id {
+            for (rank, (key, score)) in vector_rank.iter().enumerate() {
+                let hit = scores.entry(*key).or_default();
+                hit.0 += 1.0 / (60.0 + (rank + 1) as f64); hit.2.insert(space_id.clone(), *score);
             }
         }
         let total = if request.with_total { Some(storage::count_matches(conn, &request.filter, &request.kinds)?) } else { None };
-        let mut ranked: Vec<_> = scores.into_iter().collect();
-        ranked.sort_by(|a,b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
         let mut rerank_scores: BTreeMap<RecordKey, f64> = BTreeMap::new();
+        // 重排可用：两路候选交替合并、截到 max_docs 直接送重排，融合分不参与这一步。
+        // 重排不可用（未注册回调、本次关了、产出不符）：退回按融合分排序。
+        let mut ranked: Vec<(RecordKey, (f64, Option<f64>, BTreeMap<String,f64>))> = Vec::new();
+        let mut reranked = false;
         if request.rerank {
             if let Some(entry) = self.engine.rerankers.get() {
                 let options = entry.lock().options;
-                // 定长约束由库强制执行：超出 max_docs 的候选按融合顺序截掉，详情见诊断输出。
-                let truncated = ranked.len().saturating_sub(options.max_docs);
-                ranked.truncate(options.max_docs);
-                let ids: Vec<i64> = ranked.iter().map(|(key, _)| key.id).collect();
+                // 定长约束由库强制执行：候选按两路合并顺序截到 max_docs，详情见诊断输出。
+                let order = merge_candidates(&text_rank, &vector_rank);
+                let truncated = order.len().saturating_sub(options.max_docs);
+                let candidates: Vec<RecordKey> = order.iter().take(options.max_docs).map(|(key, _)| *key).collect();
+                let ids: Vec<i64> = candidates.iter().map(|key| key.id).collect();
                 // 候选正文取自索引的 stored 字段（切片正文在这里）；索引不可用时退回按 payload 现算。
                 // 候选正文只存在索引里：取不到（索引不可用）就按融合分排序，标记降级。
                 let bodies = match self.index() { Ok(index) => index.bodies(&ids)?, Err(_) => BTreeMap::new() };
@@ -302,19 +329,25 @@ impl KnowledgeBase {
                 diagnostics.rerank_candidates = documents.len();
                 diagnostics.rerank_truncated = truncated;
                 match produced {
-                    Ok(values) if values.len() == ranked.len() && values.iter().all(|value| value.is_finite()) => {
-                        let mut pairs: Vec<((RecordKey, _), f32)> = ranked.into_iter().zip(values).collect();
-                        pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.0.cmp(&b.0.0)));
+                    Ok(values) if values.len() == ids.len() && values.iter().all(|value| value.is_finite()) => {
+                        let mut pairs: Vec<(RecordKey, f32)> = candidates.into_iter().zip(values).collect();
+                        pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                         ranked = Vec::with_capacity(pairs.len());
-                        for (entry, score) in pairs {
-                            rerank_scores.insert(entry.0, f64::from(score));
-                            ranked.push(entry);
+                        for (key, score) in pairs {
+                            rerank_scores.insert(key, f64::from(score));
+                            if let Some(entry) = scores.remove(&key) { ranked.push((key, entry)); }
                         }
                         diagnostics.reranked = true;
+                        reranked = true;
                     }
+                    // 重排产出不符：退回按融合分排序，且对完整候选集排序。
                     _ => diagnostics.degraded.push(Degrade::RerankFailed),
                 }
             }
+        }
+        if !reranked {
+            ranked = scores.into_iter().collect();
+            ranked.sort_by(|a,b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
         }
         ranked.truncate(request.limit);
         // 一次批量取回全部命中本体：`load_many` 的语义等同于逐条 `get`（同样的过滤、同样的装配），
