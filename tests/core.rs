@@ -642,6 +642,24 @@ fn rerank_failure_falls_back_to_the_full_candidate_set() {
 }
 
 #[test]
+fn rerank_is_not_called_when_there_are_no_candidates() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.memories().upsert(memory("无关内容", "public")).unwrap();
+    // 候选为空时不该调模型：空文档列表对多数重排服务是无效请求，会误标降级。
+    let calls = Arc::new(Mutex::new(0usize));
+    let recorder = calls.clone();
+    kb.register_reranker(move |_: &str, documents: &[String]| {
+        *recorder.lock().unwrap() += 1;
+        Ok(vec![0.0f32; documents.len()])
+    }).unwrap();
+    *calls.lock().unwrap() = 0; // 注册校验会先调一次，清掉。
+    let result = kb.search(&SearchRequest { query: "查不到的词".into(), kinds: vec![RecordKind::Memory], vector: false, ..Default::default() }).unwrap();
+    assert!(result.hits.is_empty());
+    assert_eq!(*calls.lock().unwrap(), 0, "没有候选就不该调重排回调");
+    assert!(!result.diagnostics.degraded.contains(&Degrade::RerankFailed));
+}
+
+#[test]
 fn reranker_registration_validates_and_failures_degrade() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..3 { kb.memories().upsert(memory(&format!("降级目标 {i}"), "public")).unwrap(); }

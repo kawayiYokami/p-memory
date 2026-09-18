@@ -317,16 +317,20 @@ impl KnowledgeBase {
                 let truncated = order.len().saturating_sub(options.max_docs);
                 let candidates: Vec<RecordKey> = order.iter().take(options.max_docs).map(|(key, _)| *key).collect();
                 let ids: Vec<i64> = candidates.iter().map(|key| key.id).collect();
-                // 候选正文取自索引的 stored 字段（切片正文在这里）；索引不可用时退回按 payload 现算。
-                // 候选正文只存在索引里：取不到（索引不可用）就按融合分排序，标记降级。
-                let bodies = match self.index() { Ok(index) => index.bodies(&ids)?, Err(_) => BTreeMap::new() };
-                let documents: Vec<String> = ids.iter()
-                    .map(|id| bodies.get(id).map(String::as_str).unwrap_or(""))
-                    .map(|body| text::truncate_to_tokens(body, options.max_tokens_per_doc))
-                    .collect();
-                let budgeted_query = options.max_tokens_query.map(|budget| text::truncate_to_tokens(query, budget)).unwrap_or_else(|| query.to_string());
-                let produced = { let mut guard = entry.lock(); guard.reranker.rerank(&budgeted_query, &documents) };
-                diagnostics.rerank_candidates = documents.len();
+                // 没有候选就不必调模型：多数重排服务把空文档列表当无效请求，会误标降级。
+                let produced = if ids.is_empty() { Ok(Vec::new()) }
+                else {
+                    // 候选正文取自索引的 stored 字段（切片正文在这里）。
+                    let bodies = match self.index() { Ok(index) => index.bodies(&ids)?, Err(_) => BTreeMap::new() };
+                    let documents: Vec<String> = ids.iter()
+                        .map(|id| bodies.get(id).map(String::as_str).unwrap_or(""))
+                        .map(|body| text::truncate_to_tokens(body, options.max_tokens_per_doc))
+                        .collect();
+                    let budgeted_query = options.max_tokens_query.map(|budget| text::truncate_to_tokens(query, budget)).unwrap_or_else(|| query.to_string());
+                    let produced = { let mut guard = entry.lock(); guard.reranker.rerank(&budgeted_query, &documents) };
+                    diagnostics.rerank_candidates = documents.len();
+                    produced
+                };
                 diagnostics.rerank_truncated = truncated;
                 match produced {
                     Ok(values) if values.len() == ids.len() && values.iter().all(|value| value.is_finite()) => {
