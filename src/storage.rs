@@ -681,6 +681,21 @@ pub(crate) fn record_name(kind: RecordKind, payload: &Value) -> String {
     }
 }
 
+/// 一批记录里属于实体的那些的规范名（按 record_id）。重排取文档时用：正文列已不含规范名，
+/// 纯名实体（别名、摘要、属性全空）的正文是空串，得把规范名拼回去才能让重排看到名字。
+pub(crate) fn entity_names(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() { return Ok(out); }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let mut stmt = conn.prepare(&format!("SELECT record_id,name FROM entities WHERE record_id IN ({placeholders})"))?;
+    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, name) = row?;
+        out.insert(id, name);
+    }
+    Ok(out)
+}
+
 fn name_list(payload: &Value) -> String {
     payload.get("participant_names").and_then(Value::as_array)
         .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))

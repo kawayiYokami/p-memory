@@ -1530,6 +1530,32 @@ fn entity_name_column_outweighs_long_body() {
     assert!(hits.iter().any(|hit| hit.key.id == noise));
 }
 
+/// 实体的规范名要进重排文档：正文列不含规范名，纯名实体的正文是空串；
+/// 重排若只拿到正文，就等于收到空文档、无从判断。
+#[test]
+fn entity_name_reaches_the_rerank_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.graph().apply_batch(&GraphBatch { entities: vec![entity("孤名实体")], ..Default::default() }).unwrap();
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    kb.register_reranker_with(move |_: &str, documents: &[String]| {
+        recorder.lock().unwrap().extend(documents.iter().cloned());
+        Ok(vec![1.0f32; documents.len()])
+    }, RerankerOptions::default()).unwrap();
+    // 注册校验已调用过回调一次，清掉只留检索那次。
+    seen.lock().unwrap().clear();
+
+    let request = SearchRequest { query: "孤名实体".into(), kinds: vec![RecordKind::Entity],
+        text: true, vector: false, rerank: true, ..Default::default() };
+    let hits = kb.search(&request).unwrap().hits;
+    assert!(!hits.is_empty(), "纯名实体靠名字列也该被召回");
+    let documents = seen.lock().unwrap().clone();
+    assert!(documents.iter().any(|doc| doc.contains("孤名实体")),
+        "实体的规范名必须出现在重排文档里，实收 {documents:?}");
+}
+
 /// 谓词等价词：登记后可列出、可扩散，按领域隔离；没登记就是空。
 #[test]
 fn predicate_equivalents_register_list_and_expand_per_domain() {

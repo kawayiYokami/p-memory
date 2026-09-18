@@ -322,11 +322,19 @@ impl KnowledgeBase {
                 // 没有候选就不必调模型：多数重排服务把空文档列表当无效请求，会误标降级。
                 let produced = if ids.is_empty() { Ok(Vec::new()) }
                 else {
-                    // 候选正文取自索引的 stored 字段（切片正文在这里）。
+                    // 候选正文取自索引的 stored 字段（切片正文在这里）。实体的正文列不含规范名，
+                    // 这里给实体把规范名拼在正文前——否则纯名实体送到重排的文档是空的，等于没内容可判。
                     let bodies = match self.index() { Ok(index) => index.bodies(&ids)?, Err(_) => BTreeMap::new() };
+                    let names = storage::entity_names(conn, &ids).unwrap_or_default();
                     let documents: Vec<String> = ids.iter()
-                        .map(|id| bodies.get(id).map(String::as_str).unwrap_or(""))
-                        .map(|body| text::truncate_to_tokens(body, options.max_tokens_per_doc))
+                        .map(|id| {
+                            let body = bodies.get(id).map(String::as_str).unwrap_or("");
+                            match names.get(id).filter(|name| !name.is_empty()) {
+                                Some(name) => format!("{name} {body}"),
+                                None => body.to_string(),
+                            }
+                        })
+                        .map(|document| text::truncate_to_tokens(&document, options.max_tokens_per_doc))
                         .collect();
                     let budgeted_query = options.max_tokens_query.map(|budget| text::truncate_to_tokens(query, budget)).unwrap_or_else(|| query.to_string());
                     let produced = { let mut guard = entry.lock(); guard.reranker.rerank(&budgeted_query, &documents) };
