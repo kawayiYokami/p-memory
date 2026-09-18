@@ -623,6 +623,25 @@ fn rerank_consumes_the_merged_paths_before_fusion() {
 }
 
 #[test]
+fn rerank_failure_falls_back_to_the_full_candidate_set() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    for tag in ["甲", "乙", "丙", "丁", "戊"] { kb.memories().upsert(memory(&format!("兜底目标 {tag}"), "public")).unwrap(); }
+    let request = SearchRequest { query: "兜底目标".into(), kinds: vec![RecordKind::Memory], vector: false, limit: 5, ..Default::default() };
+    let baseline: Vec<i64> = kb.search(&SearchRequest { rerank: false, ..request.clone() }).unwrap().hits.iter().map(|hit| hit.key.id).collect();
+    assert_eq!(baseline.len(), 5);
+
+    // 重排回调报错、且 max_docs 小于候选数：兜底必须对完整候选集按融合分排序，
+    // 而不是只返回被 max_docs 截断过的那几条。
+    kb.register_reranker_with(|_: &str, _: &[String]| Err("重排服务不可用".to_string()),
+        RerankerOptions { max_docs: 2, max_tokens_per_doc: 1024, max_tokens_query: None }).unwrap();
+    let result = kb.search(&request).unwrap();
+    assert!(!result.diagnostics.reranked);
+    assert!(result.diagnostics.degraded.contains(&Degrade::RerankFailed));
+    assert_eq!(result.diagnostics.rerank_truncated, 3);
+    assert_eq!(result.hits.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), baseline, "重排挂了也要给出完整的融合排序结果");
+}
+
+#[test]
 fn reranker_registration_validates_and_failures_degrade() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..3 { kb.memories().upsert(memory(&format!("降级目标 {i}"), "public")).unwrap(); }

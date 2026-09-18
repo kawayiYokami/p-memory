@@ -347,7 +347,7 @@ def test_vectorization_targets_are_independent(kb, tmp_path):
 
 
 def test_reranker_reorders_and_reports_diagnostics(kb):
-    """重排回调在融合之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
+    """重排回调在两路候选合并之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
     for i in range(4):
         kb.memories.upsert_by_judgment(judgment=f"重排对象 {i}")
 
