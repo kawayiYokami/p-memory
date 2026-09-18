@@ -195,11 +195,15 @@ impl KnowledgeBase {
         let loaded: BTreeMap<i64, Entity> = storage::load_many(conn, &seeds, &entity_filter)?;
         let entities: Vec<Entity> = seeds.iter().filter_map(|id| loaded.get(id).cloned()).collect();
 
-        // 第二步：种子实体各自到「以它为端点」的关系里敲查询词，命中的留下并按相关度排。
+        // 第二步：种子实体各自到「以它为端点」的关系里敲词，命中的留下并按相关度排。
+        // 敲的是「查询去掉实体名（连别名）之后的剩余词」——关系正文里本来就写着主语名，
+        // 拿实体名去敲几乎恒真、等于空转，还会把与谓词无关的关系带进来。剩余为空表示查询
+        // 就是实体名本身、没有谓词可敲，此时不筛，保留种子的全部端点关系。
         let candidate_ids = incident_relations(conn, &seeds, &request.filter)?;
         let candidates = storage::record_values(conn, &candidate_ids)?;
-        // 与全文路同一套扩散：关系正文里写「丈夫」时，查询「艾莉儿的老公」也能敲中。
-        let graph_query = crate::graph::match_predicate_synonyms(conn, &request.filter.namespace, query)?;
+        // 与全文路同一套扩散：剩余词里写「老公」时，也带上「丈夫」这一类同义谓词。
+        let remainder = remaining_query_after_entities(query, &entities);
+        let graph_query = crate::graph::match_predicate_synonyms(conn, &request.filter.namespace, &remainder)?;
         let ranked = rank_relations_by_query(&candidates, &graph_query);
         let hit_ids = truncate_values_by_chars(&candidates, &ranked, RecordKind::Relation, request.budget.graph_relations_chars);
         let relations: Vec<Relation> = decode_all(&candidates, &hit_ids)?;
@@ -247,6 +251,20 @@ fn token_weight(body: &str, tokens: &[String]) -> usize {
     tokens.iter().map(|token| {
         if !present.contains(token) { 0 } else if token.chars().count() > 1 { 2 } else { 1 }
     }).sum()
+}
+
+/// 第二步要敲的词：查询里去掉种子实体名（连别名）之后的剩余部分。
+/// 关系正文里本就写着主语名，拿实体名去敲几乎恒真、等于空转，去掉后剩下的才是真正的谓词线索。
+/// 名字或别名没出现在查询里时不改动。剩余为空（查询本身就是实体名）时返回空串，
+/// 交给 `rank_relations_by_query` 按「无词元即不筛」处理。
+fn remaining_query_after_entities(query: &str, entities: &[Entity]) -> String {
+    let mut remainder = query.to_string();
+    for entity in entities {
+        for term in std::iter::once(&entity.name).chain(entity.aliases.iter()) {
+            if !term.is_empty() { remainder = remainder.replace(term.as_str(), " "); }
+        }
+    }
+    remainder
 }
 
 /// 第二步的排序：命中权重高的在前，同权重按记录 id 升序，保证结果稳定。

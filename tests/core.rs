@@ -1431,6 +1431,10 @@ fn preset_graph_walks_entities_then_relations_then_events() {
         .map(|relation| (relation.subject_id, relation.predicate.clone(), relation.object_id)).collect();
     assert!(hits.contains(&(id("朱樱"), "同学".into(), id("青萍"))), "朱樱那边的同学关系是结果");
     assert!(hits.contains(&(id("白露"), "同学".into(), id("玄霜"))), "白露那边的同学关系是结果");
+    // 第二步敲的是「去掉实体名后的剩余词」：查询去掉朱樱、白露后只剩「的同学是谁」，
+    // 「客卿于」这条与剩余词无关，不该仅因正文里写着「朱樱」就被留下。
+    assert!(!hits.iter().any(|(_, predicate, _)| predicate == "客卿于"),
+        "与剩余词无关的关系不该进第二步结果");
 
     // 第三步：实体集合两两之间的关系与事件，不筛。
     let context: Vec<String> = result.graph.context_relations.iter().map(|relation| relation.predicate.clone()).collect();
@@ -1442,6 +1446,58 @@ fn preset_graph_walks_entities_then_relations_then_events() {
     // 记忆那一路独立出结果，字段不混。
     assert!(result.memories.iter().any(|hit| hit.record["judgment"].as_str().unwrap_or_default().contains("朱樱的同学")));
     assert!(result.notes.is_empty(), "RAG 不出笔记那一路");
+}
+
+/// 查询词本身就是一个实体名时，「去掉实体名后的剩余词」为空：不筛，保留它的全部端点关系。
+#[test]
+fn preset_graph_keeps_all_incident_relations_for_a_pure_name_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let created = kb.graph().apply_batch(&GraphBatch {
+        entities: vec![entity("墨团"), entity("派罗"), entity("月裔")], ..Default::default()
+    }).unwrap().value;
+    let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
+    kb.graph().apply_batch(&GraphBatch {
+        relations: vec![
+            relation_of(id("墨团"), "朋友", id("派罗")),
+            relation_of(id("墨团"), "隶属于", id("月裔")),
+        ], ..Default::default()
+    }).unwrap();
+
+    let result = kb.search_preset(&PresetRequest {
+        preset: SearchPreset::Graph, query: "墨团".into(), ..Default::default()
+    }).unwrap();
+    let predicates: Vec<&str> = result.graph.relations.iter().map(|r| r.predicate.as_str()).collect();
+    assert!(predicates.contains(&"朋友"), "剩余词为空时墨团的朋友关系不该被筛掉");
+    assert!(predicates.contains(&"隶属于"), "剩余词为空时墨团的隶属关系不该被筛掉");
+}
+
+/// 第二步的扩散：剩余词里的谓词是等价词时，也能召回关系正文里的另一种写法。
+#[test]
+fn preset_graph_step2_expands_the_remainder_with_predicate_synonyms() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let created = kb.graph().apply_batch(&GraphBatch {
+        entities: vec![entity("艾莉儿"), entity("克劳斯")], ..Default::default()
+    }).unwrap().value;
+    let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
+    kb.graph().apply_batch(&GraphBatch {
+        relations: vec![relation_of(id("克劳斯"), "丈夫", id("艾莉儿"))], ..Default::default()
+    }).unwrap();
+
+    // 没登记等价词：剩余词「老公」敲不到正文里的「丈夫」。
+    let before = kb.search_preset(&PresetRequest {
+        preset: SearchPreset::Graph, query: "艾莉儿的老公".into(), ..Default::default()
+    }).unwrap();
+    assert!(!before.graph.relations.iter().any(|r| r.predicate == "丈夫"), "没登记等价词时敲不到另一写法");
+
+    // 登记「丈夫=老公」后，剩余词扩散带上「丈夫」，关系被第二步召回。
+    kb.graph().set_predicate_equivalents("default", &[vec!["丈夫".into(), "老公".into()]]).unwrap();
+    let after = kb.search_preset(&PresetRequest {
+        preset: SearchPreset::Graph, query: "艾莉儿的老公".into(), ..Default::default()
+    }).unwrap();
+    assert!(after.graph.relations.iter().any(|r| r.predicate == "丈夫"),
+        "登记等价词后「老公」扩散出「丈夫」，关系应被第二步召回");
 }
 
 /// 单路预设只填自己那一个字段；广撒网三个字段都填。
