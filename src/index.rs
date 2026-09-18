@@ -6,13 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
-    query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
+    query::{BoostQuery, BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v6";
+const FORMAT: &str = "p-memory-text-v7";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, body: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, body: Field }
+
+/// 名字字段命中时的固定加权：名字是实体的规范名，比正文里的同名提及更该决定这条记录的相关度。
+const NAME_FIELD_BOOST: f32 = 3.0;
 
 /// 一条要写进索引的记录：正文、标签全部由写入流程就地提供。
 /// 写入时读一次源文件、切一次，切片正文一路带到这里，索引阶段不再回头读文件。
@@ -23,6 +26,8 @@ pub(crate) struct IndexDocument {
     pub kind: RecordKind,
     /// 正文列：这条记录自己的文本。记忆是 judgment，切片是它那一段。笔记不进索引。
     pub text: String,
+    /// 实体规范名：单独一列，检索时按 `NAME_FIELD_BOOST` 加权。其它记录为空串、不写这一列。
+    pub name: String,
     /// 拼在可搜正文前面的标签集（空格连接，空串表示不带）。索引里没有单独的标签文本列：
     /// 标签只有承载它的那一条带——切片是第一片，其余记录是它自己；取值规则见 `storage::tags_prefix`。
     pub tags_prefix: String,
@@ -64,6 +69,8 @@ impl TextIndex {
             // 正文列：唯一承载「这条记录讲了什么」的列，也是相关性打分的主力。
             // 标签集拼在承载它的那一条的正文前面，与正文同列、同长度、共同参与打分。
             text: builder.add_text_field("text", tokenized()),
+            // 实体规范名单独一列：与正文分开，检索时按固定倍数加权，抵消长正文对名字的分摊。
+            name: builder.add_text_field("name", tokenized()),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
             body: builder.add_text_field("body", STORED),
         };
@@ -123,6 +130,7 @@ impl TextIndex {
             else { format!("{}\n{}", item.tags_prefix, item.text) };
         let cleaned = text::clean_markdown(&searchable);
         if !cleaned.is_empty() { document.add_text(self.fields.text, text::tokenize(&cleaned).join(" ")); }
+        if !item.name.is_empty() { document.add_text(self.fields.name, text::tokenize(&item.name).join(" ")); }
         writer.add_document(document)?;
         Ok(())
     }
@@ -193,6 +201,7 @@ impl TextIndex {
             let pairs = storage::record_tag_pairs(conn, id).unwrap_or_default();
             let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
             documents.push(IndexDocument { id, namespace_id, scope_id, kind, text,
+                name: storage::record_name(kind, &payload),
                 tags_prefix: storage::tags_prefix(kind, &tags, &payload),
                 tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
@@ -225,8 +234,16 @@ impl TextIndex {
 
     fn filtered_query(&self, tokens: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
         let occurrence = if strict { Occur::Must } else { Occur::Should };
-        // 相关性只有正文这一层：标签文本已经拼在承载它的那条正文里，不再单独成列。
-        let relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
+        // 正文层决定「命中」：strict 轮要求全部词元命中，放宽轮命中一个即可。
+        let body_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
+        // 名字层只负责抬分：与正文层同处一个 BooleanQuery，正文层是 Must、名字层是 Should，
+        // 因此名字命中只加分、不改变「必须命中正文」这个必要条件。实体名单独成列、长度均匀，
+        // 加权后不会被它的别名与属性摊薄；其它记录的 name 列为空，天然不参与。
+        let name_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.name, token, Occur::Should)).collect());
+        let relevance = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(body_relevance) as Box<dyn Query>),
+            (Occur::Should, Box::new(BoostQuery::new(Box::new(name_relevance), NAME_FIELD_BOOST)) as Box<dyn Query>),
+        ]);
         // 相关性这层只放 Should，所以至少要命中一个词元才算相关，过滤维度另起一层放 Must。
         // 两层不能合并：同一层里一旦存在 Must，全部 Should 都会降级为「有则加分、无也无妨」，
         // 正文条件就形同虚设，检索退化成「只按过滤条件取记录」——

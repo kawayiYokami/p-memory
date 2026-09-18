@@ -462,7 +462,7 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     // 索引文档就地拼好交回调用方：正文来自本次写入手上的那一份，索引阶段不再回源。
     // 标记一律带整数 id 给索引：namespace、scope、kind、tags 都不写第二份文本。
     let document = crate::index::IndexDocument { id, namespace_id, scope_id, kind,
-        text: text.to_string(), tags_prefix: tags_prefix(kind, &tags, payload), tag_ids };
+        text: text.to_string(), name: record_name(kind, payload), tags_prefix: tags_prefix(kind, &tags, payload), tag_ids };
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
@@ -501,6 +501,7 @@ pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text:
     let pairs = record_tag_pairs(conn, id)?;
     let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
     Ok(crate::index::IndexDocument { id, namespace_id, scope_id, kind, text,
+        name: record_name(kind, &payload),
         tags_prefix: tags_prefix(kind, &tags, &payload),
         tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() })
 }
@@ -668,6 +669,14 @@ pub(crate) fn record_text(kind: RecordKind, payload: &Value) -> String {
         RecordKind::Event => format!("{} {} {} {}", field("name"), field("summary"), name_list(payload), field("reason")),
         // 笔记与切片的正文另有来源：笔记的检索面交给切片，切片正文由写入流程就地提供。
         RecordKind::Note | RecordKind::Chunk => String::new(),
+    }
+}
+
+/// 记录的名字列内容：只有实体有规范名，其它记录为空串（检索时该列不参与）。
+pub(crate) fn record_name(kind: RecordKind, payload: &Value) -> String {
+    match kind {
+        RecordKind::Entity => payload.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => String::new(),
     }
 }
 

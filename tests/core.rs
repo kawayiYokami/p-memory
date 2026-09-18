@@ -1504,3 +1504,28 @@ fn preset_without_seed_entities_keeps_other_routes() {
         "没有实体命中，图谱那一路整体空着");
     assert!(!result.memories.is_empty(), "记忆那一路不受影响");
 }
+
+/// 实体规范名单独成列并按固定倍数加权：名字命中的实体要压过「正文里堆词频」的干扰实体。
+#[test]
+fn entity_name_column_outweighs_long_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    // 正主：规范名就是查询词，正文只有名字本身。
+    let target = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("苹果")], ..Default::default() })
+        .unwrap().value.entities[0].header.id;
+    // 干扰：规范名与查询无关，但别名与属性里反复出现查询词——纯 BM25 下它靠词频与短正文领先。
+    let mut noisy = entity("香蕉");
+    noisy.aliases = vec!["苹果".into()];
+    for key in ["别称", "俗称", "外号"] {
+        noisy.attributes.insert(key.into(), vec!["苹果".into(), "苹果".into(), "苹果".into()]);
+    }
+    let noise = kb.graph().apply_batch(&GraphBatch { entities: vec![noisy], ..Default::default() })
+        .unwrap().value.entities[0].header.id;
+
+    let req = SearchRequest { query: "苹果".into(), kinds: vec![RecordKind::Entity],
+        text: true, vector: false, rerank: false, ..Default::default() };
+    let hits = kb.search(&req).unwrap().hits;
+    assert!(hits.len() >= 2, "两条都该被召回");
+    assert_eq!(hits[0].key.id, target, "规范名命中应压过长正文里堆起来的词频");
+    assert!(hits.iter().any(|hit| hit.key.id == noise));
+}

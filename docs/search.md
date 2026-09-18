@@ -108,9 +108,10 @@ flowchart LR
 | 严格 | 全部词项 `Must` 命中 | 精确匹配优先 |
 | 宽松 | 词项 `Should` 命中 | 补充召回 |
 
-结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（`body` 列照旧保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/text/body`：
+结果合并时**严格轮优先**：先取严格命中，再用宽松结果补齐未出现的记录，最后按组内分数与 `key` 排序。写入索引前，文本先经统一的 `clean_markdown` 清洗掉标记符（`body` 列照旧保留原文）。索引侧 schema 为 `key/namespace/scope/kind/tags/text/name/body`：
 
 - `text`（正文列）：这条记录自己的文本——记忆是 `judgment`，切片是它那一段；承载标签的那一条（切片是第一片，其余记录是它自己）前面还拼着空格连接的标签集。用预切分的空白分词器（`pretokenized`）承担 1+2 分词召回。
+- `name`（名字列）：只有实体的规范名进来，其它记录为空、不写这一列。实体名本来也会拼进 `text`，与别名、属性同处一列；名字短、正文长，BM25 的长度归一化会把名字那几字的分摊薄。单列之后查询侧对名字列命中按固定倍数（`NAME_FIELD_BOOST = 3.0`）加权，名字层放 `Should`、只加分不改「必须命中正文」这个必要条件。它治的是「正主被自己的别名与属性挤下去」这一类。
 - `tags`（标签 id 列）：整数多值，只用来按标签过滤，不参与打分。
 - `namespace` / `scope` / `kind`：一律存 `strings` 表的整数 id，索引里不留第二份标记文本。折算在进索引之前做完；filter 里的文本换不到 id，说明库里没有这个标记，本次不可能有命中，直接给空结果，不必进索引碰。
 - `body`：正文原值（stored），供重排取候选正文与命中回读；库里不留正文副本，取正文只走这一列。它不带标签——标签只拼进可搜的那份文本。
@@ -231,5 +232,5 @@ struct GraphSection {
 - `index_updates` 是待提交信号：写入事务里登记 `(revision, record_id)`，同一个调用把文档写进索引 writer。`update_index` 一趟提交、把 `indexed_revision` 记到本次实际覆盖的最大 revision，并删掉已覆盖的队列行。
 - 索引目录损坏时**隔离并重建**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再新建空索引，权威数据库不受影响。
 - 检索前若还有待处理更新，会先提交一次，保证结果与已提交数据一致。
-- 索引提交带 payload `p-memory-text-v6:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
+- 索引提交带 payload `p-memory-text-v7:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
 - 重建是唯一回读源文件的路径：切片正文没有第二份副本，按同一套切分规则重新读文件切一遍，文件缺失的那批切片正文退化为空。
