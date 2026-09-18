@@ -24,6 +24,9 @@ SQLite（权威）→ build_graph(filter) 读快照 → petgraph 图 → 跑算�
 | `kb.graph().path(from, to, &filter)` | 桥接路径（Entity 级） | 同上 |
 | `kb.graph().strongly_connected(&filter)` | 强连通环（只返回大小 > 1） | `tarjan_scc` |
 | `kb.graph().set_predicate_rule(pred, inverse, symmetric)` | 登记对称/逆谓词元规则，供建图时内存补边 | — |
+| `kb.graph().set_predicate_equivalents(namespace, groups)` | 按领域登记谓词等价组（上游提供，持久化） | — |
+| `kb.graph().predicate_equivalents(namespace)` | 列出已登记的等价组 | — |
+| `kb.graph().expand_query(namespace, text)` | 查询期扩散：返回该补进的同义补充词 | — |
 
 图范围由 `ReadFilter` 决定（namespace / scope / tag），跨命名空间不会串图。`build_graph` 每次调用重建——图变了无需失效逻辑；小图重建毫秒级。
 

@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 9;
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -29,6 +29,17 @@ CREATE TABLE namespace_roots (
     namespace_id INTEGER PRIMARY KEY REFERENCES strings(id) ON DELETE CASCADE,
     root TEXT NOT NULL
 );
+";
+
+/// v9 -> v10：谓词等价词表。表由上游按领域登记、库不内置数据，迁移只建表、不动数据。
+const MIGRATION_9_TO_10: &str = "
+CREATE TABLE predicate_equivalents (
+    namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    predicate_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    canonical_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    PRIMARY KEY (namespace_id, predicate_id)
+);
+CREATE INDEX predicate_equivalents_group ON predicate_equivalents(namespace_id, canonical_id);
 ";
 
 /// 把切片 payload 里的若干键摘掉。切片正文只在索里存一份，库内副本一律不要。
@@ -146,6 +157,8 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             7 => { strip_chunk_payload_keys(&tx, &["char_start", "char_end"])?; }
             // v8 -> v9：知识领域的笔记根目录表。
             8 => { tx.execute_batch(MIGRATION_8_TO_9)?; }
+            // v9 -> v10：谓词等价词表。
+            9 => { tx.execute_batch(MIGRATION_9_TO_10)?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -185,6 +198,10 @@ mod tests {
         if version < 9 {
             conn.execute_batch("DROP TABLE namespace_roots;").unwrap();
         }
+        // v10 之前没有谓词等价词表；回退到旧版本时删掉，供 v9→v10 迁移验证。
+        if version < 10 {
+            conn.execute_batch("DROP TABLE predicate_equivalents;").unwrap();
+        }
         conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
     }
@@ -218,6 +235,18 @@ mod tests {
         assert!(kb.notes().root("default").unwrap().is_none(), "旧库没有登记过根目录");
         kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
         assert!(kb.notes().root("default").unwrap().is_some());
+    }
+
+    /// v9 形态的库前滚到当前版本：新增谓词等价词表，登记与扩散立刻可用。
+    #[test]
+    fn rolls_v9_forward_adding_predicate_equivalents() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_db(dir.path(), 9, "");
+        let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
+        assert!(kb.graph().predicate_equivalents("gi").unwrap().is_empty(), "旧库没登记过等价词");
+        kb.graph().set_predicate_equivalents("gi", &[vec!["丈夫".into(), "老公".into()]]).unwrap();
+        assert_eq!(kb.graph().predicate_equivalents("gi").unwrap().len(), 1, "迁移后新表可用");
     }
 
     /// v4 形态的笔记 + 切片（带 content 与两条派生列）前滚到当前版本：

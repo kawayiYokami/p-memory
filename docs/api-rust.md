@@ -172,6 +172,9 @@ impl GraphStore {
     fn path(&self, from: i64, to: i64, filter: &ReadFilter) -> Result<Option<Vec<Entity>>>;
     fn strongly_connected(&self, filter: &ReadFilter) -> Result<Vec<Vec<i64>>>;
     fn set_predicate_rule(&self, predicate: &str, inverse: Option<&str>, symmetric: bool) -> Result<WriteReceipt<()>>;
+    fn set_predicate_equivalents(&self, namespace: &str, groups: &[Vec<String>]) -> Result<WriteReceipt<usize>>;
+    fn predicate_equivalents(&self, namespace: &str) -> Result<Vec<Vec<String>>>;
+    fn expand_query(&self, namespace: &str, text: &str) -> Result<Vec<String>>;
 }
 
 // p_memory::graph_search::GraphView
@@ -190,6 +193,9 @@ impl GraphView {
 - `component_count`：连通分量数量（`connected_components`，按无向方式算）。
 - `strongly_connected`：**有向**强连通环（`tarjan_scc`），只返回大小 > 1 的分量，元素为 `record_id`。
 - `set_predicate_rule`：登记谓词元规则——`symmetric` 声明对称谓词（反向即自身），`inverse` 声明逆谓词（反向补一条对偶边，如 `父亲` 的逆是 `子女`），二者互斥。规则只影响后续建图的内存补边。内置 `sys:same_as` 为对称关系。
+- `set_predicate_equivalents`：按知识领域登记谓词等价组（如 `[["丈夫","老公","夫君"]]`），组内第一个是规范词。表由上游提供、库不内置领域数据，登记后持久化；同一个词重复登记会改写它的归属。只管同义，与 `set_predicate_rule` 的方向规则是不同维度。
+- `predicate_equivalents`：列出某领域已登记的等价组（每组按文本排序）。
+- `expand_query`：查询期扩散——找出 `text` 里出现的登记词，返回它们所在等价组的全部同义词（`text` 里没有登记词就返回空）。全文路与预设检索图谱路内部用同一套扩散；单次返回词元有上限（`EXPAND_QUERY_LIMIT = 64`）。
 - 图搜索只服务「要在图上走一步以上」的查询；一层邻接（`neighbors`）仍走 SQL。
 
 > 定位、能力边界与实测提醒见 [graph-search](graph-search.md)。

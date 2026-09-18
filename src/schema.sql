@@ -65,6 +65,17 @@ CREATE TABLE predicate_rules (
 INSERT OR IGNORE INTO strings(text) VALUES ('sys:same_as');
 INSERT OR IGNORE INTO predicate_rules(predicate_id, is_symmetric) SELECT id, 1 FROM strings WHERE text='sys:same_as';
 
+-- 谓词等价词：把「丈夫 / 老公 / 夫君」这类同义写法登记成一组，按知识领域各存一套。
+-- 表由上游提供，库不内置任何领域数据；只用于查询期扩散，不改谓词的落盘写法。
+-- 同组词共享 canonical_id（组内代表词，自己那行指向自身），据此反查整组。
+CREATE TABLE predicate_equivalents (
+    namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    predicate_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    canonical_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE CASCADE,
+    PRIMARY KEY (namespace_id, predicate_id)
+);
+CREATE INDEX predicate_equivalents_group ON predicate_equivalents(namespace_id, canonical_id);
+
 CREATE TABLE event_participants (
     event_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
     entity_id INTEGER NOT NULL REFERENCES entities(record_id) ON DELETE RESTRICT,

@@ -1529,3 +1529,51 @@ fn entity_name_column_outweighs_long_body() {
     assert_eq!(hits[0].key.id, target, "规范名命中应压过长正文里堆起来的词频");
     assert!(hits.iter().any(|hit| hit.key.id == noise));
 }
+
+/// 谓词等价词：登记后可列出、可扩散，按领域隔离；没登记就是空。
+#[test]
+fn predicate_equivalents_register_list_and_expand_per_domain() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    assert!(kb.graph().predicate_equivalents("gi").unwrap().is_empty(), "没登记就是空");
+
+    kb.graph().set_predicate_equivalents("gi", &[vec!["丈夫".into(), "老公".into(), "夫君".into()]]).unwrap();
+    let groups = kb.graph().predicate_equivalents("gi").unwrap();
+    assert_eq!(groups, vec![vec!["丈夫".to_string(), "夫君".to_string(), "老公".to_string()]], "组内按文本排序");
+
+    // 扩散：查询里出现登记词（老公），返回整组同义词。
+    let expanded = kb.graph().expand_query("gi", "艾莉儿的老公").unwrap();
+    assert!(expanded.contains(&"丈夫".to_string()) && expanded.contains(&"夫君".to_string()), "命中「老公」应展开出「丈夫」「夫君」: {expanded:?}");
+    assert!(kb.graph().expand_query("gi", "艾莉儿").unwrap().is_empty(), "查询里没有登记词就是空");
+
+    // 领域隔离：hsr 没登记，同一查询扩散不出东西。
+    assert!(kb.graph().expand_query("hsr", "艾莉儿的老公").unwrap().is_empty(), "别的领域不共享等价词");
+}
+
+/// 谓词等价词接入检索：同义查询在登记后能召回关系，且关系里存着的谓词原文不变。
+#[test]
+fn predicate_equivalents_expand_search_without_rewriting_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let made = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("克劳斯"), entity("艾莉儿")], ..Default::default() }).unwrap();
+    let subject = made.value.entities[0].header.id;
+    let object = made.value.entities[1].header.id;
+    let relation = kb.graph().apply_batch(&GraphBatch { relations: vec![RelationInput {
+        record: RecordInput::default(), subject_id: subject, predicate: "配偶".into(),
+        object_id: object, confidence: 0.9, reason: String::new(),
+    }], ..Default::default() }).unwrap().value.relations[0].header.id;
+
+    let request = SearchRequest { query: "伴侣".into(), kinds: vec![RecordKind::Relation],
+        text: true, vector: false, rerank: false, ..Default::default() };
+    // 未登记：查询词与关系正文没有字面交集，召回不到。
+    assert!(kb.search(&request).unwrap().hits.is_empty(), "没登记时同义查询召回不到");
+    // 登记一组等价词后，同一查询被扩散到「配偶」，命中。
+    kb.graph().set_predicate_equivalents("default", &[vec!["配偶".into(), "伴侣".into()]]).unwrap();
+    let hits = kb.search(&request).unwrap().hits;
+    assert_eq!(hits.len(), 1, "登记后同义查询能召回");
+    assert_eq!(hits[0].key.id, relation);
+
+    // 落盘不变：关系里存的谓词仍是登记时写的「配偶」，扩散没有改写记录。
+    let stored: serde_json::Value = kb.graph().get(RecordKind::Relation, relation, &ReadFilter::default()).unwrap();
+    assert_eq!(stored["predicate"], serde_json::json!("配偶"));
+}

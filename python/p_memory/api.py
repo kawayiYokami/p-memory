@@ -216,6 +216,31 @@ class GraphStore(_Store):
     def resolve(self, name: str, *, filter: ReadFilter | None = None, limit: int = 10) -> list[dict]:
         return self._call("resolve", {"name": name, "filter": self._kb._filter(filter), "limit": limit})
 
+    def set_predicate_equivalents(self, namespace: str, groups: Sequence[Sequence[str]]) -> WriteReceipt:
+        """Register predicate equivalence groups for a knowledge domain.
+
+        Each group is a list of interchangeable predicate spellings (e.g.
+        ``["丈夫", "老公", "夫君"]``); the first entry is the canonical one. The
+        table is supplied by the caller per domain and persisted; the library
+        ships no built-in domain data. Re-registering a word moves it to the
+        new group. Only affects query-time expansion, never stored predicates.
+        """
+        return self._call("set_predicate_equivalents",
+                          {"namespace": namespace, "groups": [list(group) for group in groups]})
+
+    def predicate_equivalents(self, namespace: str) -> list[list[str]]:
+        """List the predicate equivalence groups registered for a domain."""
+        return self._call("predicate_equivalents", {"namespace": namespace})
+
+    def expand_query(self, namespace: str, text: str) -> list[str]:
+        """Expand ``text`` with synonyms of any registered predicate it contains.
+
+        Returns the extra terms to append to a search (empty when nothing
+        matched or the domain has no table). The same expansion is applied
+        automatically inside full-text and preset search.
+        """
+        return self._call("expand_query", {"namespace": namespace, "text": text})
+
     def neighbors(self, id: str, *, filter: ReadFilter | None = None, limit: int = 50) -> dict:
         return self._call("neighbors", {"id": id, "filter": self._kb._filter(filter), "limit": limit})
 

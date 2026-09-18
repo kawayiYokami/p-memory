@@ -198,7 +198,9 @@ impl KnowledgeBase {
         // 第二步：种子实体各自到「以它为端点」的关系里敲查询词，命中的留下并按相关度排。
         let candidate_ids = incident_relations(conn, &seeds, &request.filter)?;
         let candidates = storage::record_values(conn, &candidate_ids)?;
-        let ranked = rank_relations_by_query(&candidates, query);
+        // 与全文路同一套扩散：关系正文里写「丈夫」时，查询「艾莉儿的老公」也能敲中。
+        let graph_query = crate::graph::match_predicate_synonyms(conn, &request.filter.namespace, query)?;
+        let ranked = rank_relations_by_query(&candidates, &graph_query);
         let hit_ids = truncate_values_by_chars(&candidates, &ranked, RecordKind::Relation, request.budget.graph_relations_chars);
         let relations: Vec<Relation> = decode_all(&candidates, &hit_ids)?;
 

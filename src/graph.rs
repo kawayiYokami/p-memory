@@ -1,8 +1,8 @@
 use crate::{storage::{self, KnowledgeBase}, text, types::*, Error, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 fn concept() -> String { "concept".into() }
 fn confidence() -> f64 { 0.8 }
@@ -66,6 +66,51 @@ pub struct GraphStore(pub(crate) KnowledgeBase);
 fn check_confidence(score: f64) -> Result<()> {
     if !score.is_finite() || !(0.0..=1.0).contains(&score) { return Err(Error::Validation("confidence must be in [0,1]".into())); }
     Ok(())
+}
+
+/// 单次扩散返回的词元上限：防止宽泛等价词灌入过多词元、稀释检索精度。
+const EXPAND_QUERY_LIMIT: usize = 64;
+
+/// 按文本查已登记的领域 id；没登记返回 None（只读接口不新建标记）。
+fn namespace_term(conn: &Connection, namespace: &str) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT id FROM strings WHERE text=?1", [text::normalized_tag(namespace)], |r| r.get(0)).optional()?)
+}
+
+/// 扩散核心，直接在给定连接上做：GraphStore::expand_query 与全文检索路共用。
+/// 先找出查询里出现的登记谓词，再取这些谓词所在等价组的全部同义词。
+pub(crate) fn expand_query_conn(conn: &Connection, namespace: &str, text_value: &str) -> Result<Vec<String>> {
+    let Some(namespace_id) = namespace_term(conn, namespace)? else { return Ok(Vec::new()); };
+    let normalized = text::normalized_tag(text_value);
+    let mut stmt = conn.prepare("SELECT s.text, pe.canonical_id FROM predicate_equivalents pe \
+        JOIN strings s ON s.id=pe.predicate_id WHERE pe.namespace_id=?1")?;
+    let mut canonical_ids: BTreeSet<i64> = BTreeSet::new();
+    for row in stmt.query_map([namespace_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (predicate_text, canonical_id) = row?;
+        let probe = text::normalized_tag(&predicate_text);
+        if !probe.is_empty() && normalized.contains(&probe) { canonical_ids.insert(canonical_id); }
+    }
+    if canonical_ids.is_empty() { return Ok(Vec::new()); }
+    let mut member_stmt = conn.prepare("SELECT s.text FROM predicate_equivalents pe JOIN strings s ON s.id=pe.predicate_id \
+        WHERE pe.namespace_id=?1 AND pe.canonical_id=?2 ORDER BY s.text")?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut expanded: Vec<String> = Vec::new();
+    for canonical_id in &canonical_ids {
+        for row in member_stmt.query_map(params![namespace_id, canonical_id], |r| r.get::<_, String>(0))? {
+            let term = row?;
+            if seen.insert(term.clone()) { expanded.push(term); }
+            if expanded.len() >= EXPAND_QUERY_LIMIT { return Ok(expanded); }
+        }
+    }
+    Ok(expanded)
+}
+
+/// 查询期扩散：把命中的同义词追加到查询词后面，让「老公」也能召回写「丈夫」的记录。
+/// 领域没登记等价词、或查询里没出现登记词时，原样返回。查询词用空格连接追加，
+/// 追加部分自成词元，不影响原有部分的分词结果。
+pub(crate) fn match_predicate_synonyms(conn: &Connection, namespace: &str, query: &str) -> Result<String> {
+    let extra = expand_query_conn(conn, namespace, query)?;
+    if extra.is_empty() { return Ok(query.to_string()); }
+    Ok(format!("{query} {}", extra.join(" ")))
 }
 
 fn referenced_entity(conn: &Connection, record: &RecordInput, id: i64) -> Result<Entity> {
@@ -213,6 +258,56 @@ impl GraphStore {
         if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
         storage::list(self.0.read()?.conn(), kind, page)
     }
+    /// 登记一批谓词等价组到某个知识领域：`groups` 是一组组互等同义词，
+    /// 组内第一个词当规范词（组内代表），同组词据此归并。重复登记同一个词会改写它的归属。
+    /// 表由上游提供、库不内置领域数据；只影响查询期扩散，不改谓词的落盘写法。
+    pub fn set_predicate_equivalents(&self, namespace: &str, groups: &[Vec<String>]) -> Result<WriteReceipt<usize>> {
+        storage::validate_identity("namespace", namespace)?;
+        for group in groups {
+            if group.is_empty() { return Err(Error::Validation("an equivalent group must not be empty".into())); }
+            for term in group { storage::validate_identity("predicate", term)?; }
+        }
+        self.0.mutate(|tx| {
+            let namespace_id = storage::term_id(tx, namespace)?;
+            let mut count = 0usize;
+            for group in groups {
+                let canonical_id = storage::term_id(tx, &group[0])?;
+                for term in group {
+                    let predicate_id = storage::term_id(tx, term)?;
+                    tx.execute("INSERT INTO predicate_equivalents(namespace_id,predicate_id,canonical_id) VALUES (?1,?2,?3) \
+                        ON CONFLICT(namespace_id,predicate_id) DO UPDATE SET canonical_id=excluded.canonical_id",
+                        params![namespace_id, predicate_id, canonical_id])?;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+    }
+
+    /// 列出某个知识领域已登记的等价组；每个组是一组互等同义词。没登记过就返回空。
+    pub fn predicate_equivalents(&self, namespace: &str) -> Result<Vec<Vec<String>>> {
+        storage::validate_identity("namespace", namespace)?;
+        let state = self.0.read()?;
+        let conn = state.conn();
+        let Some(namespace_id) = namespace_term(conn, namespace)? else { return Ok(Vec::new()); };
+        let mut stmt = conn.prepare("SELECT pe.canonical_id, s.text FROM predicate_equivalents pe \
+            JOIN strings s ON s.id=pe.predicate_id WHERE pe.namespace_id=?1 ORDER BY pe.canonical_id, s.text")?;
+        let mut groups: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for row in stmt.query_map([namespace_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (canonical_id, term) = row?;
+            groups.entry(canonical_id).or_default().push(term);
+        }
+        Ok(groups.into_values().map(|mut group| { group.sort(); group.dedup(); group }).collect())
+    }
+
+    /// 扩散：找出 `text` 里出现了哪些已登记谓词，返回这些谓词所在等价组的全部同义词。
+    /// 命中判定是「登记词作为子串出现在查询里」，与 story 的关键词表同一路数。
+    /// 返回的是可直接追加进检索的补充词元；没有命中返回空。
+    pub fn expand_query(&self, namespace: &str, text_value: &str) -> Result<Vec<String>> {
+        storage::validate_identity("namespace", namespace)?;
+        expand_query_conn(self.0.read()?.conn(), namespace, text_value)
+    }
+
     pub fn resolve(&self, name: &str, filter: &ReadFilter, limit: usize) -> Result<Vec<Entity>> {
         storage::validate_filter(filter)?; storage::validate_limit(limit)?;
         let state = self.0.read()?;

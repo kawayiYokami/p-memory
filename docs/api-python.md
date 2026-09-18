@@ -29,7 +29,7 @@ p_memory.KnowledgeBase.restore(snapshot, directory)  # 类方法
 异步封装 `AsyncKnowledgeBase` 才提供 `open(path, **options)` 类方法（`async def`）。
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
-**谓词元规则 `set_predicate_rule` 仅在 Rust 侧提供，Python 未暴露**；用法示例见 [graph-search](graph-search.md#python)。
+**谓词元规则 `set_predicate_rule` 仅在 Rust 侧提供，Python 未暴露**；用法示例见 [graph-search](graph-search.md#python)。谓词等价词与查询期扩散在 Python 侧可用：`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.expand_query(namespace, text)` 单独调用扩散，二者也已在全文路与预设检索图谱路内部自动生效。
 
 笔记多两个方法，用来登记领域根目录：
 

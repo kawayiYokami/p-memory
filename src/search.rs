@@ -179,7 +179,9 @@ impl KnowledgeBase {
     fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
         self.sync_index_if_behind(conn)?;
         let Some(index_filter) = index_filter(conn, filter, kinds)? else { return Ok(Vec::new()) };
-        self.index()?.search(query, &index_filter, limit)
+        // 领域登记了谓词等价词时先扩散：把同义写法一并纳入召回（如「老公」补「丈夫」）。
+        let expanded = crate::graph::match_predicate_synonyms(conn, &filter.namespace, query)?;
+        self.index()?.search(&expanded, &index_filter, limit)
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
