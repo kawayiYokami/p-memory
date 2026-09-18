@@ -18,6 +18,7 @@ kb.register_reranker(callback, max_docs=64)
 kb.health()        # -> dict
 kb.update_index()  # 追平写入累积的索引待办（批量导入后调用一次）
 kb.rebuild_indexes()
+kb.rebuild_progress()  # -> {"active": bool, "processed": int, "total": int}，可轮询重建进度
 kb.backup(target)
 kb.close()
 

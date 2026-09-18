@@ -55,7 +55,8 @@ impl KnowledgeBase {
 
 - `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、`pending_index_updates`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
 - `update_index()` 追平写入累积的待办、只提交一次，返回新的健康报告。写入路径不调用它；批量导入后调用一次即可，期间读取走自愈兜底。
-- `rebuild_indexes()` 强制重建全文索引并清空向量缓存，随后返回新的健康报告。
+- `rebuild_indexes()` 强制重建全文索引并清空向量缓存，随后返回新的健康报告。重建按 record id 分页流式进行、逐批提交，内存不随语料规模增长；进程中途被杀后重开库会从持久游标续跑。
+- `rebuild_progress()` 返回一次重建进度快照 `RebuildProgressReport { active, processed, total }`，可在重建进行时从另一线程轮询。
 
 ### 注册模型回调
 

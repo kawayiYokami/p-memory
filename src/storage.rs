@@ -280,6 +280,11 @@ impl KnowledgeBase {
         self.health()
     }
 
+    /// 读一次全文索引重建的进度快照。纯原子读、不碰写锁，可在重建进行时从另一线程轮询。
+    pub fn rebuild_progress(&self) -> Result<RebuildProgressReport> {
+        Ok(self.index()?.rebuild_progress())
+    }
+
     pub fn health(&self) -> Result<HealthReport> {
         let state = self.read()?;
         let conn = state.conn();
@@ -338,6 +343,23 @@ impl KnowledgeBase {
 pub(crate) fn now_us() -> i64 { chrono::Utc::now().timestamp_micros() }
 pub(crate) fn meta(conn: &Connection, key: &str) -> Result<i64> {
     Ok(conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))?)
+}
+
+/// 读一个可能不存在的 meta 键；不存在返回 `None`。用于重建游标这类运行期临时状态。
+pub(crate) fn meta_opt(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
+}
+
+/// 写入（存在则更新）一个 meta 键。键值表结构固定，新增键不需要 schema 迁移。
+pub(crate) fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+    Ok(())
+}
+
+/// 删除一个运行时 meta 键，不存在时无副作用。
+pub(crate) fn clear_meta(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM meta WHERE key=?1", [key])?;
+    Ok(())
 }
 pub(crate) fn current_revision(conn: &Connection) -> Result<i64> { meta(conn, "revision") }
 pub(crate) fn next_revision(conn: &Connection, record_id: i64) -> Result<i64> {

@@ -1,8 +1,9 @@
 use crate::{storage, text, types::*, Error, Result};
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
@@ -16,6 +17,25 @@ struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: F
 
 /// 名字字段命中时的固定加权：规范名单独成列后，名字整段命中是最强的相关信号，给它固定倍数抬高。
 const NAME_FIELD_BOOST: f32 = 3.0;
+
+/// 重建分页大小：每页处理这么多条记录，页间释放本页的文档与切分缓存，并提交一次。
+/// 取值只需「够小以保证内存有界、够大以保证提交不过于频繁」，不承担性能调优职责。
+const REBUILD_BATCH: usize = 2_000;
+
+/// 重建进行中写在索引 payload 上的标记；与稳态的 `FORMAT:<indexed_revision>` 区分，
+/// 让 `recover` 能认出「上次重建没跑完，该从游标续跑」。
+fn rebuild_marker() -> String { format!("{FORMAT}:rebuild") }
+
+/// 索引重建进度。只有重建线程写，其余线程读，因此用原子量而非锁。
+pub(crate) struct RebuildProgress {
+    active: AtomicBool,
+    processed: AtomicU64,
+    total: AtomicU64,
+}
+
+impl RebuildProgress {
+    fn new() -> Self { Self { active: AtomicBool::new(false), processed: AtomicU64::new(0), total: AtomicU64::new(0) } }
+}
 
 /// 一条要写进索引的记录：正文、标签全部由写入流程就地提供。
 /// 写入时读一次源文件、切一次，切片正文一路带到这里，索引阶段不再回头读文件。
@@ -47,6 +67,10 @@ pub(crate) struct TextIndex {
     #[cfg(test)] pub(crate) fail_search: AtomicBool,
     /// 测试专用：统计重建次数。
     #[cfg(test)] pub(crate) rebuilds: AtomicUsize,
+    /// 测试专用：>0 时表示本次重建最多处理这么多页就注入中断，用来验证断点续存。
+    #[cfg(test)] pub(crate) abort_rebuild_after: AtomicUsize,
+    /// 重建进度快照，供其它线程轮询。
+    progress: RebuildProgress,
 }
 
 impl TextIndex {
@@ -95,7 +119,9 @@ impl TextIndex {
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
         Ok(Self { index, reader, writer: Mutex::new(writer), fields,
             #[cfg(test)] fail_search: AtomicBool::new(false),
-            #[cfg(test)] rebuilds: AtomicUsize::new(0) })
+            #[cfg(test)] rebuilds: AtomicUsize::new(0),
+            #[cfg(test)] abort_rebuild_after: AtomicUsize::new(0),
+            progress: RebuildProgress::new() })
     }
 
     pub fn document_count(&self) -> usize { self.reader.searcher().num_docs() as usize }
@@ -105,8 +131,13 @@ impl TextIndex {
     pub fn recover(&self, conn: &Connection) -> Result<()> {
         let expected = format!("{FORMAT}:{}", storage::meta(conn, "indexed_revision")?);
         let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-        if pending > 0 || self.index.load_metas()?.payload.as_deref() != Some(&expected) { self.rebuild(conn) }
-        else { Ok(()) }
+        if pending == 0 && self.index.load_metas()?.payload.as_deref() == Some(&expected) {
+            // 稳态：顺手清掉可能残留的重建状态（正常收尾已清，这里是崩溃在收尾前的兜底）。
+            if storage::meta_opt(conn, "rebuild_cursor")?.is_some() { storage::clear_meta(conn, "rebuild_cursor")?; }
+            if storage::meta_opt(conn, "rebuild_processed")?.is_some() { storage::clear_meta(conn, "rebuild_processed")?; }
+            return Ok(());
+        }
+        self.rebuild(conn)
     }
 
     /// 把写入流程就地交过来的文档写进索引：按记录 ID 覆盖，尚未提交所以对搜索不可见。
@@ -163,30 +194,88 @@ impl TextIndex {
 
     /// 全量重建：清空索引，按库里现有记录重新读源文件、重跑同一套切分。
     /// 只在索引格式过期、索引损坏、或上次写入未收尾时走这里，属于异常恢复而非日常路径。
+    ///
+    /// 重建按 record id 分页流式进行：每页写完就提交、并把「已处理到的 id」记进 `meta`。
+    /// 内存只驻留单页文档；进程中途被杀，重开时 `recover` 能从游标续跑而非从零重来。
     pub fn rebuild(&self, conn: &Connection) -> Result<()> {
         #[cfg(test)]
         self.rebuilds.fetch_add(1, Ordering::SeqCst);
-        let mut writer = self.writer.lock();
-        writer.delete_all_documents()?;
-        for item in self.rebuild_documents(conn) { self.add(&mut writer, &item)?; }
-        self.finish(&mut writer, conn, storage::current_revision(conn)?)
+
+        // 磁盘 payload 是「重建中」标记 → 上次没跑完，从游标接着来；否则从头清空重来。
+        let resumable = self.index.load_metas()?.payload.as_deref() == Some(&rebuild_marker());
+        let (start_cursor, already) = if resumable {
+            // 已处理量也从 meta 读，不依赖 reader 的新鲜度：同进程重试时 reader 还停在旧快照上。
+            (storage::meta_opt(conn, "rebuild_cursor")?.unwrap_or(0),
+             storage::meta_opt(conn, "rebuild_processed")?.unwrap_or(0).max(0) as u64)
+        } else { (0, 0) };
+        // 进度里的总量只算真正进索引的记录：笔记不占索引文档。
+        let total = conn.query_row("SELECT COUNT(*) FROM records WHERE kind<>?1", [RecordKind::Note.code()],
+            |r| r.get::<_, i64>(0))? as u64;
+
+        self.progress.total.store(total, Ordering::SeqCst);
+        self.progress.processed.store(already, Ordering::SeqCst);
+        self.progress.active.store(true, Ordering::SeqCst);
+        let result = self.rebuild_pages(conn, resumable, start_cursor, already);
+        // 无论成功失败都退出「进行中」态，宿主不会读到永远 active 的幽灵进度。
+        self.progress.active.store(false, Ordering::SeqCst);
+        result
     }
 
-    /// 从库里现有的记录重建索引文档。切片正文没有第二份副本，这里按同一套切分规则
-    /// 重新读文件切一遍；文件读不到时任该切片正文为空，不让一次恢复失败于单个缺文件。
-    fn rebuild_documents(&self, conn: &Connection) -> Vec<IndexDocument> {
-        let mut documents = Vec::new();
-        let Ok(mut stmt) = conn.prepare("SELECT r.id,r.namespace_id,r.kind,r.scope_id,r.payload_json FROM records r ORDER BY r.id") else { return Vec::new() };
-        let Ok(records) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
-            r.get::<_, i64>(3)?, r.get::<_, String>(4)?))) else { return Vec::new() };
-        let mut rows = Vec::new();
-        for row in records {
-            let Ok(row) = row else { continue };
-            rows.push(row);
+    /// 重建的分页主循环：逐页读、逐页写、逐页提交并推进持久游标。
+    fn rebuild_pages(&self, conn: &Connection, resumable: bool, start_cursor: i64, mut processed: u64) -> Result<()> {
+        let mut writer = self.writer.lock();
+        if !resumable {
+            // 从头来：旧索引整体作废，写下重建标记，游标与已处理量都归零。
+            writer.delete_all_documents()?;
+            storage::set_meta(conn, "rebuild_cursor", 0)?;
+            storage::set_meta(conn, "rebuild_processed", 0)?;
+            let mut prepared = writer.prepare_commit()?;
+            prepared.set_payload(&rebuild_marker());
+            prepared.commit()?;
         }
-        // 同一篇笔记的多片共用一次文件读取与一次切分。
+        let mut cursor = start_cursor;
+        #[cfg(test)]
+        let mut pages = 0usize;
+        loop {
+            let (documents, last_scanned) = self.rebuild_page(conn, cursor)?;
+            // 本页没有推进（后面已无记录）即结束。
+            if last_scanned <= cursor { break; }
+            for item in &documents { self.add(&mut writer, item)?; }
+            cursor = last_scanned;
+            // 先提交、再写游标：崩溃只可能让游标落后于已落盘数据，重放是幂等覆盖。
+            let mut prepared = writer.prepare_commit()?;
+            prepared.set_payload(&rebuild_marker());
+            prepared.commit()?;
+            storage::set_meta(conn, "rebuild_cursor", cursor)?;
+            processed += documents.len() as u64;
+            storage::set_meta(conn, "rebuild_processed", processed as i64)?;
+            self.progress.processed.store(processed, Ordering::SeqCst);
+            #[cfg(test)]
+            {
+                pages += 1;
+                let cap = self.abort_rebuild_after.load(Ordering::SeqCst);
+                if cap != 0 && pages >= cap { return Err(Error::Index("injected rebuild abort".into())); }
+            }
+        }
+        // 收尾：payload 落到稳态、记账、清掉重建游标与已处理量。
+        self.finish(&mut writer, conn, storage::current_revision(conn)?)?;
+        storage::clear_meta(conn, "rebuild_cursor")?;
+        storage::clear_meta(conn, "rebuild_processed")?;
+        Ok(())
+    }
+
+    /// 读一页记录折成索引文档。返回本页文档与本页扫到的最大 record id。
+    /// `files`（笔记切分缓存）只在本页内存活，随函数返回释放，不再整程驻留。
+    fn rebuild_page(&self, conn: &Connection, after: i64) -> Result<(Vec<IndexDocument>, i64)> {
+        let mut documents = Vec::new();
         let mut files: HashMap<i64, Vec<String>> = HashMap::new();
-        for (id, namespace_id, kind_code, scope_id, payload_json) in rows {
+        let mut last = after;
+        let mut stmt = conn.prepare("SELECT r.id,r.namespace_id,r.kind,r.scope_id,r.payload_json FROM records r WHERE r.id>?1 ORDER BY r.id LIMIT ?2")?;
+        let rows = stmt.query_map(params![after, REBUILD_BATCH as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))?;
+        for row in rows {
+            let (id, namespace_id, kind_code, scope_id, payload_json) = row?;
+            last = id;
             let Some(kind) = RecordKind::from_code(kind_code) else { continue };
             // 笔记不占索引文档：路径信息以标签形态挂在它的每个切片上，文件列表按库里的标签翻。
             if kind == RecordKind::Note { continue; }
@@ -207,7 +296,16 @@ impl TextIndex {
                 tags_prefix: storage::tags_prefix(kind, &tags, &payload),
                 tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
-        documents
+        Ok((documents, last))
+    }
+
+    /// 读一次重建进度快照。纯原子读，不碰写锁，可在重建进行时从另一线程安全调用。
+    pub(crate) fn rebuild_progress(&self) -> RebuildProgressReport {
+        RebuildProgressReport {
+            active: self.progress.active.load(Ordering::SeqCst),
+            processed: self.progress.processed.load(Ordering::SeqCst),
+            total: self.progress.total.load(Ordering::SeqCst),
+        }
     }
 
     /// 读一篇笔记的源文件并重跑切分，返回每片正文（按 ordinal 顺序）。
@@ -315,5 +413,103 @@ impl TextIndex {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{KnowledgeBase, MemoryInput};
+
+    /// 造一个比两页还多的库，确保重建会跨多个分页边界。
+    fn seed(kb: &KnowledgeBase, n: usize) {
+        for i in 0..n { kb.memories().upsert(MemoryInput::new(&format!("重建分页测试条目{i}"))).unwrap(); }
+        kb.update_index().unwrap();
+    }
+
+    /// 读当前落盘的重建游标（不存在返回 None）。
+    fn cursor_of(kb: &KnowledgeBase) -> Option<i64> {
+        let guard = kb.engine.writer.lock();
+        storage::meta_opt(&guard.as_ref().unwrap().conn, "rebuild_cursor").unwrap()
+    }
+
+    /// 断点续存：中断后从持久游标接着跑，而不是从零重来。
+    #[test]
+    fn rebuild_resumes_from_persisted_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        let n = REBUILD_BATCH * 2 + 37;
+        seed(&kb, n);
+        let total = kb.health().unwrap().index_document_count;
+        assert_eq!(total, n);
+
+        // 让第一页提交后立刻中断，模拟进程被杀。
+        let index = kb.index().unwrap();
+        index.abort_rebuild_after.store(1, Ordering::SeqCst);
+        assert!(kb.rebuild_indexes().is_err(), "注入的中断必须冒泡成错误");
+
+        // 中断后的落盘状态：游标停在第一页末尾、已处理量记下已提交页、退出进行中态。
+        assert_eq!(cursor_of(&kb), Some(REBUILD_BATCH as i64), "中断后必须留下停在该页末尾的持久游标");
+        let progress = kb.rebuild_progress().unwrap();
+        assert!(!progress.active, "中断后不应仍处于进行中态");
+        assert_eq!(progress.total as usize, n);
+        assert_eq!(progress.processed as usize, REBUILD_BATCH);
+
+        // 再续跑一页后中断：游标应从 4000 而不是从 2000 重来，这才能证明「续跑而非重来」。
+        assert!(kb.rebuild_indexes().is_err());
+        assert_eq!(cursor_of(&kb), Some((REBUILD_BATCH * 2) as i64), "续跑必须从持久游标继续推进");
+        assert_eq!(kb.rebuild_progress().unwrap().processed as usize, REBUILD_BATCH * 2);
+
+        // 关掉钩子跑完：补齐到完整并清掉重建状态。
+        index.abort_rebuild_after.store(0, Ordering::SeqCst);
+        kb.rebuild_indexes().unwrap();
+        assert_eq!(kb.health().unwrap().index_document_count, total);
+        assert_eq!(cursor_of(&kb), None, "收尾后应清掉重建游标");
+        let done = kb.rebuild_progress().unwrap();
+        assert!(!done.active);
+        assert_eq!(done.processed, done.total);
+
+        // 跨进程：重开库走 recover，稳态下不再重建、索引完整。
+        drop(index);
+        drop(kb);
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().index_document_count, total);
+    }
+
+    /// 跨进程续跑：中断后重开库，recover 应自动从游标补齐，无需显式重建。
+    #[test]
+    fn open_resumes_interrupted_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        let n = REBUILD_BATCH + 11;
+        seed(&kb, n);
+        let total = kb.health().unwrap().index_document_count;
+
+        let index = kb.index().unwrap();
+        index.abort_rebuild_after.store(1, Ordering::SeqCst);
+        assert!(kb.rebuild_indexes().is_err());
+        assert!(cursor_of(&kb).is_some());
+        drop(index);
+        drop(kb);
+
+        // 重开：open 内的 recover 看到「重建中」标记即从游标续跑。
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().index_document_count, total, "recover 应自动补齐中断的重建");
+        assert_eq!(cursor_of(&kb), None);
+    }
+
+    /// 进度上报：完成后 processed 追平 total，且不再处于进行中态。
+    #[test]
+    fn rebuild_progress_reports_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        let n = REBUILD_BATCH + 5;
+        seed(&kb, n);
+        assert!(!kb.rebuild_progress().unwrap().active, "尚未重建时不应处于进行中态");
+        kb.rebuild_indexes().unwrap();
+        let p = kb.rebuild_progress().unwrap();
+        assert!(!p.active);
+        assert_eq!(p.total, n as u64);
+        assert_eq!(p.processed, n as u64, "完成后 processed 应等于总量");
     }
 }

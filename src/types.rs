@@ -211,3 +211,12 @@ pub struct HealthReport {
     /// 最近观察到的降级档位，去重后保留少量。
     pub last_degraded: Vec<Degrade>,
 }
+
+/// 全文索引重建的进度快照。宿主可在重建进行时从另一线程轮询：
+/// `active` 为真表示正在重建，`processed`/`total` 是已索引记录数与待索引记录总数。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RebuildProgressReport {
+    pub active: bool,
+    pub processed: u64,
+    pub total: u64,
+}

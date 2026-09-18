@@ -245,3 +245,5 @@ struct GraphSection {
 - 检索前若还有待处理更新，会先提交一次，保证结果与已提交数据一致。
 - 索引提交带 payload `p-memory-text-v8:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
 - 重建是唯一回读源文件的路径：切片正文没有第二份副本，按同一套切分规则重新读文件切一遍，文件缺失的那批切片正文退化为空。
+- 重建按 record id 分页流式进行，每批（`REBUILD_BATCH`）处理完就提交一次、并把「已处理到的 id」写进 `meta.rebuild_cursor`；因此内存只驻留单批文档，且中途被杀后 `recover` 能从游标续跑。重建进行中 payload 为 `p-memory-text-v8:rebuild`，收尾时才落回 `p-memory-text-v8:<indexed_revision>`。
+- 重建进度可从 `rebuild_indexes` 之外的只读接口 `rebuild_progress` 取到（`active` / `processed` / `total`），可在重建进行时从另一线程轮询。

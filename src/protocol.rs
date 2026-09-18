@@ -18,6 +18,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
     match operation {
         "health"=>encode(kb.health()?),
         "rebuild_indexes"=>encode(kb.rebuild_indexes()?),
+        "rebuild_progress"=>encode(kb.rebuild_progress()?),
         "update_index"=>encode(kb.update_index()?),
         "backup"=>{kb.backup(field::<String>(&args,"path")?)?;Ok(Value::Null)},
         "close"=>{kb.close()?;Ok(Value::Null)},
