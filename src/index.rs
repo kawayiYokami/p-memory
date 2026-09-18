@@ -18,6 +18,11 @@ struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: F
 /// 名字字段命中时的固定加权：规范名单独成列后，名字整段命中是最强的相关信号，给它固定倍数抬高。
 const NAME_FIELD_BOOST: f32 = 3.0;
 
+/// 索引 writer 的内存预算，只作单线程写器的内存天花板。
+/// 本重建每批（`REBUILD_BATCH`）都 commit，段在每次提交即刷盘，预算不会被逼近；
+/// 取值只需留足余量，不必随语料规模变化。
+const WRITER_MEMORY_BUDGET: usize = 1_000_000_000;
+
 /// 重建分页大小：每页处理这么多条记录，页间释放本页的文档与切分缓存，并提交一次。
 /// 取值只需「够小以保证内存有界、够大以保证提交不过于频繁」，不承担性能调优职责。
 const REBUILD_BATCH: usize = 2_000;
@@ -115,7 +120,10 @@ impl TextIndex {
             }
         };
         index.tokenizers().register("pretokenized", WhitespaceTokenizer::default());
-        let writer = index.writer(20_000_000)?;
+        // 索引 writer 固定单线程：本机实测（8 核 16 线程，20 万条）1 线程最快 9.3s，
+        // 2/4/8/16 线程依次退化到 11.0/14.1/19.1/32.8s——多 worker 只增加协调与合并开销，
+        // 所以不交给 tantivy 按核数拆线程。
+        let writer = index.writer_with_num_threads(1, WRITER_MEMORY_BUDGET)?;
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
         Ok(Self { index, reader, writer: Mutex::new(writer), fields,
             #[cfg(test)] fail_search: AtomicBool::new(false),
@@ -419,7 +427,7 @@ impl TextIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KnowledgeBase, MemoryInput};
+    use crate::{KnowledgeBase, MemoryInput, SearchRequest};
 
     /// 造一个比两页还多的库，确保重建会跨多个分页边界。
     fn seed(kb: &KnowledgeBase, n: usize) {
@@ -496,6 +504,31 @@ mod tests {
         let kb = KnowledgeBase::open(dir.path()).unwrap();
         assert_eq!(kb.health().unwrap().index_document_count, total, "recover 应自动补齐中断的重建");
         assert_eq!(cursor_of(&kb), None);
+    }
+
+    /// 跨多页流式重建后，记录不能丢也不能查不到：按名字建一批跨页记录，
+    /// 重建后逐条检索与按 id 取正文都要能命中。
+    #[test]
+    fn streamed_rebuild_keeps_every_record_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::open(dir.path()).unwrap();
+        let n = REBUILD_BATCH * 2 + 17;
+        seed(&kb, n);
+        kb.rebuild_indexes().unwrap();
+
+        let index = kb.index().unwrap();
+        // 逐条确认「分页边界两侧」的记录都还在索引里且可检索。
+        for i in [0usize, REBUILD_BATCH - 1, REBUILD_BATCH, REBUILD_BATCH * 2, n - 1] {
+            let query = format!("重建分页测试条目{i}");
+            let request = SearchRequest { query: query.clone(), kinds: vec![RecordKind::Memory],
+                vector: false, rerank: false, ..Default::default() };
+            let result = kb.search(&request).unwrap();
+            assert!(!result.hits.is_empty(), "重建后第 {i} 条应仍可检索到");
+            let hit = &result.hits[0];
+            let body = index.bodies(&[hit.key.id]).unwrap();
+            assert!(body.get(&hit.key.id).map(|t| t.contains(&query)).unwrap_or(false),
+                "重建后第 {i} 条的正文应能按 id 取回");
+        }
     }
 
     /// 进度上报：完成后 processed 追平 total，且不再处于进行中态。
