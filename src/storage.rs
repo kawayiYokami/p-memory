@@ -660,6 +660,7 @@ pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[Rec
 
 /// 记录的正文列内容：这条记录自己的文本。
 /// 切片正文来自写入时切好的那一段，不在这里算，所以这条纯函数只覆盖其余四种记录。
+/// 实体的正文不含规范名——规范名单独走 `record_name` 的 name 列，不在正文里占位。
 pub(crate) fn record_text(kind: RecordKind, payload: &Value) -> String {
     let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     match kind {
@@ -687,7 +688,6 @@ fn name_list(payload: &Value) -> String {
 }
 
 fn entity_body(payload: &Value) -> String {
-    let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
     let aliases = payload.get("aliases").and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default();
     let summary = payload.get("summary").and_then(Value::as_str).unwrap_or("");
@@ -697,7 +697,7 @@ fn entity_body(payload: &Value) -> String {
             format!("{key} {joined}")
         }).collect::<Vec<_>>().join(" ")
     }).unwrap_or_default();
-    format!("{name} {aliases} {summary} {attr_text}")
+    format!("{aliases} {summary} {attr_text}")
 }
 
 pub(crate) fn select_keys(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, after: Option<&str>) -> Result<Vec<RecordKey>> {    let (mut condition, mut values) = filter_sql(filter, kinds, false)?;

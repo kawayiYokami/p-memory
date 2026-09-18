@@ -10,11 +10,11 @@ use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityS
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v7";
+const FORMAT: &str = "p-memory-text-v8";
 
 struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, body: Field }
 
-/// 名字字段命中时的固定加权：名字是实体的规范名，比正文里的同名提及更该决定这条记录的相关度。
+/// 名字字段命中时的固定加权：规范名单独成列后，名字整段命中是最强的相关信号，给它固定倍数抬高。
 const NAME_FIELD_BOOST: f32 = 3.0;
 
 /// 一条要写进索引的记录：正文、标签全部由写入流程就地提供。
@@ -68,8 +68,10 @@ impl TextIndex {
             tags: builder.add_u64_field("tags", INDEXED),
             // 正文列：唯一承载「这条记录讲了什么」的列，也是相关性打分的主力。
             // 标签集拼在承载它的那一条的正文前面，与正文同列、同长度、共同参与打分。
+            // 实体规范名不进这一列。
             text: builder.add_text_field("text", tokenized()),
-            // 实体规范名单独一列：与正文分开，检索时按固定倍数加权，抵消长正文对名字的分摊。
+            // 实体规范名单独一列：正文列不含规范名，名字只活在这一列，检索时按固定倍数加权，
+            // 并作为独立的命中条件——名字命中也算这条记录被搜到。
             name: builder.add_text_field("name", tokenized()),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
             body: builder.add_text_field("body", STORED),
@@ -234,14 +236,20 @@ impl TextIndex {
 
     fn filtered_query(&self, tokens: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
         let occurrence = if strict { Occur::Must } else { Occur::Should };
-        // 正文层决定「命中」：strict 轮要求全部词元命中，放宽轮命中一个即可。
-        let body_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.text, token, occurrence)).collect());
-        // 名字层只负责抬分：与正文层同处一个 BooleanQuery，正文层是 Must、名字层是 Should，
-        // 因此名字命中只加分、不改变「必须命中正文」这个必要条件。实体名单独成列、长度均匀，
-        // 加权后不会被它的别名与属性摊薄；其它记录的 name 列为空，天然不参与。
+        // 命中层：每个词元在「正文列 + 名字列」里任一命中即算这个词元命中。
+        // 规范名已从正文列移出，所以名字命中也必须能独立把这条记录带进结果，不再只是加分项。
+        let hit = BooleanQuery::new(tokens.iter().map(|token| {
+            let either = BooleanQuery::new(vec![
+                Self::term(self.fields.text, token, Occur::Should),
+                Self::term(self.fields.name, token, Occur::Should),
+            ]);
+            (occurrence, Box::new(either) as Box<dyn Query>)
+        }).collect());
+        // 名字层只负责抬分：名字整段等于查询词的记录，不该被它那几百字的别名与属性摊薄；
+        // 其它记录的 name 列为空，天然不参与。
         let name_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.name, token, Occur::Should)).collect());
         let relevance = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(body_relevance) as Box<dyn Query>),
+            (Occur::Must, Box::new(hit) as Box<dyn Query>),
             (Occur::Should, Box::new(BoostQuery::new(Box::new(name_relevance), NAME_FIELD_BOOST)) as Box<dyn Query>),
         ]);
         // 相关性这层只放 Should，所以至少要命中一个词元才算相关，过滤维度另起一层放 Must。

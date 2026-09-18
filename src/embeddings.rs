@@ -384,14 +384,20 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
     let bodies = if chunk_ids.is_empty() { BTreeMap::new() } else { index.bodies(&chunk_ids)? };
     for (id, kind_code, payload_json, fingerprint) in candidates {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
+        let payload: Option<serde_json::Value> = serde_json::from_str(&payload_json).ok();
         let body = match kind {
             RecordKind::Chunk => bodies.get(&id).cloned().unwrap_or_default(),
-            _ => serde_json::from_str::<serde_json::Value>(&payload_json)
-                .map(|payload| storage::record_text(kind, &payload)).unwrap_or_default(),
+            _ => payload.as_ref().map(|payload| storage::record_text(kind, payload)).unwrap_or_default(),
         };
-        // 记忆是短句，标签是它的另一半特征，两者一起送进向量；其余记录只用正文。
+        // 规范名不进正文列（见 record_text），但它对实体的语义不可或缺，向量这边单独补回去。
+        let name = match (kind, &payload) {
+            (RecordKind::Entity, Some(payload)) => payload.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        // 记忆是短句，标签是它的另一半特征，两者一起送进向量；其余记录用正文，实体的规范名补在正文前。
         let text = match (kind, record_tags(conn, id)?) {
             (RecordKind::Memory, tags) if !tags.is_empty() => format!("{body}\n{}", tags.join(" ")),
+            (RecordKind::Entity, _) if !name.is_empty() => format!("{name}\n{body}"),
             _ => body,
         };
         items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint });

@@ -124,7 +124,7 @@ pub(crate) fn upsert_entity(conn: &Connection, input: &EntityInput) -> Result<(E
     let aliases: Vec<_> = input.aliases.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<BTreeSet<_>>().into_iter().collect();
     let attributes = input.attributes.clone();
     let attr_text = attributes.iter().map(|(k, values)| format!("{k} {}", values.join(" "))).collect::<Vec<_>>().join(" ");
-    let body = format!("{} {} {} {}", input.name, aliases.join(" "), input.summary, attr_text);
+    let body = format!("{} {} {}", aliases.join(" "), input.summary, attr_text);
     let (header, document) = storage::put_record(conn, RecordKind::Entity, &input.record,
         &json!({"name":input.name,"entity_type":input.entity_type,"aliases":aliases,"attributes":attributes,"summary":input.summary}), &body)?;
     let entity_type_id = storage::term_id(conn, &input.entity_type)?;
