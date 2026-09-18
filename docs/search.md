@@ -229,5 +229,5 @@ struct GraphSection {
 - `index_updates` 是待提交信号：写入事务里登记 `(revision, record_id)`，同一个调用把文档写进索引 writer。`update_index` 一趟提交、把 `indexed_revision` 记到本次实际覆盖的最大 revision，并删掉已覆盖的队列行。
 - 索引目录损坏时**隔离并重建**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再新建空索引，权威数据库不受影响。
 - 检索前若还有待处理更新，会先提交一次，保证结果与已提交数据一致。
-- 索引提交带 payload `p-memory-text-v5:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
+- 索引提交带 payload `p-memory-text-v6:<indexed_revision>`；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
 - 重建是唯一回读源文件的路径：切片正文没有第二份副本，按同一套切分规则重新读文件切一遍，文件缺失的那批切片正文退化为空。
