@@ -75,6 +75,10 @@ pub struct SearchHit {
     pub score: f64, pub text_score: Option<f64>, pub vector_scores: BTreeMap<String, f64>,
     /// 本条目在重排回调那里的分数；未重排时为 `None`。
     #[serde(default)] pub rerank_score: Option<f64>,
+    /// 本条目是切片时：其所属笔记里命中本次查询的切片总数（按请求的匹配列计，含本条）。
+    /// 非切片命中、或请求只看名字/目录列时为 `None`。
+    /// 它只描述「这篇文档有多少相关片段」，与结果窗口、翻页无关。
+    #[serde(default)] pub note_chunks: Option<usize>,
     pub record: Value,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,7 +369,34 @@ impl KnowledgeBase {
             ranked = scores.into_iter().collect();
             ranked.sort_by(|a,b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
         }
+        // 同一篇笔记的多个命中切片折叠成一条：只保留排名最高的那一片。
+        // 否则一篇对话体文档会用自己几十个片段占满整个结果列表，把别的文档全挤出去。
+        // 折叠之前先拿到「切片 → 所属笔记」，折叠之后还要用它统计各篇共命中多少片。
+        let candidate_ids: Vec<i64> = ranked.iter().map(|(key, _)| key.id).collect();
+        let chunk_notes = storage::chunk_note_ids(conn, &candidate_ids)?;
+        if !chunk_notes.is_empty() {
+            let mut seen_notes: HashSet<i64> = HashSet::new();
+            ranked.retain(|(key, _)| match chunk_notes.get(&key.id) {
+                Some(note_id) => seen_notes.insert(*note_id),
+                None => true,
+            });
+        }
         ranked.truncate(request.limit);
+        // 「这篇笔记共有多少片段命中本次查询」是查询本身的属性，与结果窗口无关，
+        // 不能拿截断后的结果集去数，只能在索引里按笔记精确统计。
+        // 只对按正文列（或默认的正文+名字列）检索的请求统计：名字与目录列是笔记级的，
+        // 一篇至多一条命中，计数无从谈起。
+        let mut note_counts: BTreeMap<i64, usize> = BTreeMap::new();
+        if request.text && matches!(request.match_field, MatchField::All | MatchField::Text) {
+            if let Some(ifilter) = index_filter(conn, &request.filter, &request.kinds)? {
+                for (key, _) in &ranked {
+                    let Some(&note_id) = chunk_notes.get(&key.id) else { continue };
+                    if note_counts.contains_key(&note_id) { continue; }
+                    let count = self.index()?.count_in(query, &ifilter, request.match_field, note_id)?;
+                    note_counts.insert(note_id, count);
+                }
+            }
+        }
         // 一次批量取回全部命中本体：`load_many` 的语义等同于逐条 `get`（同样的过滤、同样的装配），
         // 但把每条命中的两轮 SQL（matches_filter + record_value）压成固定三条。
         // 用 id 做键再按 `ranked` 顺序装配，批量取回的顺序不会影响名次。
@@ -376,7 +407,8 @@ impl KnowledgeBase {
             // 索引里还有文档、库里记录已不在（并发删除、或索引尚未追上）时跳过这一条：
             // 为一条已消失的记录让别人的整次检索失败，代价不对等。
             let Some(record) = records.remove(&key.id) else { continue };
-            hits.push(SearchHit { record, key, score, text_score, vector_scores, rerank_score: rerank_scores.get(&key).copied() });
+            let note_chunks = chunk_notes.get(&key.id).and_then(|note_id| note_counts.get(note_id).copied());
+            hits.push(SearchHit { record, key, score, text_score, vector_scores, rerank_score: rerank_scores.get(&key).copied(), note_chunks });
         }
         for degrade in &diagnostics.degraded { self.note_degrade(*degrade); }
         Ok(SearchResult { hits, revision: storage::current_revision(conn)?, indexed_revision: storage::meta(conn, "indexed_revision")?, total, diagnostics })

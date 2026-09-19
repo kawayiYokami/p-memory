@@ -107,7 +107,7 @@ struct PresetResult {
 }
 struct NoteSection {             // 笔记那一路：书名块 / 内容块 / 路径兜底同时返回
     titles: Vec<SearchHit>,      // 文件名命中（name 列），纯全文
-    contents: Vec<SearchHit>,    // 正文命中（text 列）
+    contents: Vec<SearchHit>,    // 正文命中（text 列）；同一篇只留最高的一片，note_chunks 报出这一篇的片段总数
     paths: Vec<SearchHit>,       // 书名块不足时用目录段（path 列）补的，排最后
 }
 struct GraphSection {

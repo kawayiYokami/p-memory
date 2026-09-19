@@ -1367,10 +1367,12 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
         assert_eq!(tags, vec!["bwiki".to_string(), "人物".to_string(), "沧州".to_string(), "澜川".to_string()],
             "调用方标签与路径段标签合并去重后挂在每一片上");
     }
-    // 查「澜川」：正文里全是它，每一片都由自己的正文命中。
+    // 查「澜川」：正文里全是它，每一片都命中——但同一篇只保留排名最高的一片，
+    // 并带上「这一篇共有多少片段命中」，否则这一篇会用自己的几十片占满整个结果列表。
     let hits = kb.search(&SearchRequest { query: "澜川".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
-    assert_eq!(hits.len(), chunks.len(), "每片都能被搜到");
-    assert!(hits.iter().all(|hit| hit.text_score.is_some_and(|score| score > 0.0)), "每片都拿到分");
+    assert_eq!(hits.len(), 1, "同一篇笔记折叠成一条");
+    assert_eq!(hits[0].note_chunks, Some(chunks.len()), "并告诉调用方这一篇共有多少片段命中");
+    assert!(hits[0].text_score.is_some_and(|score| score > 0.0), "命中的那一片拿到分");
     // 调用方标签拼在第一片上：只有第一片命中。
     let caller_tag_hits = kb.search(&SearchRequest { query: "人物".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(caller_tag_hits.len(), 1, "调用方标签只拼在第一片上");
@@ -1384,7 +1386,7 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let by_tag = |tag: &str| kb.search(&SearchRequest { query: "澜川".into(),
         filter: ReadFilter { tags: vec![tag.into()], ..Default::default() }, kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() })
         .unwrap().hits.len();
-    assert_eq!(by_tag("沧州"), chunks.len());
+    assert_eq!(by_tag("沧州"), 1, "同一篇折叠成一条，但按目录段筛选仍能定位到它");
     assert_eq!(by_tag("库里没有的标签"), 0);
     // 笔记自己不占索引文档：文档数 = 记录数 − 笔记数。
     let before = kb.health().unwrap();
@@ -1395,6 +1397,43 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     assert_eq!(again.len(), hits.len(), "重建后命中条数一致");
     assert_eq!(again[0].key.id, hits[0].key.id, "重建后名次一致");
     assert_eq!(kb.health().unwrap().index_document_count, before.record_count - 1);
+}
+
+/// 同一篇笔记的多个命中片段折叠成一条：只留排名最高的一片，
+/// 并告诉调用方这一篇共有多少片段命中——这个数与结果窗口、翻页无关。
+#[test]
+fn chunks_from_one_note_collapse_to_one_hit_with_the_note_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
+    // 一篇：正文反复出现同一个词，切成多片，每片都命中。
+    let many_path = dir.path().join("对话.md");
+    std::fs::write(&many_path, "派蒙".repeat(800)).unwrap();
+    let many = kb.notes().upsert_file(NoteFileInput::new(&many_path)).unwrap().value;
+    let many_chunks = kb.notes().chunks(many.header.id, &ReadFilter::default()).unwrap();
+    assert!(many_chunks.len() > 1, "这篇应当切成多片");
+    // 另一篇：只命中一片。
+    let once_path = dir.path().join("独白.md");
+    std::fs::write(&once_path, "派蒙").unwrap();
+    let once = kb.notes().upsert_file(NoteFileInput::new(&once_path)).unwrap().value;
+
+    let hits = kb.search(&SearchRequest { query: "派蒙".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 2, "两篇各出且只出一条，多片段那篇不许刷屏");
+    let many_hit = hits.iter().find(|hit| hit.record["note_id"] == json!(many.header.id)).unwrap();
+    assert_eq!(many_hit.note_chunks, Some(many_chunks.len()), "多片段那篇报出它的片段总数");
+    let once_hit = hits.iter().find(|hit| hit.record["note_id"] == json!(once.header.id)).unwrap();
+    assert_eq!(once_hit.note_chunks, Some(1), "单片段那篇报 1");
+
+    // 计数是查询本身的属性：把 limit 收到 1，这一篇的计数不因此变小。
+    let narrow = kb.search(&SearchRequest { query: "派蒙".into(), kinds: vec![RecordKind::Chunk], limit: 1, ..Default::default() }).unwrap().hits;
+    assert_eq!(narrow.len(), 1);
+    assert_eq!(narrow[0].note_chunks, Some(many_chunks.len()), "窗口变小，片段计数不变");
+
+    // 名字与目录列是笔记级的，一篇至多一条，不参与片段计数。
+    let by_name = kb.search(&SearchRequest { query: "对话".into(), kinds: vec![RecordKind::Chunk],
+        match_field: MatchField::Name, ..Default::default() }).unwrap().hits;
+    assert!(!by_name.is_empty());
+    assert!(by_name.iter().all(|hit| hit.note_chunks.is_none()), "只看名字列时不报片段数");
 }
 
 // ── 预设检索 ──────────────────────────────────────────────────────────

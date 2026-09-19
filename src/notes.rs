@@ -187,6 +187,7 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
                 (id, crate::index::IndexDocument { id, namespace_id, scope_id, kind: RecordKind::Chunk,
                     text: chunk.content.clone(),
                     name, path,
+                    note_id: header.id,
                     tags_prefix: storage::tags_prefix(RecordKind::Chunk, &header.tags, &exclude, &payload),
                     tag_ids })
             }

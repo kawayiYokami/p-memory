@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::atomic::AtomicUsize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
+use tantivy::{collector::{Count, DocSetCollector, TopDocs, sort_key::{SortBySimilarityScore, SortByString}}, directory::MmapDirectory, doc, Order,
     query::{BoostQuery, BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery},
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v10";
+const FORMAT: &str = "p-memory-text-v11";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, path: Field, body: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, path: Field, note: Field, body: Field }
 
 /// 名字字段命中时的固定加权：规范名单独成列后，名字整段命中是最强的相关信号，给它固定倍数抬高。
 const NAME_FIELD_BOOST: f32 = 3.0;
@@ -56,6 +56,8 @@ pub(crate) struct IndexDocument {
     /// 笔记所在目录：相对路径里除文件名之外的各段，空格连接。只有切片记录写这一列，
     /// 常规检索不查它——它是「书名块不够时」才动用的兜底。
     pub path: String,
+    /// 切片所属笔记的记录 id（只挂切片，其它记录为 0）：用来按笔记精确统计「还有多少片段命中」。
+    pub note_id: i64,
     /// 拼在可搜正文前面的标签集（空格连接，空串表示不带）。索引里没有单独的标签文本列：
     /// 标签只有承载它的那一条带——切片是第一片，其余记录是它自己；取值规则见 `storage::tags_prefix`。
     pub tags_prefix: String,
@@ -108,6 +110,9 @@ impl TextIndex {
             // 笔记所在目录单独一列：目录段不进正文列（否则搜「璃月」会命中该目录下每一篇），
             // 只在「书名块不够」的兜底查询里被查。
             path: builder.add_text_field("path", tokenized()),
+            // 切片所属笔记的记录 id：只挂在切片上，用来数「这一篇里有多少切片命中」。
+            // 这条计数与结果窗口无关，所以只能在索引里按笔记精确统计，不能靠截断后的结果集去数。
+            note: builder.add_u64_field("note", INDEXED),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
             body: builder.add_text_field("body", STORED),
         };
@@ -179,6 +184,7 @@ impl TextIndex {
         if !cleaned.is_empty() { document.add_text(self.fields.text, text::tokenize(&cleaned).join(" ")); }
         if !item.name.is_empty() { document.add_text(self.fields.name, text::tokenize(&item.name).join(" ")); }
         if !item.path.is_empty() { document.add_text(self.fields.path, text::tokenize(&item.path).join(" ")); }
+        if item.note_id != 0 { document.add_u64(self.fields.note, item.note_id as u64); }
         writer.add_document(document)?;
         Ok(())
     }
@@ -322,6 +328,7 @@ impl TextIndex {
                 _ => (storage::record_name(kind, &payload), String::new(), Vec::new()),
             };
             documents.push(IndexDocument { id, namespace_id, scope_id, kind, text, name, path,
+                note_id: if kind == RecordKind::Chunk { payload.get("note_id").and_then(|v| v.as_i64()).unwrap_or(0) } else { 0 },
                 tags_prefix: storage::tags_prefix(kind, &tags, &exclude, &payload),
                 tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
@@ -437,6 +444,22 @@ impl TextIndex {
         result.sort_by(|a, b| strict_rank[&b.0].cmp(&strict_rank[&a.0]).then_with(|| b.1.total_cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
         result.truncate(limit);
         Ok(result)
+    }
+
+    /// 数一数「某一篇笔记里，有多少条切片命中这个查询」。
+    /// 与 `search_in` 同源：同一套词元、同一套过滤条件，另加一条「属于该笔记」的约束。
+    /// 用来告诉调用方「这篇文档还有多少片段相关」——它是查询本身的属性，与结果窗口、翻页无关，
+    /// 所以必须在这里精确统计，不能拿截断后的结果集去数。
+    /// 宽松词元集是严格词元集的超集，两者的命中集因此是包含关系，只数宽松那一遍就是并集。
+    pub fn count_in(&self, query: &str, filter: &IndexFilter, field: MatchField, note_id: i64) -> Result<usize> {
+        let tokens = text::query_terms(query, false);
+        if tokens.is_empty() { return Ok(0); }
+        let base = self.filtered_query(&tokens, false, filter, field);
+        let with_note = BooleanQuery::new(vec![
+            (Occur::Must, base),
+            (Occur::Must, Self::exact_u64(self.fields.note, note_id)),
+        ]);
+        Ok(self.reader.searcher().search(&with_note, &Count)?)
     }
 
     /// 按 id 取回索引里存储的正文：重排候选取正文、以及「切片正文从索引读」都走这里，不再回源文件。

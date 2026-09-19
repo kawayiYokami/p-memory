@@ -55,7 +55,7 @@ def test_memory_roundtrip_is_a_flat_dict(kb):
 
     hits = kb.search("简短回答")["hits"]
     assert [h["record"]["judgment"] for h in hits] == ["用户偏好简短回答"]
-    assert set(hits[0]) == {"key", "record", "score", "text_score", "vector_scores", "rerank_score"}
+    assert set(hits[0]) == {"key", "record", "score", "text_score", "vector_scores", "rerank_score", "note_chunks"}
 
 
 def test_upsert_by_judgment_deduplicates_within_scope(kb):
@@ -217,6 +217,25 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
     bad.write_bytes(b"\xff\xfe\xfd")
     with pytest.raises(PMemoryError):
         kb.notes.upsert_file(path=str(bad))
+
+
+def test_chunks_from_one_note_collapse_with_the_note_total(kb, tmp_path):
+    """同一篇笔记命中多片时只出一条，并报出这一篇共有多少片段命中。"""
+    many = tmp_path / "对话.md"
+    many.write_text("派蒙" * 800, encoding="utf-8", newline="")
+    many_note = kb.notes.upsert_file(path=str(many))["value"]
+    many_chunks = kb.notes.chunks(many_note["id"])
+    assert len(many_chunks) > 1, "这篇应当切成多片"
+
+    once = tmp_path / "独白.md"
+    once.write_text("派蒙", encoding="utf-8", newline="")
+    once_note = kb.notes.upsert_file(path=str(once))["value"]
+
+    hits = kb.search("派蒙", kinds=["chunk"], limit=50)["hits"]
+    by_note = {hit["record"]["note_id"]: hit for hit in hits}
+    assert set(by_note) == {many_note["id"], once_note["id"]}, "两篇各出且只出一条，多片段那篇不许刷屏"
+    assert by_note[many_note["id"]]["note_chunks"] == len(many_chunks), "多片段那篇报出片段总数"
+    assert by_note[once_note["id"]]["note_chunks"] == 1, "单片段那篇报 1"
 
 
 def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(kb, tmp_path):

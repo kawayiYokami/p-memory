@@ -526,7 +526,9 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     // 标记一律带整数 id 给索引：namespace、scope、kind、tags 都不写第二份文本。
     let (name, path, exclude) = index_columns(conn, kind, payload);
     let document = crate::index::IndexDocument { id, namespace_id, scope_id, kind,
-        text: text.to_string(), name, path, tags_prefix: tags_prefix(kind, &tags, &exclude, payload), tag_ids };
+        text: text.to_string(), name, path,
+        note_id: if kind == RecordKind::Chunk { payload.get("note_id").and_then(Value::as_i64).unwrap_or(0) } else { 0 },
+        tags_prefix: tags_prefix(kind, &tags, &exclude, payload), tag_ids };
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
@@ -567,8 +569,23 @@ pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text:
     let (name, path, exclude) = index_columns(conn, kind, &payload);
     Ok(crate::index::IndexDocument { id, namespace_id, scope_id, kind, text,
         name, path,
+        note_id: if kind == RecordKind::Chunk { payload.get("note_id").and_then(Value::as_i64).unwrap_or(0) } else { 0 },
         tags_prefix: tags_prefix(kind, &tags, &exclude, &payload),
         tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() })
+}
+
+/// 一批记录 id 里哪些是切片、各自属于哪一篇笔记。非切片不出现在结果里。
+/// 「一篇笔记有多少片段命中」要按笔记精确统计，靠的就是这层「切片 → 笔记」的归属。
+pub(crate) fn chunk_note_ids(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, i64>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() { return Ok(out); }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!("SELECT record_id,note_id FROM chunks WHERE record_id IN ({placeholders})"))?;
+    for row in stmt.query_map(params_from_iter(ids.iter().copied()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        let (id, note_id) = row?;
+        out.insert(id, note_id);
+    }
+    Ok(out)
 }
 
 /// 该知识领域登记的笔记根目录；没登记就是 `None`。
