@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+pub(crate) const SCHEMA_VERSION: i64 = 11;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -103,6 +103,24 @@ fn migrate_note_paths(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v10 -> v11：笔记的文件名从「索引期按路径现推」改为「写入时就存下来」。
+/// 加一列并就地按 path 回填：`Path::file_stem` 认平台分隔符，比事后拆字符串可靠。
+fn migrate_note_names(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch("ALTER TABLE notes ADD COLUMN name TEXT NOT NULL DEFAULT ''")?;
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT record_id,path FROM notes")?;
+        let collected = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        collected
+    };
+    let mut update = tx.prepare("UPDATE notes SET name=?2 WHERE record_id=?1")?;
+    for (id, path) in rows {
+        let stem = std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        update.execute(rusqlite::params![id, stem])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != 0 && !(2..=SCHEMA_VERSION).contains(&version) {
@@ -159,6 +177,8 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             8 => { tx.execute_batch(MIGRATION_8_TO_9)?; }
             // v9 -> v10：谓词等价词表。
             9 => { tx.execute_batch(MIGRATION_9_TO_10)?; }
+            // v10 -> v11：笔记文件名落库（写入时取好），不再由索引期拆路径现推。
+            10 => { migrate_note_names(&tx)?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -201,6 +221,10 @@ mod tests {
         // v10 之前没有谓词等价词表；回退到旧版本时删掉，供 v9→v10 迁移验证。
         if version < 10 {
             conn.execute_batch("DROP TABLE predicate_equivalents;").unwrap();
+        }
+        // v11 之前 notes 没有 name 列；回退到旧版本时删掉，供 v10→v11 迁移验证。
+        if (7..11).contains(&version) {
+            conn.execute_batch("ALTER TABLE notes DROP COLUMN name;").unwrap();
         }
         conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -290,6 +314,30 @@ mod tests {
         assert_eq!(note.get("chunk_chars").and_then(|v| v.as_u64()), Some(220), "只留切片粒度");
         let migrated_path: String = conn.query_row("SELECT path FROM notes WHERE record_id=1", [], |r| r.get(0)).unwrap();
         assert_eq!(migrated_path, source_path, "笔记路径应从标签字典原样迁到 path 列");
+    }
+
+    /// v10 形态的库前滚到当前版本：笔记文件名就地回填，写入时存下的名字立刻可用。
+    #[test]
+    fn rolls_v10_forward_backfilling_note_names() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_db(dir.path(), 10, "");
+        let note_path = dir.path().join("bwiki").join("沧州").join("澜川.md");
+        std::fs::create_dir_all(note_path.parent().unwrap()).unwrap();
+        std::fs::write(&note_path, "甲乙丙").unwrap();
+        {
+            let conn = Connection::open(dir.path().join("store.sqlite3")).unwrap();
+            conn.execute_batch(&format!(r#"
+                INSERT INTO strings(id,text) VALUES (10,'ns'),(11,'sc'),(12,'bwiki/沧州/澜川.md');
+                INSERT INTO records(id,namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,fingerprint,payload_json)
+                VALUES (1,10,4,11,1,1,1,'{{}}','[]','nf','{{"chunk_chars":220}}');
+                INSERT INTO notes(record_id,namespace_id,scope_id,path) VALUES (1,10,11,'bwiki/沧州/澜川.md');
+            "#)).unwrap();
+        }
+        let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
+        let conn = Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        let name: String = conn.query_row("SELECT name FROM notes WHERE record_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(name, "澜川", "迁移就地按 path 回填文件名（去扩展名）");
     }
 }
 

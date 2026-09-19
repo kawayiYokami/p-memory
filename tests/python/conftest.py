@@ -26,6 +26,12 @@ def open_kb(tmp_path):
 
 
 @pytest.fixture
-def kb(open_kb):
-    """默认库：namespace=default、scopes=(public,)、write_scope=public。"""
-    return open_kb()
+def kb(open_kb, tmp_path):
+    """默认库：namespace=default、scopes=(public,)、write_scope=public。
+
+    默认把 `tmp_path` 登记为该领域的笔记根目录：笔记写入要求根目录存在，
+    用例里的笔记文件都放在 `tmp_path` 下。
+    """
+    kb = open_kb()
+    kb.notes.set_root("default", str(tmp_path))
+    return kb

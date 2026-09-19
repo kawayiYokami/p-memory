@@ -126,14 +126,15 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
     let mut record = input.record.clone();
     let namespace_id = storage::term_id(conn, &record.namespace)?;
     let scope_id = storage::term_id(conn, &record.scope)?;
-    // 领域登记过根目录：存库与进索引的都是减掉根目录的相对路径。
-    // 路径拆成「目录段 + 文件名」：目录段仍当标签挂着（按文件夹筛笔记要用），
-    // 但它与文件名都已升格成独立索引列，由 `tags_prefix` 从可搜正文里摘掉。
-    // 没登记就维持原样——路径逐字符存、不拆标签。
-    let (source, dirs, stem) = match storage::namespace_root(conn, namespace_id)? {
-        Some(root) => { let relative = relative_note_path(&root, &given)?; let (dirs, stem) = storage::split_note_path(&relative); (relative, dirs, stem) }
-        None => (given.clone(), Vec::new(), String::new()),
-    };
+    // 领域必须登记根目录：写入路径与它比对前缀，不重合直接拒绝、重合的部分裁掉。
+    // 库里存的永远是相对路径——项目从头到尾不知道前面的绝对路径是什么。
+    let root = storage::namespace_root(conn, namespace_id)?.ok_or_else(|| Error::Validation(
+        format!("namespace {} has no registered domain root; call notes.set_root before upserting notes", record.namespace)))?;
+    let source = relative_note_path(&root, &given)?;
+    let (dirs, split_stem) = storage::split_note_path(&source);
+    // 文件名以写入时取好的 `title`（`file_stem`）为准，与落库的 `notes.name` 同源；
+    // `split_note_path` 只用来取目录段。
+    let stem = if title.is_empty() { split_stem } else { title.clone() };
     // 这一份标签挂到这篇的每一条切片上：调用方给的 + 路径拆出来的。
     let mut merged = record.tags.clone();
     merged.extend(dirs.iter().cloned());
@@ -150,9 +151,11 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
     let (header, _) = storage::put_record(conn, RecordKind::Note, &record,
         &json!({"chunk_chars":input.chunk_chars}), "")?;
     let mut documents = Vec::new();
-    conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path) VALUES (?1,?2,?3,?4)
-        ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path",
-        params![header.id, namespace_id, scope_id, source])?;
+    // 文件名在写入这一刻就从路径取好（`file_stem` 认平台分隔符），随笔记落库：
+    // 索引那一列直接读它，重建时也不必再拆一次路径。
+    conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path,name) VALUES (?1,?2,?3,?4,?5)
+        ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path,name=excluded.name",
+        params![header.id, namespace_id, scope_id, source, title])?;
     // Reuse the record ID of any slice whose ordinal和内容都未变，让它的向量继续有效。
     let mut old = Vec::new();
     {

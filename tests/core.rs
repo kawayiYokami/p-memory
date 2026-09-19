@@ -202,6 +202,7 @@ fn sync_stops_after_the_first_failing_batch() {
 #[test]
 fn writes_stay_clean_and_the_batch_end_sync_fills_vectors() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     // 空间先登记好（登记不算有模型）；回调稍后再接，用来证明写入那次一次模型都没调。
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
     let mut tagged = memory("记住她喜欢苹果", "public");
@@ -302,6 +303,7 @@ fn vectorization_targets_are_independent_per_namespace() {
 #[test]
 fn notes_switch_gates_chunk_vectors_and_keeps_existing_ones() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("n.md");
     std::fs::write(&path, "切片正文里的独有措辞").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
@@ -355,6 +357,7 @@ fn vectorization_switches_survive_reopen() {
         kb.close().unwrap();
     }
     let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     assert!(!kb.embeddings().vectorization("default", "memory").unwrap());
     assert!(kb.embeddings().vectorization("default", "notes").unwrap());
     assert!(kb.embeddings().vectorization("default", "graph").unwrap(), "没设过的档位仍取内置默认");
@@ -370,6 +373,7 @@ fn vectorization_switches_survive_reopen() {
 #[test]
 fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let id = kb.memories().upsert(memory("待删除的记忆措辞", "public")).unwrap().value.header.id;
     fill(&kb, "v");
     assert_eq!(kb.search(&vector_query("v", "待删除的记忆措辞", vec![RecordKind::Memory])).unwrap().hits[0].key.id, id);
@@ -431,6 +435,7 @@ fn background_thread_backfills_after_the_batch_ends() {
 #[test]
 fn chunk_vectors_come_from_the_real_body_not_an_empty_one() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
     let path = dir.path().join("n.md");
     std::fs::write(&path, "切片正文独有措辞").unwrap();
@@ -447,6 +452,7 @@ fn chunk_vectors_come_from_the_real_body_not_an_empty_one() {
 #[test]
 fn the_gap_counts_only_enabled_targets() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     // 笔记档默认关：写入的笔记不生成向量，笔记档也就谈不上就绪。
     let path = dir.path().join("n.md");
     std::fs::write(&path, "笔记正文里的措辞").unwrap();
@@ -891,6 +897,7 @@ fn graph_integrity_aliases_and_rename_propagation() {
 #[test]
 fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let tea_path = dir.path().join("tea.md");
     std::fs::write(&tea_path, "# 茶\n\n上海喝茶\n\n```rust\nlet x = 1;\n```\n\n最后一段").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&tea_path)).unwrap().value;
@@ -1154,6 +1161,7 @@ fn text_gate_excludes_records_that_do_not_match_the_query() {
 #[test]
 fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("世界观.md");
     let raw = "# 标题\n\n这里有 **独有措辞** 正文。";
     std::fs::write(&path, raw).unwrap();
@@ -1188,6 +1196,7 @@ fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
 fn note_body_lives_only_in_the_index_not_in_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("note.md");
     std::fs::write(&path, "ZZBODYMARK 独有正文标记").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
@@ -1212,7 +1221,7 @@ fn note_body_lives_only_in_the_index_not_in_sqlite() {
 }
 
 /// 切片只装它自己那一段正文；文件名与目录只挂在这一篇的第一片上。
-/// 没登记领域根目录就不拆路径，文件名与目录都不成列，谁都搜不到。
+/// 根目录是写入前提：没登记就拒绝写入；登记后文件名进名字列、目录段进目录列且不参与常规匹配。
 #[test]
 fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     let dir = tempfile::tempdir().unwrap();
@@ -1220,18 +1229,16 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     let root = dir.path().to_string_lossy().into_owned();
     let note_dir = dir.path().join("绝区零").join("角色");
     std::fs::create_dir_all(&note_dir).unwrap();
+    // 没登记根目录就写笔记：直接拒绝——根目录是写入的前提，库从头到尾不接触上游绝对路径。
+    let bare_path = note_dir.join("无根.md");
+    std::fs::write(&bare_path, "苹果 香蕉 橘子").unwrap();
+    assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&bare_path)), Err(Error::Validation(_))),
+        "没登记根目录就拒绝写入");
+    assert_eq!(kb.health().unwrap().record_count, 0, "被拒的笔记一条都不落库");
+    // 登记根目录后写入这一篇：文件名进名字列、目录段进目录列，都只挂第一片。
+    kb.notes().set_root("default", &root).unwrap();
     let short_path = note_dir.join("雅.md");
     std::fs::write(&short_path, "苹果 香蕉 橘子").unwrap();
-    let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
-    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].content, "苹果 香蕉 橘子", "切片正文逐字符等于切片原文");
-    for word in ["雅", "角色", "绝区零"] {
-        assert!(kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits.is_empty(),
-            "没登记根目录就不拆路径：{word}");
-    }
-    // 登记根目录后重新写入：文件名进名字列、目录段进目录列，都只挂第一片。
-    kb.notes().set_root("default", &root).unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
     let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
     let stored: String = conn.query_row("SELECT path FROM notes WHERE record_id=?1", [note.header.id], |r| r.get(0)).unwrap();
@@ -1269,6 +1276,7 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
 fn indexed_text_survives_the_source_file_but_a_rebuild_needs_it() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("gone.md");
     std::fs::write(&path, "会被删掉的正文").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
@@ -1288,6 +1296,7 @@ fn indexed_text_survives_the_source_file_but_a_rebuild_needs_it() {
 fn rerank_reads_chunk_bodies_from_the_index_not_from_the_source_file() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("唯一笔记.md");
     std::fs::write(&path, "青提苹果 ZZTEXTMARK").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
@@ -1313,6 +1322,7 @@ fn rerank_reads_chunk_bodies_from_the_index_not_from_the_source_file() {
 fn memory_and_chunk_score_the_same_text_identically() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let text = "青提苹果";
     kb.memories().upsert(memory(text, "public")).unwrap();
     let path = dir.path().join("同文本.md");
@@ -1580,6 +1590,7 @@ fn preset_fields_stay_separate() {
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("预设字段分离用的记忆", "public")).unwrap();
     kb.graph().apply_batch(&GraphBatch { entities: vec![entity("预设字段分离用的实体")], ..Default::default() }).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("预设字段分离用的笔记.md");
     std::fs::write(&path, "预设字段分离用的正文".repeat(20)).unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();

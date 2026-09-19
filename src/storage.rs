@@ -434,18 +434,16 @@ pub(crate) fn split_note_path(relative: &str) -> (Vec<String>, String) {
     (dirs.iter().map(|segment| segment.to_string()).collect(), stem.to_string())
 }
 
-/// 一篇笔记的「目录段 / 文件名」，从库里的相对路径现推。切片记录只有 `note_id`，
-/// 名字与目录两列都由它回查笔记路径得到。
+/// 一篇笔记的「目录段 / 文件名」。文件名直接读写入时存下的 `notes.name`（不事后拆路径，
+/// 平台的路径分隔符与扩展名边界都由 `Path` 在写入那一刻定好）；目录段取相对路径去掉末段。
+/// 登记根目录后库里存的必是相对路径；迁移前留下的绝对路径没有相对目录可言，只给名字。
 pub(crate) fn note_path_parts(conn: &Connection, note_id: i64) -> (Vec<String>, String) {
-    let Ok((path, namespace_id)) = conn.query_row("SELECT path,namespace_id FROM notes WHERE record_id=?1", [note_id],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else {
+    let Ok((path, name)) = conn.query_row("SELECT path,name FROM notes WHERE record_id=?1", [note_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
         return (Vec::new(), String::new());
     };
-    // 没登记根目录的领域把路径原样存着（绝对路径），不拆：否则每一段目录都会变成文件名。
-    match namespace_root(conn, namespace_id) {
-        Ok(Some(_)) => split_note_path(&path),
-        _ => (Vec::new(), String::new()),
-    }
+    if Path::new(&path).is_absolute() { return (Vec::new(), name); }
+    (split_note_path(&path).0, name)
 }
 
 /// 一条记录在索引里的「名字列 / 目录列 / 从可搜前缀里摘除的标签」。
@@ -613,15 +611,15 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
         let (id, tag) = row?;
         tags.entry(id).or_default().push(tag);
     }
-    // 笔记的路径是它自己的一列（原样）：读取时按 record_id 补回（及其派生 title），
+    // 笔记的路径与文件名都是它自己的列（原样）：读取时按 record_id 补回，
     // 路径不进标签字典，payload 里也不重复存。
-    let mut note_paths: BTreeMap<i64, String> = BTreeMap::new();
+    let mut note_meta: BTreeMap<i64, (String, String)> = BTreeMap::new();
     {
-        let mut stmt = conn.prepare(&format!("SELECT n.record_id,n.path FROM notes n \
+        let mut stmt = conn.prepare(&format!("SELECT n.record_id,n.path,n.name FROM notes n \
             WHERE n.record_id IN ({placeholders})"))?;
-        for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-            let (id, source) = row?;
-            note_paths.insert(id, source);
+        for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+            let (id, path, name) = row?;
+            note_meta.insert(id, (path, name));
         }
     }
     for (id, namespace_id, namespace, kind_code, scope, created, updated, revision, metadata, evidence, payload) in rows {
@@ -639,11 +637,10 @@ pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i
         }
         if kind == RecordKind::Note {
             // 库里存的是相对路径（登记过领域根目录时），对外取回时拼回绝对路径。
-            let stored = note_paths.remove(&id).unwrap_or_default();
+            let (stored, name) = note_meta.remove(&id).unwrap_or_default();
             let source = absolute_note_path(conn, namespace_id, &stored);
-            let title = std::path::Path::new(&source).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             payload.insert("source".into(), Value::String(source));
-            payload.insert("title".into(), Value::String(title));
+            payload.insert("title".into(), Value::String(name));
         }
         object.extend(payload);
         out.insert(id, value);

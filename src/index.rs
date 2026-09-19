@@ -11,7 +11,7 @@ use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityS
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v9";
+const FORMAT: &str = "p-memory-text-v10";
 
 struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, path: Field, body: Field }
 

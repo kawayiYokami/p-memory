@@ -53,7 +53,7 @@ struct EventDraft { table: String, source_id: String, record: RecordInput, name:
 struct NoteDraft { table: String, source_id: String, input: NoteFileInput }
 #[derive(Default, Serialize)]
 struct Plan { memories: Vec<MemoryDraft>, entities: Vec<EntityDraft>, relations: Vec<RelationDraft>, events: Vec<EventDraft>,
-    notes: Vec<NoteDraft>, missing: BTreeSet<String>, warnings: Vec<String> }
+    notes: Vec<NoteDraft>, roots: BTreeMap<String, String>, missing: BTreeSet<String>, warnings: Vec<String> }
 type Row = serde_json::Map<String,Value>;
 
 fn source_conn(path: &Path) -> Result<Connection> {
@@ -337,6 +337,8 @@ fn import_notes(req:&ImportRequest,plan:&mut Plan,index_rows:Vec<Row>,raw:&[Row]
         let domain=if matches!(req.source,LegacySource::WorldTree){relative.split('/').next().filter(|_|relative.contains('/')).unwrap_or("")}else{""};
         let domain={let explicit=string(&row,"domain");if explicit.is_empty(){domain.to_string()}else{explicit}};
         let ns=namespace(req,&domain);
+        // 笔记根目录是写入的前提：导入时按领域登记下来，笔记才存得成相对路径。
+        plan.roots.entry(ns.clone()).or_insert_with(|| root.to_string_lossy().replace('\\',"/"));
         if !seen.insert((ns.clone(),path.clone())){continue}
         let sid=format!("{ns}:{relative}");
         let mut rec=record(req,"notes",&sid,&row,&domain)?;
@@ -379,6 +381,12 @@ fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut
         let (event,document)=graph::upsert_event(conn,&EventInput{record:draft.record.clone(),name:draft.name.clone(),summary:draft.summary.clone(),participants,confidence:draft.confidence,reason:draft.reason.clone()})?;
         documents.push(document);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:event.header.id});
+    }
+    // 先按领域登记笔记根目录：`sync_file` 要求根目录存在，笔记才存得成相对路径。
+    for (namespace, root) in &plan.roots {
+        let namespace_id = storage::term_id(conn, namespace)?;
+        conn.execute("INSERT INTO namespace_roots(namespace_id,root) VALUES (?1,?2) ON CONFLICT(namespace_id) DO UPDATE SET root=excluded.root",
+            params![namespace_id, root])?;
     }
     for draft in &plan.notes { let (note,staged)=notes::sync_file(conn,&draft.input)?; documents.extend(staged);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id}); }

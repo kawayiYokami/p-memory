@@ -40,7 +40,7 @@ kb.notes.root("akasha/gi")                                  # -> "./data/domain/
 kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
 ```
 
-登记之后库里存的是相对路径 `bwiki/沧州/澜川.md`，拆出的 `bwiki` / `沧州` / `澜川` 与调用方标签合并、挂到这一篇的每条切片上；`path` 不在根目录之内报 `ValidationError`。没登记根目录的领域维持原样：路径逐字符存，不拆标签。
+登记之后库里存的是相对路径 `bwiki/沧州/澜川.md`，拆出的 `bwiki` / `沧州` / `澜川` 与调用方标签合并、挂到这一篇的每条切片上；根目录是写入前提，没登记就写 `upsert_file` 直接报 `ValidationError`，`path` 不在根目录之内同样报 `ValidationError`。
 
 预设检索：
 
