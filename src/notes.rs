@@ -126,15 +126,18 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
     let mut record = input.record.clone();
     let namespace_id = storage::term_id(conn, &record.namespace)?;
     let scope_id = storage::term_id(conn, &record.scope)?;
-    // 领域登记过根目录：存库与进索引的都是减掉根目录的相对路径，相对路径按 / 拆段当标签。
+    // 领域登记过根目录：存库与进索引的都是减掉根目录的相对路径。
+    // 路径拆成「目录段 + 文件名」：目录段仍当标签挂着（按文件夹筛笔记要用），
+    // 但它与文件名都已升格成独立索引列，由 `tags_prefix` 从可搜正文里摘掉。
     // 没登记就维持原样——路径逐字符存、不拆标签。
-    let (source, path_tags) = match storage::namespace_root(conn, namespace_id)? {
-        Some(root) => { let relative = relative_note_path(&root, &given)?; let tags = path_tags(&relative); (relative, tags) }
-        None => (given.clone(), Vec::new()),
+    let (source, dirs, stem) = match storage::namespace_root(conn, namespace_id)? {
+        Some(root) => { let relative = relative_note_path(&root, &given)?; let (dirs, stem) = storage::split_note_path(&relative); (relative, dirs, stem) }
+        None => (given.clone(), Vec::new(), String::new()),
     };
     // 这一份标签挂到这篇的每一条切片上：调用方给的 + 路径拆出来的。
     let mut merged = record.tags.clone();
-    merged.extend(path_tags);
+    merged.extend(dirs.iter().cloned());
+    if !stem.is_empty() { merged.push(stem.clone()); }
     record.tags = merged;
     let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
         params![namespace_id, scope_id, source], |r| r.get(0)).optional()?;
@@ -177,10 +180,11 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
                 conn.execute("UPDATE records SET fingerprint=?2,updated_at_us=MAX(updated_at_us,?3) WHERE id=?1",
                     params![id, fingerprint, header.updated_at_us])?;
                 conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
+                let (name, path, exclude) = storage::index_columns(conn, RecordKind::Chunk, &payload);
                 (id, crate::index::IndexDocument { id, namespace_id, scope_id, kind: RecordKind::Chunk,
                     text: chunk.content.clone(),
-                    name: String::new(),
-                    tags_prefix: storage::tags_prefix(RecordKind::Chunk, &header.tags, &payload),
+                    name, path,
+                    tags_prefix: storage::tags_prefix(RecordKind::Chunk, &header.tags, &exclude, &payload),
                     tag_ids })
             }
             None => {
@@ -210,17 +214,6 @@ fn relative_note_path(root: &str, given: &str) -> Result<String> {
     };
     if relative.is_empty() { return Err(Error::Validation("note path must name a file below the domain root".into())); }
     Ok(relative.to_string())
-}
-
-/// 相对路径按 / 拆段当标签：目录段原样，最后一段（文件名）去掉扩展名。
-fn path_tags(relative: &str) -> Vec<String> {
-    let segments: Vec<&str> = relative.split('/').filter(|segment| !segment.is_empty()).collect();
-    let last = segments.len().saturating_sub(1);
-    segments.iter().enumerate()
-        .map(|(index, segment)| if index == last { segment.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(segment) } else { segment })
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_string())
-        .collect()
 }
 
 #[derive(Clone)]
@@ -314,11 +307,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_segments_become_tags_and_only_the_file_name_loses_its_extension() {
-        assert_eq!(path_tags("bwiki/沧州/澜川.md"), vec!["bwiki".to_string(), "沧州".to_string(), "澜川".to_string()]);
+    fn split_note_path_separates_directories_from_the_file_name() {
+        assert_eq!(storage::split_note_path("bwiki/沧州/澜川.md"), (vec!["bwiki".to_string(), "沧州".to_string()], "澜川".to_string()));
         // 目录段里的点不是扩展名：只有最后一段去后缀。
-        assert_eq!(path_tags("v1.2/角色.设定.md"), vec!["v1.2".to_string(), "角色.设定".to_string()]);
-        assert_eq!(path_tags("澜川"), vec!["澜川".to_string()]);
+        assert_eq!(storage::split_note_path("v1.2/角色.设定.md"), (vec!["v1.2".to_string()], "角色.设定".to_string()));
+        assert_eq!(storage::split_note_path("澜川"), (Vec::new(), "澜川".to_string()));
     }
 
     #[test]

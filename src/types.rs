@@ -212,6 +212,22 @@ pub struct HealthReport {
     pub last_degraded: Vec<Degrade>,
 }
 
+/// 一次查询限定在哪一列命中。`All` 是既有行为：正文列与名字列任一命中都算，
+/// 名字命中另加固定加权；其余取值只认那一列，用于把「书名」「内容」「目录」分开取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchField {
+    /// 正文列 + 名字列（默认）。
+    #[default]
+    All,
+    /// 只正文列。
+    Text,
+    /// 只名字列（实体规范名、笔记文件名）。
+    Name,
+    /// 只目录列（笔记所在目录段），供「书名块不够时」的路径兜底使用。
+    Path,
+}
+
 /// 全文索引重建的进度快照。宿主可在重建进行时从另一线程轮询：
 /// `active` 为真表示正在重建，`processed`/`total` 是已索引记录数与待索引记录总数。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

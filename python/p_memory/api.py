@@ -92,13 +92,16 @@ class KnowledgeBase:
                kinds: Sequence[RecordKind] | None = None, limit: int = 10,
                candidate_limit: int | None = None, embed_space: str | None = None,
                text: bool = True, vector: bool = True, rerank: bool = True,
-               with_total: bool = False, text_weight: float = 1.0) -> SearchResult:
+               with_total: bool = False, text_weight: float = 1.0,
+               match_field: str = "all") -> SearchResult:
         """检索。向量能力由库内部完成：给出 `embed_space`，库用该空间注册的
         回调嵌入查询词；宿主只给搜索词，不给向量。`text` / `vector` / `rerank`
-        / `with_total` 各自独立开关。"""
+        / `with_total` 各自独立开关。`match_field` 限定全文路在哪一列命中：
+        `all`（默认，正文+名字）/ `text` / `name` / `path`。"""
         payload = {"query": query, "filter": self._filter(filter), "limit": limit,
                    "candidate_limit": candidate_limit, "text_weight": text_weight,
-                   "text": text, "vector": vector, "rerank": rerank, "with_total": with_total}
+                   "text": text, "vector": vector, "rerank": rerank, "with_total": with_total,
+                   "match_field": match_field}
         if embed_space is not None:
             payload["embed_space"] = embed_space
         if kinds is not None:

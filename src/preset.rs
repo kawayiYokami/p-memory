@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{Entity, Event, Relation};
 use crate::search::{SearchHit, SearchRequest, SearchResult};
 use crate::storage::{self, KnowledgeBase};
-use crate::types::{ReadFilter, RecordKind, SearchDiagnostics};
+use crate::types::{MatchField, ReadFilter, RecordKind, SearchDiagnostics};
 use crate::{text, Error, Result};
 
 /// 库预先配好的搜索方法。
@@ -58,12 +58,14 @@ pub struct PresetBudget {
     pub graph_relations_chars: usize,
     /// 图谱第三步铺开的关系与事件的字符数上限（关系与事件共用这一份）。
     pub graph_context_chars: usize,
+    /// 笔记那一路「书名块」想要的条数；也是路径兜底的触发线——书名块不足这么多才用地名补。
+    pub note_titles: usize,
 }
 
 impl Default for PresetBudget {
     fn default() -> Self {
         Self { memory_chars: 2000, notes_chars: 3000, seed_entities: 4,
-            graph_relations_chars: 1000, graph_context_chars: 2000 }
+            graph_relations_chars: 1000, graph_context_chars: 2000, note_titles: 5 }
     }
 }
 
@@ -108,13 +110,24 @@ pub struct GraphSection {
     pub context_events: Vec<Event>,
 }
 
+/// 笔记那一路的产物，按「命中在哪」分块。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NoteSection {
+    /// 书名块：文件名命中，排在最前。
+    pub titles: Vec<SearchHit>,
+    /// 内容块：切片正文命中，已去掉进了书名块的那些。
+    pub contents: Vec<SearchHit>,
+    /// 路径兜底：书名块条数不够时，用目录段补足的、排在最后的一批。
+    pub paths: Vec<SearchHit>,
+}
+
 /// 一次预设检索的结果。三个字段各自独立排序，没走的那一路是空的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetResult {
     pub preset: SearchPreset,
     pub memories: Vec<SearchHit>,
     pub graph: GraphSection,
-    pub notes: Vec<SearchHit>,
+    pub notes: NoteSection,
     pub revision: i64,
     pub indexed_revision: i64,
     pub diagnostics: SearchDiagnostics,
@@ -131,15 +144,13 @@ impl KnowledgeBase {
 
         let mut diagnostics = SearchDiagnostics::default();
         let memories = if request.preset.uses_memory() {
-            let result = self.preset_hits(query, request, &[RecordKind::Memory])?;
+            let result = self.preset_hits(query, request, &[RecordKind::Memory], MatchField::All)?;
             merge_diagnostics(&mut diagnostics, &result.diagnostics);
             self.truncate_hits_by_chars(result.hits, request.budget.memory_chars)?
         } else { Vec::new() };
         let notes = if request.preset.uses_notes() {
-            let result = self.preset_hits(query, request, &[RecordKind::Chunk])?;
-            merge_diagnostics(&mut diagnostics, &result.diagnostics);
-            self.truncate_hits_by_chars(result.hits, request.budget.notes_chars)?
-        } else { Vec::new() };
+            self.preset_notes(query, request, &mut diagnostics)?
+        } else { NoteSection::default() };
         let graph = if request.preset.uses_graph() {
             self.preset_graph(query, request, &mut diagnostics)?
         } else { GraphSection::default() };
@@ -152,12 +163,53 @@ impl KnowledgeBase {
     }
 
     /// 单一路的候选：复用现有的全文 + 向量融合，再按字符数截断。
-    fn preset_hits(&self, query: &str, request: &PresetRequest, kinds: &[RecordKind]) -> Result<SearchResult> {
+    fn preset_hits(&self, query: &str, request: &PresetRequest, kinds: &[RecordKind], match_field: MatchField) -> Result<SearchResult> {
         let inner = SearchRequest {
             query: query.to_string(), filter: request.filter.clone(), kinds: kinds.to_vec(),
             limit: request.candidate_limit, embed_space: request.embed_space.clone(),
             text: request.text, vector: request.vector, rerank: request.rerank,
-            ..Default::default()
+            match_field, ..Default::default()
+        };
+        self.search(&inner)
+    }
+
+    /// 笔记那一路：书名块在上、内容块在下，书名块条数不够时用地名兜底补足。
+    /// 三条探针分工不同——书名块与目录兜底是纯全文、只看名字/目录列、不走向量也不重排
+    /// （向量是语义相似，不属于「书名」）；内容块按正文列取，沿用本次请求的全文 + 向量 + 重排。
+    fn preset_notes(&self, query: &str, request: &PresetRequest, diagnostics: &mut SearchDiagnostics) -> Result<NoteSection> {
+        // 书名块：文件名列，纯全文。
+        let title_result = self.preset_field_hits(query, request, MatchField::Name)?;
+        merge_diagnostics(diagnostics, &title_result.diagnostics);
+        let titles: Vec<SearchHit> = title_result.hits.into_iter().take(request.budget.note_titles).collect();
+        let title_ids: BTreeSet<i64> = titles.iter().map(|hit| hit.key.id).collect();
+
+        // 内容块：正文列，去掉已经进了书名块的 id，再按字符数封顶。
+        let content_result = self.preset_hits(query, request, &[RecordKind::Chunk], MatchField::Text)?;
+        merge_diagnostics(diagnostics, &content_result.diagnostics);
+        let content_hits: Vec<SearchHit> = content_result.hits.into_iter()
+            .filter(|hit| !title_ids.contains(&hit.key.id)).collect();
+        let contents = self.truncate_hits_by_chars(content_hits, request.budget.notes_chars)?;
+        let mut surfaced: BTreeSet<i64> = title_ids;
+        surfaced.extend(contents.iter().map(|hit| hit.key.id));
+
+        // 路径兜底：书名块条数不足才启用，只补差额，并排除已经出现在书名或内容块里的。
+        let mut paths = Vec::new();
+        if titles.len() < request.budget.note_titles {
+            let need = request.budget.note_titles - titles.len();
+            let path_result = self.preset_field_hits(query, request, MatchField::Path)?;
+            merge_diagnostics(diagnostics, &path_result.diagnostics);
+            paths = path_result.hits.into_iter()
+                .filter(|hit| !surfaced.contains(&hit.key.id)).take(need).collect();
+        }
+        Ok(NoteSection { titles, contents, paths })
+    }
+
+    /// 只看某一列的全文字段探针：不走向量、不重排，用于书名块与路径兜底。
+    fn preset_field_hits(&self, query: &str, request: &PresetRequest, match_field: MatchField) -> Result<SearchResult> {
+        let inner = SearchRequest {
+            query: query.to_string(), filter: request.filter.clone(), kinds: vec![RecordKind::Chunk],
+            limit: request.candidate_limit.max(request.budget.note_titles),
+            text: true, vector: false, rerank: false, match_field, ..Default::default()
         };
         self.search(&inner)
     }
@@ -183,7 +235,7 @@ impl KnowledgeBase {
     /// 图谱那一路：搜实体 → 种子各自敲自己的关系 → 两两之间铺开关系与事件。
     fn preset_graph(&self, query: &str, request: &PresetRequest, diagnostics: &mut SearchDiagnostics) -> Result<GraphSection> {
         // 第一步：查询词搜实体，取前几个当种子。
-        let entity_result = self.preset_hits(query, request, &[RecordKind::Entity])?;
+        let entity_result = self.preset_hits(query, request, &[RecordKind::Entity], MatchField::All)?;
         merge_diagnostics(diagnostics, &entity_result.diagnostics);
         let seeds: Vec<i64> = entity_result.hits.iter().take(request.budget.seed_entities).map(|hit| hit.key.id).collect();
         if seeds.is_empty() { return Ok(GraphSection::default()); }

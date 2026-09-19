@@ -413,13 +413,56 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
 
 /// 标签集拼进哪一条的可搜正文：笔记这条自己不占索引文档，由它的第一片承载；
 /// 其余记录没有切片，就是它自己。返回空格连接的标签文本，不带标签时是空串。
-pub(crate) fn tags_prefix(kind: RecordKind, tags: &[String], payload: &Value) -> String {
+/// `exclude` 是已经升格成独立索引列的那些标签（笔记的目录段与文件名）——它们靠专门的列
+/// 参与匹配，不能再留在正文里，否则搜目录名会命中该目录下每一篇。
+pub(crate) fn tags_prefix(kind: RecordKind, tags: &[String], exclude: &[String], payload: &Value) -> String {
     let carries = match kind {
         RecordKind::Note => false,
         RecordKind::Chunk => payload.get("ordinal").and_then(Value::as_u64) == Some(0),
         _ => true,
     };
-    if carries { tags.join(" ") } else { String::new() }
+    if !carries { return String::new(); }
+    tags.iter().filter(|tag| !exclude.contains(tag)).cloned().collect::<Vec<_>>().join(" ")
+}
+
+/// 笔记相对路径拆成「目录段」与「文件名（去扩展名）」。
+/// 目录段原样，只有最后一段去后缀（目录名里的点不是扩展名）。写入与重建共用同一套规则。
+pub(crate) fn split_note_path(relative: &str) -> (Vec<String>, String) {
+    let segments: Vec<&str> = relative.split('/').filter(|segment| !segment.is_empty()).collect();
+    let Some((last, dirs)) = segments.split_last() else { return (Vec::new(), String::new()); };
+    let stem = last.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(last).trim();
+    (dirs.iter().map(|segment| segment.to_string()).collect(), stem.to_string())
+}
+
+/// 一篇笔记的「目录段 / 文件名」，从库里的相对路径现推。切片记录只有 `note_id`，
+/// 名字与目录两列都由它回查笔记路径得到。
+pub(crate) fn note_path_parts(conn: &Connection, note_id: i64) -> (Vec<String>, String) {
+    let Ok((path, namespace_id)) = conn.query_row("SELECT path,namespace_id FROM notes WHERE record_id=?1", [note_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else {
+        return (Vec::new(), String::new());
+    };
+    // 没登记根目录的领域把路径原样存着（绝对路径），不拆：否则每一段目录都会变成文件名。
+    match namespace_root(conn, namespace_id) {
+        Ok(Some(_)) => split_note_path(&path),
+        _ => (Vec::new(), String::new()),
+    }
+}
+
+/// 一条记录在索引里的「名字列 / 目录列 / 从可搜前缀里摘除的标签」。
+/// 切片的名字列放所属笔记的文件名、目录列放它的目录段；这两样都已升格成独立列，
+/// 就从可搜前缀里摘掉——否则搜目录名会命中该目录下每一篇，文件名也会被正文列弱命中重复计一次。
+/// 其余记录只有名字列（实体规范名），目录列为空、无摘除。
+pub(crate) fn index_columns(conn: &Connection, kind: RecordKind, payload: &Value) -> (String, String, Vec<String>) {
+    if kind == RecordKind::Chunk {
+        // 名字列与目录列只挂在这一篇的第一片上：否则一篇的每一片都会命中同一查询、把结果刷屏。
+        if payload.get("ordinal").and_then(Value::as_u64).unwrap_or(0) != 0 { return (String::new(), String::new(), Vec::new()); }
+        let note_id = payload.get("note_id").and_then(Value::as_i64).unwrap_or(0);
+        let (dirs, stem) = note_path_parts(conn, note_id);
+        let mut exclude = dirs.clone();
+        if !stem.is_empty() { exclude.push(stem.clone()); }
+        return (stem, dirs.join(" "), exclude);
+    }
+    (record_name(kind, payload), String::new(), Vec::new())
 }
 
 pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInput,
@@ -483,8 +526,9 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     let tag_ids = set_record_tags(conn, id, &tags)?;
     // 索引文档就地拼好交回调用方：正文来自本次写入手上的那一份，索引阶段不再回源。
     // 标记一律带整数 id 给索引：namespace、scope、kind、tags 都不写第二份文本。
+    let (name, path, exclude) = index_columns(conn, kind, payload);
     let document = crate::index::IndexDocument { id, namespace_id, scope_id, kind,
-        text: text.to_string(), name: record_name(kind, payload), tags_prefix: tags_prefix(kind, &tags, payload), tag_ids };
+        text: text.to_string(), name, path, tags_prefix: tags_prefix(kind, &tags, &exclude, payload), tag_ids };
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
@@ -522,9 +566,10 @@ pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text:
     let payload: Value = serde_json::from_str(&payload_json)?;
     let pairs = record_tag_pairs(conn, id)?;
     let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
+    let (name, path, exclude) = index_columns(conn, kind, &payload);
     Ok(crate::index::IndexDocument { id, namespace_id, scope_id, kind, text,
-        name: record_name(kind, &payload),
-        tags_prefix: tags_prefix(kind, &tags, &payload),
+        name, path,
+        tags_prefix: tags_prefix(kind, &tags, &exclude, &payload),
         tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() })
 }
 

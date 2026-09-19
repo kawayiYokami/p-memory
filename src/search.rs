@@ -58,12 +58,14 @@ pub struct SearchRequest {
     #[serde(default = "yes")] pub rerank: bool,
     /// 是否额外返回过滤后的匹配总量。
     #[serde(default)] pub with_total: bool,
+    /// 本次全文路限定在哪一列命中：`all`（默认，正文+名字）、`text`、`name`、`path`。
+    #[serde(default)] pub match_field: MatchField,
 }
 impl Default for SearchRequest {
     fn default() -> Self {
         Self { query: String::new(), filter: ReadFilter::default(), kinds: default_kinds(), limit: default_limit(),
             candidate_limit: None, embed_space: None, text_weight: 1.0, prune: None,
-            text: true, vector: true, rerank: true, with_total: false }
+            text: true, vector: true, rerank: true, with_total: false, match_field: MatchField::All }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,12 +178,12 @@ impl KnowledgeBase {
     pub fn reranker_registered(&self) -> bool { self.engine.rerankers.is_registered() }
 
     /// 全文路。派生索引查询失败时返回 `Index`，由调用方触发重建后重试。
-    fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize) -> Result<Vec<(RecordKey, f64)>> {
+    fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, field: MatchField) -> Result<Vec<(RecordKey, f64)>> {
         self.sync_index_if_behind(conn)?;
         let Some(index_filter) = index_filter(conn, filter, kinds)? else { return Ok(Vec::new()) };
         // 领域登记了谓词等价词时先扩散：把同义写法一并纳入召回（如「老公」补「丈夫」）。
         let expanded = crate::graph::match_predicate_synonyms(conn, &filter.namespace, query)?;
-        self.index()?.search(&expanded, &index_filter, limit)
+        self.index()?.search_in(&expanded, &index_filter, limit, field)
     }
 
     pub fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
@@ -256,12 +258,12 @@ impl KnowledgeBase {
         let conn = state.conn();
         let mut text_rank: Vec<(RecordKey, f64)> = Vec::new();
         if request.text {
-            let text_hits = match self.search_text(conn, query, &request.filter, &request.kinds, limit) {
+            let text_hits = match self.search_text(conn, query, &request.filter, &request.kinds, limit, request.match_field) {
                 Ok(hits) => Some(hits),
                 // 派生索引查询失败：当场从权威数据重建一次再重试。恢复得了就照常给结果；
                 // 连重建都失败才隔离文本路。不静默退回空文本——那等于把 BM25 地板也丢掉。
                 Err(Error::Index(_)) => match self.rebuild_indexes() {
-                    Ok(_) => match self.search_text(conn, query, &request.filter, &request.kinds, limit) {
+                    Ok(_) => match self.search_text(conn, query, &request.filter, &request.kinds, limit, request.match_field) {
                         Ok(hits) => Some(hits),
                         Err(_) => { diagnostics.degraded.push(Degrade::TextIndexUnavailable); Some(Vec::new()) }
                     },

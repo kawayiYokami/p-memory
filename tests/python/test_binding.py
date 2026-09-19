@@ -220,7 +220,7 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
 
 
 def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(kb, tmp_path):
-    """切片正文随写入进索引：源文件删掉仍读得到；登记根目录后路径段拆成标签，拼在第一片的正文前面。"""
+    """切片正文随写入进索引：源文件删掉仍读得到；文件名进名字列可搜，目录段只当标签可筛不可搜。"""
     root = tmp_path / "domain"
     directory = root / "绝区零" / "角色"
     directory.mkdir(parents=True)
@@ -234,11 +234,12 @@ def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(
     chunks = kb.notes.chunks(note["id"])
     assert [c["content"] for c in chunks] == ["苹果 香蕉 橘子"], "正文在索引里，源文件没了也读得到"
     assert [c["tags"] for c in chunks] == [["绝区零", "角色", "雅"]], "路径段标签挂在切片记录上"
-    hits = kb.search("角色", kinds=["chunk"])["hits"]
-    assert [h["key"]["id"] for h in hits] == [chunks[0]["id"]], "路径段标签让第一片被搜到"
-    assert kb.search("角色", kinds=["note"])["hits"] == [], "笔记不占索引文档"
+    assert kb.search("角色", kinds=["chunk"])["hits"] == [], "目录段不参与常规匹配"
+    hits = kb.search("雅", kinds=["chunk"])["hits"]
+    assert [h["key"]["id"] for h in hits] == [chunks[0]["id"]], "文件名进名字列，第一片被搜到"
+    assert kb.search("雅", kinds=["note"])["hits"] == [], "笔记不占索引文档"
     page = kb.notes.list(filter={"tags": ["角色"]})
-    assert [item["id"] for item in page["items"]] == [note["id"]], "按标签翻笔记仍能筛出这一篇"
+    assert [item["id"] for item in page["items"]] == [note["id"]], "按目录段筛笔记仍能筛出这一篇"
 
     outside = tmp_path / "外面.md"
     outside.write_text("根目录之外", encoding="utf-8", newline="")
@@ -522,6 +523,11 @@ def kb_judgments(kb) -> list[str]:
 
 # ── 预设检索 ──────────────────────────────────────────────────────────
 
+def notes_empty(section) -> bool:
+    """笔记那一路是否空着：书名块、内容块、路径兜底三块都空才算空。"""
+    return not section["titles"] and not section["contents"] and not section["paths"]
+
+
 def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
     """预设检索：记忆、图谱、笔记各占一个字段，互不混排；图谱走实体 → 关系 → 事件。"""
     created = kb.graph.apply_batch(entities=[{"name": "朱樱"}, {"name": "白露"},
@@ -545,7 +551,7 @@ def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
 
     rag = kb.search_preset("rag", "朱樱和白露的同学是谁")
     assert kb_judgments(kb) and [item["record"]["judgment"] for item in rag["memories"]], "记忆那一路有结果"
-    assert rag["notes"] == [], "RAG 不出笔记那一路"
+    assert notes_empty(rag["notes"]), "RAG 不出笔记那一路"
     assert sorted(entity["name"] for entity in rag["graph"]["entities"]) == ["朱樱", "白露"], "命中的实体成为种子"
     predicates = [relation["predicate"] for relation in rag["graph"]["relations"]]
     assert predicates.count("同学") == 2, "种子实体各自敲出的同学关系都在结果里"
@@ -553,7 +559,7 @@ def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
     assert [event["name"] for event in rag["graph"]["context_events"]] == ["别鹤典仪"], "参与者至少两个才算"
 
     broad = kb.search_preset("broad", "朱樱和白露的同学是谁")
-    assert broad["memories"] and broad["notes"] and broad["graph"]["entities"], "广撒网三个字段都填"
+    assert broad["memories"] and not notes_empty(broad["notes"]) and broad["graph"]["entities"], "广撒网三个字段都填"
 
     memory_only = kb.search_preset("memory", "朱樱和白露的同学是谁")
-    assert memory_only["memories"] and memory_only["notes"] == [] and memory_only["graph"]["entities"] == []
+    assert memory_only["memories"] and notes_empty(memory_only["notes"]) and memory_only["graph"]["entities"] == []

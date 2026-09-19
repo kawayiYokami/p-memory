@@ -11,9 +11,9 @@ use tantivy::{collector::{DocSetCollector, TopDocs, sort_key::{SortBySimilarityS
     schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as TantivyValue, INDEXED, STRING, STORED},
     tokenizer::WhitespaceTokenizer, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
-const FORMAT: &str = "p-memory-text-v8";
+const FORMAT: &str = "p-memory-text-v9";
 
-struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, body: Field }
+struct Fields { key: Field, namespace: Field, scope: Field, kind: Field, tags: Field, text: Field, name: Field, path: Field, body: Field }
 
 /// 名字字段命中时的固定加权：规范名单独成列后，名字整段命中是最强的相关信号，给它固定倍数抬高。
 const NAME_FIELD_BOOST: f32 = 3.0;
@@ -53,6 +53,9 @@ pub(crate) struct IndexDocument {
     pub text: String,
     /// 实体规范名：单独一列，检索时按 `NAME_FIELD_BOOST` 加权。其它记录为空串、不写这一列。
     pub name: String,
+    /// 笔记所在目录：相对路径里除文件名之外的各段，空格连接。只有切片记录写这一列，
+    /// 常规检索不查它——它是「书名块不够时」才动用的兜底。
+    pub path: String,
     /// 拼在可搜正文前面的标签集（空格连接，空串表示不带）。索引里没有单独的标签文本列：
     /// 标签只有承载它的那一条带——切片是第一片，其余记录是它自己；取值规则见 `storage::tags_prefix`。
     pub tags_prefix: String,
@@ -100,8 +103,11 @@ impl TextIndex {
             // 实体规范名不进这一列。
             text: builder.add_text_field("text", tokenized()),
             // 实体规范名单独一列：正文列不含规范名，名字只活在这一列，检索时按固定倍数加权，
-            // 并作为独立的命中条件——名字命中也算这条记录被搜到。
+            // 并作为独立的命中条件——名字命中也算这条记录被搜到。笔记的文件名也落在这一列。
             name: builder.add_text_field("name", tokenized()),
+            // 笔记所在目录单独一列：目录段不进正文列（否则搜「璃月」会命中该目录下每一篇），
+            // 只在「书名块不够」的兜底查询里被查。
+            path: builder.add_text_field("path", tokenized()),
             // 正文原值随命中取回：库里不留正文副本，取正文只走这一列。
             body: builder.add_text_field("body", STORED),
         };
@@ -172,6 +178,7 @@ impl TextIndex {
         let cleaned = text::clean_markdown(&searchable);
         if !cleaned.is_empty() { document.add_text(self.fields.text, text::tokenize(&cleaned).join(" ")); }
         if !item.name.is_empty() { document.add_text(self.fields.name, text::tokenize(&item.name).join(" ")); }
+        if !item.path.is_empty() { document.add_text(self.fields.path, text::tokenize(&item.path).join(" ")); }
         writer.add_document(document)?;
         Ok(())
     }
@@ -277,6 +284,7 @@ impl TextIndex {
     fn rebuild_page(&self, conn: &Connection, after: i64) -> Result<(Vec<IndexDocument>, i64)> {
         let mut documents = Vec::new();
         let mut files: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut paths: HashMap<i64, (Vec<String>, String)> = HashMap::new();
         let mut last = after;
         let mut stmt = conn.prepare("SELECT r.id,r.namespace_id,r.kind,r.scope_id,r.payload_json FROM records r WHERE r.id>?1 ORDER BY r.id LIMIT ?2")?;
         let rows = stmt.query_map(params![after, REBUILD_BATCH as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
@@ -299,9 +307,22 @@ impl TextIndex {
             };
             let pairs = storage::record_tag_pairs(conn, id).unwrap_or_default();
             let tags: Vec<String> = pairs.iter().map(|(_, tag)| tag.clone()).collect();
-            documents.push(IndexDocument { id, namespace_id, scope_id, kind, text,
-                name: storage::record_name(kind, &payload),
-                tags_prefix: storage::tags_prefix(kind, &tags, &payload),
+            // 切片的名字列放文件名、目录列放所在目录，可搜前缀里要把这两样摘掉：
+            // 它们已经从「标签」升格（或降格）成独立列，不能再当成正文的一部分被搜到。
+            // 名字与目录只挂在这一篇的第一片上——否则每一片都会命中同一查询，把结果刷屏。
+            let (name, path, exclude) = match kind {
+                RecordKind::Chunk if payload.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0) == 0 => {
+                    let note_id = payload.get("note_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let (dirs, stem) = paths.entry(note_id).or_insert_with(|| storage::note_path_parts(conn, note_id)).clone();
+                    let mut exclude = dirs.clone();
+                    if !stem.is_empty() { exclude.push(stem.clone()); }
+                    (stem, dirs.join(" "), exclude)
+                }
+                RecordKind::Chunk => (String::new(), String::new(), Vec::new()),
+                _ => (storage::record_name(kind, &payload), String::new(), Vec::new()),
+            };
+            documents.push(IndexDocument { id, namespace_id, scope_id, kind, text, name, path,
+                tags_prefix: storage::tags_prefix(kind, &tags, &exclude, &payload),
                 tag_ids: pairs.into_iter().map(|(tag_id, _)| tag_id).collect() });
         }
         Ok((documents, last))
@@ -340,24 +361,34 @@ impl TextIndex {
         (occurrence, Box::new(TermQuery::new(Term::from_field_text(field, value), IndexRecordOption::WithFreqs)) as Box<dyn Query>)
     }
 
-    fn filtered_query(&self, tokens: &[String], strict: bool, filter: &IndexFilter) -> Box<dyn Query> {
+    fn filtered_query(&self, tokens: &[String], strict: bool, filter: &IndexFilter, field: MatchField) -> Box<dyn Query> {
         let occurrence = if strict { Occur::Must } else { Occur::Should };
-        // 命中层：每个词元在「正文列 + 名字列」里任一命中即算这个词元命中。
-        // 规范名已从正文列移出，所以名字命中也必须能独立把这条记录带进结果，不再只是加分项。
+        // 命中层：每个词元在指定列里命中即算这个词元命中。
+        // `All` 看「正文列 + 名字列」——规范名已从正文列移出，所以名字命中也必须能独立把这条
+        // 记录带进结果，不再只是加分项。目录列只在 `Path` 兜底查询里被查。
         let hit = BooleanQuery::new(tokens.iter().map(|token| {
-            let either = BooleanQuery::new(vec![
-                Self::term(self.fields.text, token, Occur::Should),
-                Self::term(self.fields.name, token, Occur::Should),
-            ]);
-            (occurrence, Box::new(either) as Box<dyn Query>)
+            let column: Box<dyn Query> = match field {
+                MatchField::All => Box::new(BooleanQuery::new(vec![
+                    Self::term(self.fields.text, token, Occur::Should),
+                    Self::term(self.fields.name, token, Occur::Should),
+                ])),
+                MatchField::Text => Box::new(TermQuery::new(Term::from_field_text(self.fields.text, token), IndexRecordOption::WithFreqs)),
+                MatchField::Name => Box::new(TermQuery::new(Term::from_field_text(self.fields.name, token), IndexRecordOption::WithFreqs)),
+                MatchField::Path => Box::new(TermQuery::new(Term::from_field_text(self.fields.path, token), IndexRecordOption::WithFreqs)),
+            };
+            (occurrence, column)
         }).collect());
         // 名字层只负责抬分：名字整段等于查询词的记录，不该被它那几百字的别名与属性摊薄；
-        // 其它记录的 name 列为空，天然不参与。
-        let name_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.name, token, Occur::Should)).collect());
-        let relevance = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(hit) as Box<dyn Query>),
-            (Occur::Should, Box::new(BoostQuery::new(Box::new(name_relevance), NAME_FIELD_BOOST)) as Box<dyn Query>),
-        ]);
+        // 其它记录的 name 列为空，天然不参与。单列查询已经只认那一列，不再叠加权。
+        let relevance: Box<dyn Query> = if field == MatchField::All {
+            let name_relevance = BooleanQuery::new(tokens.iter().map(|token| Self::term(self.fields.name, token, Occur::Should)).collect());
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(hit) as Box<dyn Query>),
+                (Occur::Should, Box::new(BoostQuery::new(Box::new(name_relevance), NAME_FIELD_BOOST)) as Box<dyn Query>),
+            ]))
+        } else {
+            Box::new(hit)
+        };
         // 相关性这层只放 Should，所以至少要命中一个词元才算相关，过滤维度另起一层放 Must。
         // 两层不能合并：同一层里一旦存在 Must，全部 Should 都会降级为「有则加分、无也无妨」，
         // 正文条件就形同虚设，检索退化成「只按过滤条件取记录」——
@@ -376,7 +407,9 @@ impl TextIndex {
         Box::new(BooleanQuery::new(clauses))
     }
 
-    pub fn search(&self, query: &str, filter: &IndexFilter, limit: usize) -> Result<Vec<(RecordKey, f64)>> {
+    /// 在指定列上检索。`field` 决定命中限定在哪一列：`All` 是正文+名字（默认），
+    /// `Text` / `Name` / `Path` 各自单独成路，供预设把「书名」「内容」「目录兜底」分开取。
+    pub fn search_in(&self, query: &str, filter: &IndexFilter, limit: usize, field: MatchField) -> Result<Vec<(RecordKey, f64)>> {
         #[cfg(test)]
         if self.fail_search.load(Ordering::SeqCst) { return Err(Error::Index("injected index failure".into())); }
         let mut result = Vec::new();
@@ -387,7 +420,7 @@ impl TextIndex {
             if !strict && result.len() >= limit { break; }
             let tokens = text::query_terms(query, strict);
             if tokens.is_empty() { continue; }
-            let query = self.filtered_query(&tokens, strict, filter);
+            let query = self.filtered_query(&tokens, strict, filter, field);
             let collector = TopDocs::with_limit(limit).order_by(((SortBySimilarityScore, Order::Desc), (SortByString::for_field("key"), Order::Asc)));
             let hits = searcher.search(&*query, &collector)?;
             for ((score, _), address) in hits {

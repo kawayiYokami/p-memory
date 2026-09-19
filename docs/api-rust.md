@@ -94,15 +94,21 @@ struct PresetBudget {            // 都可被调用方覆盖
     seed_entities: usize,        // 默认 4，不得为 0；唯一按个数的阈值
     graph_relations_chars: usize,   // 默认 1000
     graph_context_chars: usize,     // 默认 2000
+    note_titles: usize,             // 默认 5，书名块想要的条数，也是路径兜底的触发线
 }
 struct PresetResult {
     preset: SearchPreset,
     memories: Vec<SearchHit>,    // 记忆那一路
     graph: GraphSection,         // 图谱那一路
-    notes: Vec<SearchHit>,       // 笔记那一路
+    notes: NoteSection,          // 笔记那一路
     revision: i64,
     indexed_revision: i64,
     diagnostics: SearchDiagnostics,
+}
+struct NoteSection {             // 笔记那一路：书名块 / 内容块 / 路径兜底同时返回
+    titles: Vec<SearchHit>,      // 文件名命中（name 列），纯全文
+    contents: Vec<SearchHit>,    // 正文命中（text 列）
+    paths: Vec<SearchHit>,       // 书名块不足时用目录段（path 列）补的，排最后
 }
 struct GraphSection {
     entities: Vec<Entity>,              // 第一步的种子，按分排，带别名
@@ -262,7 +268,7 @@ fn default_namespace() -> String;   // "default"
 fn public_scope() -> String;        // "public"
 ```
 
-`SearchRequest`、`SearchHit`、`SearchResult`、`SearchDiagnostics`、`Degrade`、`ContextualHit`、`GraphPrune`、`EmbedderOptions`、`RerankerOptions`、`SyncReport`、`DecayPolicy`、`FeedbackRequest`、`Page`/`PageRequest`/`ReadFilter` 等见 [data-model](data-model.md)；检索流程见 [search](search.md)。
+`SearchRequest`、`SearchHit`、`SearchResult`、`SearchDiagnostics`、`MatchField`、`Degrade`、`ContextualHit`、`GraphPrune`、`NoteSection`、`EmbedderOptions`、`RerankerOptions`、`SyncReport`、`DecayPolicy`、`FeedbackRequest`、`Page`/`PageRequest`/`ReadFilter` 等见 [data-model](data-model.md)；检索流程见 [search](search.md)。
 
 ## 错误处理
 

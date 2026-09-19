@@ -959,7 +959,7 @@ fn ties_and_chinese_queries_are_deterministic_across_rebuilds() {
 }
 
 /// 标签集拼在承载它的那一条正文前面：记忆是它自己，笔记是它的第一片。
-/// 正文里根本没有的词，靠这份标签也能搜到。
+/// 正文里根本没有的词，靠这份标签也能搜到。目录段已升格成独立列，不再进这份标签。
 #[test]
 fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() {
     let dir = tempfile::tempdir().unwrap();
@@ -971,7 +971,7 @@ fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() 
     let hits = kb.search(&SearchRequest { query: "星见雅".into(), ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
-    // 笔记：登记根目录之后，相对路径的目录段拆成标签，拼在这一篇第一片的正文前面。
+    // 笔记：登记根目录之后，文件名走名字列（可搜），目录段只当标签（可筛不可搜）。
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let note_dir = dir.path().join("绝区零").join("角色");
     std::fs::create_dir_all(&note_dir).unwrap();
@@ -980,18 +980,23 @@ fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() 
     let note = kb.notes().upsert_file(NoteFileInput::new(&note_path)).unwrap().value;
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     assert_eq!(chunks.len(), 1);
-    for word in ["绝区零", "角色", "雅"] {
+    // 目录段降为纯过滤器：常规检索搜不到它们。
+    for word in ["绝区零", "角色"] {
         let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-        assert_eq!(hits.len(), 1, "路径段的标签拼在第一片的正文前面：{word}");
-        assert_eq!(hits[0].key.id, chunks[0].header.id);
+        assert!(hits.is_empty(), "目录段不参与常规匹配：{word}");
     }
+    // 文件名走名字列：常规检索搜得到，并且是这一片。
+    let hits = kb.search(&SearchRequest { query: "雅".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 1, "文件名是名字，能搜到");
+    assert_eq!(hits[0].key.id, chunks[0].header.id);
     // 取回的切片正文只有它自己那一段，标签不在里面。
     assert_eq!(chunks[0].content, "这是一段无关内容", "取回的是纯正文");
     // 笔记不占索引文档：要文件列表按库里的标签翻。
     let hits = kb.search(&SearchRequest { query: "雅".into(), kinds: vec![RecordKind::Note], ..Default::default() }).unwrap().hits;
     assert!(hits.is_empty(), "笔记不进索引");
-    let page = kb.notes().list(&PageRequest { filter: ReadFilter { tags: vec!["雅".into()], ..Default::default() }, ..Default::default() }).unwrap();
-    assert_eq!(page.items.len(), 1, "按标签翻笔记仍能筛出这一篇");
+    // 目录段仍留在标签表里：按文件夹筛笔记照样筛得出来（只是不再参与匹配）。
+    let page = kb.notes().list(&PageRequest { filter: ReadFilter { tags: vec!["角色".into()], ..Default::default() }, ..Default::default() }).unwrap();
+    assert_eq!(page.items.len(), 1, "按目录段筛笔记仍能筛出这一篇");
 }
 
 #[test]
@@ -1206,8 +1211,8 @@ fn note_body_lives_only_in_the_index_not_in_sqlite() {
     assert_eq!(hits, 0, "笔记正文不落 SQLite");
 }
 
-/// 切片只装它自己那一段正文；标签集只拼在这一篇的第一片前面，其余片一份都不带。
-/// 没登记领域根目录就不拆路径标签，路径词谁都搜不到。
+/// 切片只装它自己那一段正文；文件名与目录只挂在这一篇的第一片上。
+/// 没登记领域根目录就不拆路径，文件名与目录都不成列，谁都搜不到。
 #[test]
 fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     let dir = tempfile::tempdir().unwrap();
@@ -1223,9 +1228,9 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     assert_eq!(chunks[0].content, "苹果 香蕉 橘子", "切片正文逐字符等于切片原文");
     for word in ["雅", "角色", "绝区零"] {
         assert!(kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits.is_empty(),
-            "没登记根目录就不拆路径标签：{word}");
+            "没登记根目录就不拆路径：{word}");
     }
-    // 登记根目录后重新写入：相对路径按段拆成标签，拼到这一篇第一片的正文前面。
+    // 登记根目录后重新写入：文件名进名字列、目录段进目录列，都只挂第一片。
     kb.notes().set_root("default", &root).unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
     let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
@@ -1233,12 +1238,16 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     assert_eq!(stored, "绝区零/角色/雅.md", "库里存的是减掉根目录的相对路径");
     drop(conn);
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
-    for word in ["绝区零", "角色", "雅"] {
+    // 目录段不参与常规匹配。
+    for word in ["绝区零", "角色"] {
         let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
-        assert_eq!(hits.len(), 1, "路径段的标签拼在第一片上：{word}");
-        assert_eq!(hits[0].key.id, chunks[0].header.id);
+        assert!(hits.is_empty(), "目录段不参与常规匹配：{word}");
     }
-    // 长正文切成多片：标签只在第一片上，其余片连文件名都搜不到。
+    // 文件名进名字列，能搜到，命中的是第一片。
+    let hits = kb.search(&SearchRequest { query: "雅".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert_eq!(hits.len(), 1, "文件名是名字，能搜到");
+    assert_eq!(hits[0].key.id, chunks[0].header.id);
+    // 长正文切成多片：名字与目录只挂第一片，其余片连文件名都搜不到。
     let long_path = note_dir.join("长文.md");
     std::fs::write(&long_path, "青提".repeat(400)).unwrap();
     let long_note = kb.notes().upsert_file(NoteFileInput::new(&long_path)).unwrap().value;
@@ -1247,14 +1256,11 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     for chunk in &long_chunks { assert!(!chunk.content.contains("长文"), "切片正文不携带文件名"); }
     // 文件名只在它自己那一篇的第一片上：搜「长文」只有一条。
     let hits = kb.search(&SearchRequest { query: "长文".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
-    assert_eq!(hits.len(), 1, "文件名标签只拼在第一片上");
+    assert_eq!(hits.len(), 1, "文件名只挂第一片");
     assert_eq!(hits[0].key.id, long_chunks[0].header.id);
-    // 目录段两篇都带：每篇各出一条，多片的那篇不会一片一条。
+    // 目录段整篇都不参与匹配：两篇都搜不到。
     let hits = kb.search(&SearchRequest { query: "角色".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
-    let mut hit_ids: Vec<i64> = hits.iter().map(|hit| hit.key.id).collect();
-    let mut expected = vec![chunks[0].header.id, long_chunks[0].header.id];
-    hit_ids.sort(); expected.sort();
-    assert_eq!(hit_ids, expected, "目录段两篇各出一条，都落在各自的第一片");
+    assert!(hits.is_empty(), "目录段不参与常规匹配，两篇都搜不到");
 }
 
 /// 正文只在索引里存一份，源文件在写入之后就可以消失：读切片正文不再回文件。
@@ -1322,7 +1328,7 @@ fn memory_and_chunk_score_the_same_text_identically() {
     assert_eq!(score(vec![RecordKind::Memory]), score(vec![RecordKind::Chunk]), "同文本的文本列分数一致");
 }
 
-/// 领域根目录：写入路径必须在根目录之内，库里存相对路径，标签集拼在这一篇的第一片前面。
+/// 领域根目录：写入路径必须在根目录之内，库里存相对路径，文件名与目录段各成独立列、只挂第一片。
 #[test]
 fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let dir = tempfile::tempdir().unwrap();
@@ -1355,11 +1361,14 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let hits = kb.search(&SearchRequest { query: "澜川".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), chunks.len(), "每片都能被搜到");
     assert!(hits.iter().all(|hit| hit.text_score.is_some_and(|score| score > 0.0)), "每片都拿到分");
-    // 查路径段与调用方标签：这份标签只拼在第一片上，所以只有第一片命中。
-    for word in ["bwiki", "沧州", "人物"] {
+    // 调用方标签拼在第一片上：只有第一片命中。
+    let caller_tag_hits = kb.search(&SearchRequest { query: "人物".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
+    assert_eq!(caller_tag_hits.len(), 1, "调用方标签只拼在第一片上");
+    assert_eq!(caller_tag_hits[0].key.id, chunks[0].header.id, "命中的是第一片");
+    // 目录段不参与常规匹配：搜 bwiki / 沧州 一片都搜不到。
+    for word in ["bwiki", "沧州"] {
         let hits = kb.search(&SearchRequest { query: word.into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
-        assert_eq!(hits.len(), 1, "标签集只拼在第一片上：{word}");
-        assert_eq!(hits[0].key.id, chunks[0].header.id, "命中的是第一片：{word}");
+        assert!(hits.is_empty(), "目录段不参与常规匹配：{word}");
     }
     // 按标签筛切片：`沧州` 筛得到，库里没有的标签换不到 id 就是空结果。
     let by_tag = |tag: &str| kb.search(&SearchRequest { query: "澜川".into(),
@@ -1445,7 +1454,7 @@ fn preset_graph_walks_entities_then_relations_then_events() {
 
     // 记忆那一路独立出结果，字段不混。
     assert!(result.memories.iter().any(|hit| hit.record["judgment"].as_str().unwrap_or_default().contains("朱樱的同学")));
-    assert!(result.notes.is_empty(), "RAG 不出笔记那一路");
+    assert!(notes_empty(&result.notes), "RAG 不出笔记那一路");
 }
 
 /// 查询词本身就是一个实体名时，「去掉实体名后的剩余词」为空：不筛，保留它的全部端点关系。
@@ -1500,6 +1509,70 @@ fn preset_graph_step2_expands_the_remainder_with_predicate_synonyms() {
         "登记等价词后「老公」扩散出「丈夫」，关系应被第二步召回");
 }
 
+/// 笔记那一路是否空着：三个块都空才算空。
+fn notes_empty(section: &NoteSection) -> bool {
+    section.titles.is_empty() && section.contents.is_empty() && section.paths.is_empty()
+}
+
+/// 取笔记预设那一路的结果。
+fn notes_section(kb: &KnowledgeBase, query: &str) -> NoteSection {
+    kb.search_preset(&PresetRequest { preset: SearchPreset::Notes, query: query.into(), ..Default::default() }).unwrap().notes
+}
+
+/// 笔记预设：书名块（文件名命中）在上、内容块（正文命中）在下，两者同时出；
+/// 只有书名块条数不足时，才用目录段兜底补足、单独成块。
+#[test]
+fn preset_notes_split_titles_contents_and_path_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    kb.notes().set_root("default", &root).unwrap();
+
+    // A：文件名就叫「璃月」，正文与「璃月」无关 -> 靠书名命中。
+    let a_dir = dir.path().join("璃月");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let a_path = a_dir.join("璃月.md");
+    std::fs::write(&a_path, "岩王帝君坐镇此地").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&a_path)).unwrap();
+
+    // B：正文里出现「璃月」，文件名无关 -> 靠内容命中。
+    let b_dir = dir.path().join("杂记");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let b_path = b_dir.join("港口见闻.md");
+    std::fs::write(&b_path, "璃月 港口 今日格外热闹").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&b_path)).unwrap();
+
+    // C：只有目录段带「沧浪」，文件名与正文都没有 -> 只能靠目录兜底。
+    let c_dir = dir.path().join("沧浪");
+    std::fs::create_dir_all(&c_dir).unwrap();
+    let c_path = c_dir.join("寒天之钉.md");
+    std::fs::write(&c_path, "封冻的极北之地一览无余").unwrap();
+    kb.notes().upsert_file(NoteFileInput::new(&c_path)).unwrap();
+
+    // 搜「璃月」：A 进书名块，B 进内容块，两块同时出；B 不再被目录兜底重复一次。
+    let by_title = notes_section(&kb, "璃月");
+    assert!(!by_title.titles.is_empty(), "文件名命中的 A 进书名块");
+    assert!(!by_title.contents.is_empty(), "正文命中的 B 进内容块");
+    let title_ids: Vec<i64> = by_title.titles.iter().map(|hit| hit.key.id).collect();
+    let content_ids: Vec<i64> = by_title.contents.iter().map(|hit| hit.key.id).collect();
+    assert!(title_ids.iter().all(|id| !content_ids.contains(id)), "同一片不重复出现在两块");
+    assert!(by_title.paths.is_empty(), "已被书名或内容覆盖的目录命中不再进兜底块");
+
+    // 常规检索搜「沧浪」搜不到 C，但笔记预设的兜底能把它捞回。
+    assert!(kb.search(&SearchRequest { query: "沧浪".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits.is_empty(),
+        "目录段不参与常规匹配");
+    let by_path = notes_section(&kb, "沧浪");
+    assert!(by_path.titles.is_empty() && by_path.contents.is_empty(), "沧浪只在目录里，书名与内容都不命中");
+    assert!(!by_path.paths.is_empty(), "书名块不足时由目录兜底补足");
+
+    // 重建之后同一批查询结果一致。
+    kb.rebuild_indexes().unwrap();
+    let after = notes_section(&kb, "璃月");
+    assert_eq!(after.titles.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), title_ids, "重建后书名块一致");
+    assert_eq!(after.contents.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), content_ids, "重建后内容块一致");
+    assert!(!notes_section(&kb, "沧浪").paths.is_empty(), "重建后目录兜底仍生效");
+}
+
 /// 单路预设只填自己那一个字段；广撒网三个字段都填。
 #[test]
 fn preset_fields_stay_separate() {
@@ -1516,18 +1589,18 @@ fn preset_fields_stay_separate() {
 
     let memory_only = of(SearchPreset::Memory);
     assert!(!memory_only.memories.is_empty());
-    assert!(memory_only.graph.entities.is_empty() && memory_only.notes.is_empty(), "记忆预设只填记忆那一个字段");
+    assert!(memory_only.graph.entities.is_empty() && notes_empty(&memory_only.notes), "记忆预设只填记忆那一个字段");
 
     let graph_only = of(SearchPreset::Graph);
-    assert!(graph_only.memories.is_empty() && graph_only.notes.is_empty(), "图谱预设只填图谱那一个字段");
+    assert!(graph_only.memories.is_empty() && notes_empty(&graph_only.notes), "图谱预设只填图谱那一个字段");
     assert!(graph_only.graph.entities.iter().any(|entity| entity.name == "预设字段分离用的实体"));
 
     let notes_only = of(SearchPreset::Notes);
-    assert!(!notes_only.notes.is_empty());
+    assert!(!notes_only.notes.titles.is_empty() || !notes_only.notes.contents.is_empty(), "笔记预设出笔记结果");
     assert!(notes_only.memories.is_empty() && notes_only.graph.entities.is_empty(), "笔记预设只填笔记那一个字段");
 
     let broad = of(SearchPreset::Broad);
-    assert!(!broad.memories.is_empty() && !broad.notes.is_empty() && !broad.graph.entities.is_empty(), "广撒网三路都出");
+    assert!(!broad.memories.is_empty() && !notes_empty(&broad.notes) && !broad.graph.entities.is_empty(), "广撒网三路都出");
 }
 
 /// 阈值按字符数而不是条数：预算装不下下一条就停，第一条无论多长都留下。

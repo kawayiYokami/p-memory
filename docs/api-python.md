@@ -46,10 +46,11 @@ kb.notes.upsert_file(path="./data/domain/gi/bwiki/沧州/澜川.md")
 
 ```python
 kb.search_preset("rag", "朱樱和白露的同学是谁", embed_space="e5")
-# -> {"preset": "rag", "memories": [...], "graph": {...}, "notes": [...], ...}
+# -> {"preset": "rag", "memories": [...], "graph": {...},
+#     "notes": {"titles": [...], "contents": [...], "paths": [...]}, ...}
 ```
 
-签名是 `search_preset(preset="rag", query="", *, filter=None, embed_space=None, text=True, vector=True, rerank=True, budget=None, candidate_limit=64)`；`preset` 取 `memory` / `graph` / `notes` / `rag` / `broad`。返回的 `memories` / `graph` / `notes` 三个字段各自独立排序、各自按字符数封顶，不混在一起，没走的那一路是空列表；`graph` 里再分 `entities` / `relations` / `context_relations` / `context_events` 四块。阈值按 `budget` 逐项覆盖（`dict[str, int]`，键名与 `PresetBudget` 字段一致），默认值见 [search](search.md#预设检索)。异步封装：`await kb.search_preset("关键词", preset="broad")`。
+签名是 `search_preset(preset="rag", query="", *, filter=None, embed_space=None, text=True, vector=True, rerank=True, budget=None, candidate_limit=64)`；`preset` 取 `memory` / `graph` / `notes` / `rag` / `broad`。返回的 `memories` / `graph` / `notes` 三个字段各自独立排序、各自按字符数封顶，不混在一起，没走的那一路是空的。`graph` 里分 `entities` / `relations` / `context_relations` / `context_events` 四块；`notes` 里分 `titles`（文件名命中）/ `contents`（正文命中）/ `paths`（书名块不够时用目录段兜底）三块，同时返回、互不重复。阈值按 `budget` 逐项覆盖（`dict[str, int]`，键名与 `PresetBudget` 字段一致，含 `note_titles`），默认值见 [search](search.md#预设检索)。异步封装：`await kb.search_preset("关键词", preset="broad")`。
 
 ## 向量与重排回调
 
@@ -70,7 +71,7 @@ kb.register_reranker(my_rerank_fn, max_docs=64)                    # 进程内�
 - `EmbeddingStore` 另有 `vector_ready` / `unregister_embedder` / `embedder_space` / `spaces` / `namespace_vectorization` / `set_namespace_vectorization` / `vectorization` / `set_vectorization` / `delete_space`。
 - `vectorization(namespace, target)` / `set_vectorization(namespace, target, enabled)`：`target` 取 `"memory"` / `"graph"` / `"notes"`，是该领域下三个独立开关；`namespace_vectorization` / `set_namespace_vectorization` 则是整个领域的总闸。没设置过的档位返回内置默认（记忆与图谱为 `True`，笔记为 `False`），档位名不在这三个之一时报 `ValidationError`。
 - 回调是运行时状态，不进数据库：宿主启动时注册一次即可。
-- 检索时宿主只给 `embed_space`，库用它注册的回调嵌入查询词；`search` 的 `text` / `vector` / `rerank` / `with_total` 各自独立开关，未给 `embed_space` 时向量路自动让位（不是错误）。
+- 检索时宿主只给 `embed_space`，库用它注册的回调嵌入查询词；`search` 的 `text` / `vector` / `rerank` / `with_total` 各自独立开关，`match_field` 限定全文路在哪一列命中（`all` / `text` / `name` / `path`），未给 `embed_space` 时向量路自动让位（不是错误）。
 
 ### 回调错误分类
 

@@ -27,5 +27,5 @@ pub use graph::{Entity, EntityInput, Relation, RelationInput, Event, EventInput,
 pub use notes::{Note, NoteFileInput, Chunk};
 pub use embeddings::{EmbeddingSpace, Embedder, EmbedderOptions, EmbedCallbackError, EmbedErrorKind, SyncReport};
 pub use search::{SearchRequest, SearchResult, SearchHit, GraphPrune, ContextualHit, Reranker, RerankerOptions};
-pub use preset::{SearchPreset, PresetBudget, PresetRequest, PresetResult, GraphSection};
+pub use preset::{SearchPreset, PresetBudget, PresetRequest, PresetResult, GraphSection, NoteSection};
 
