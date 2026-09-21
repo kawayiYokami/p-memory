@@ -1,0 +1,42 @@
+[package]
+name = "p-memory"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.88"
+description = "Embedded memory, knowledge graph, and note storage for Rust and Python"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/kawayiYokami/p-memory"
+keywords = ["memory", "knowledge-graph", "search", "embeddings", "sqlite"]
+categories = ["database", "data-structures", "text-processing"]
+exclude = ["/.github", "/.env.sample", "/pyproject.toml", "/python", "/tests/python", "/uv.lock"]
+
+[workspace]
+members = ["bindings/python"]
+default-members = ["."]
+resolver = "2"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+fs4 = "0.13.1"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.39", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tantivy = "0.26.1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+petgraph = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"
+strip = true
+

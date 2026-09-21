@@ -1,0 +1,12 @@
+p-memory
+Copyright (C) 2026 p-memory contributors
+
+This project is distributed under the Apache License 2.0. The complete license is in LICENSE.
+
+This package is a standalone implementation. It ships read-only format adapters for
+importing data from other memory systems, so that existing data can be migrated;
+those applications are neither bundled nor redistributed, and none of them is a
+runtime dependency of this library.
+
+Third-party Rust dependencies retain their own licenses. Cargo.lock records the
+resolved dependency versions. Python's simple agent uses the standard library.

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "p-memory"
+dynamic = ["version"]
+description = "Shared Rust core for memories, knowledge graphs, and notes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/kawayiYokami/p-memory"
+Repository = "https://github.com/kawayiYokami/p-memory"
+Issues = "https://github.com/kawayiYokami/p-memory/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+p-memory = "p_memory.cli:main"
+p-memory-demo = "p_memory.demo:main"
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "python"
+module-name = "p_memory._native"
+include = ["LICENSE", "NOTICE", "docs/**", "examples/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+
