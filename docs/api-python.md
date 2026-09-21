@@ -41,13 +41,14 @@ kb.notes.delete_by_filter(filter={"namespace": "demo", "tags": ["draft"]})  # �
 过滤条件里的 `namespace` 决定删哪个域，`scopes` / `tags` / `note_ids` 收窄范围；空命中返回 0，不是错误。图谱域按「关系 → 事件 → 实体」的顺序连边一起删，笔记域连带切片，级联顺序由库内部保证，调用方不必先解除引用。返回值只计主记录（图谱域是实体/关系/事件之和，笔记域只计笔记本身，随笔记删掉的切片不单独计数）。若某个待删实体仍被过滤条件之外的关系引用，抛 `ConflictError`，整个事务回滚，不做部分删除。
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
-**谓词元规则 `set_predicate_rule` 仅在 Rust 侧提供，Python 未暴露**；用法示例见 [graph-search](graph-search.md#python)。谓词等价词与查询期扩散在 Python 侧可用：`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.expand_query(namespace, text)` 单独调用扩散，二者也已在全文路与预设检索图谱路内部自动生效。
+谓词元规则与等价词在 Python 侧都可用：`kb.graph.set_predicate_rule(predicate, inverse=None, symmetric=False)` 登记对称/逆谓词、`kb.graph.delete_predicate_rule(predicate)` 撤销（内置 `sys:same_as` 同样可撤）；`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.delete_predicate_equivalents(namespace, predicates=None)` 撤销（不给词就清掉整域）、`kb.graph.expand_query(namespace, text)` 单独调用扩散。扩散也已在全文路与预设检索图谱路内部自动生效。
 
 笔记多两个方法，用来登记领域根目录：
 
 ```python
 kb.notes.set_root("demo", "./data/demo")   # 必须是已存在的目录
 kb.notes.root("demo")                                  # -> "./data/demo"，没登记为 None
+kb.notes.unset_root("demo")                            # 注销登记，返回是否命中
 kb.notes.upsert_file(path="./data/demo/notes/characters/overview.md")
 ```
 

@@ -443,3 +443,12 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
     kb.write(|writer| Ok(writer.conn.execute("UPDATE import_runs SET report_json=?2 WHERE source_id=?1",params![req.source_id,serde_json::to_string(&report)?])?))?;
     kb.close()?;Ok(report)
 }
+
+/// 从导入台账里删掉一条来源记录，让同一个来源能在同一目录上重新导入。
+/// 只删台账，不碰该来源已经导进去的数据；返回是否命中。
+pub fn delete_import_run(destination:&Path,source_id:&str)->Result<bool>{
+    let kb=KnowledgeBase::open(destination)?;
+    let removed=kb.write(|writer|Ok(writer.conn.execute("DELETE FROM import_runs WHERE source_id=?1",[source_id])?))?;
+    kb.close()?;
+    Ok(removed>0)
+}

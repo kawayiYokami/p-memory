@@ -43,7 +43,7 @@ enum RecordKind { Memory, Entity, Relation, Event, Note, Chunk }
 ### 不变式
 
 - `namespace`/`scope` 必须非空、无首尾空白、无控制字符；`id` 由库分配，不接受调用方指定。
-- 记录一旦写入，**不能改变 `scope`**；需要换作用域时显式复制成新 `id`（否则 `conflict`）。
+- `scope` 可以改。但被关系或事件引用的记录不能直接换域（否则端点会跨作用域，报 `conflict`）：先解除那些引用，再换。
 - `updated_at_us` 不能早于 `created_at_us`。
 - 指定 `expected_revision` 且与库中不符时拒绝写入。
 

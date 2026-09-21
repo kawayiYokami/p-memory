@@ -113,10 +113,26 @@ fn import_legacy(py:Python<'_>,request_json:String)->String{
         protocol::envelope(result).to_string()
     })
 }
+#[pyfunction]
+fn delete_import_run(py:Python<'_>,request_json:String)->String{
+    py.detach(move ||{
+        let result=serde_json::from_str::<serde_json::Value>(&request_json).map_err(p_memory::Error::from)
+            .and_then(|args|{
+                let destination=args.get("destination").and_then(|v|v.as_str())
+                    .ok_or_else(||p_memory::Error::Validation("destination is required".into()))?;
+                let source_id=args.get("source_id").and_then(|v|v.as_str())
+                    .ok_or_else(||p_memory::Error::Validation("source_id is required".into()))?;
+                let removed=p_memory::legacy::delete_import_run(std::path::Path::new(destination),source_id)?;
+                serde_json::to_value(removed).map_err(p_memory::Error::from)
+            });
+        protocol::envelope(result).to_string()
+    })
+}
 #[pymodule]
 fn _native(module:&Bound<'_,PyModule>)->PyResult<()>{
     module.add_class::<NativeKnowledgeBase>()?;
     module.add_function(wrap_pyfunction!(import_legacy,module)?)?;
+    module.add_function(wrap_pyfunction!(delete_import_run,module)?)?;
     module.add("PROTOCOL_VERSION",protocol::PROTOCOL_VERSION)?;
     module.add("__version__",env!("CARGO_PKG_VERSION"))?;
     Ok(())

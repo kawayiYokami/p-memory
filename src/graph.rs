@@ -302,6 +302,29 @@ impl GraphStore {
         Ok(groups.into_values().map(|mut group| { group.sort(); group.dedup(); group }).collect())
     }
 
+    /// 撤销谓词等价登记：给了词就只删这些词，留空就清掉整个领域的等价表。
+    /// 返回删掉的登记条数；没登记过的词不报错。
+    pub fn delete_predicate_equivalents(&self, namespace: &str, predicates: Option<&[String]>) -> Result<WriteReceipt<usize>> {
+        storage::validate_identity("namespace", namespace)?;
+        if let Some(list) = predicates { for term in list { storage::validate_identity("predicate", term)?; } }
+        self.0.mutate_meta(|tx| {
+            let Some(namespace_id) = namespace_term(tx, namespace)? else { return Ok(0usize); };
+            let removed = match predicates {
+                Some(list) if !list.is_empty() => {
+                    let mut removed = 0usize;
+                    for term in list {
+                        removed += tx.execute("DELETE FROM predicate_equivalents WHERE namespace_id=?1 \
+                            AND predicate_id=(SELECT id FROM strings WHERE text=?2)",
+                            params![namespace_id, text::normalized_tag(term)])?;
+                    }
+                    removed
+                }
+                _ => tx.execute("DELETE FROM predicate_equivalents WHERE namespace_id=?1", [namespace_id])?,
+            };
+            Ok(removed)
+        })
+    }
+
     /// 扩散：找出 `text` 里出现了哪些已登记谓词，返回这些谓词所在等价组的全部同义词。
     /// 命中判定是「登记词作为子串出现在查询里」。
     /// 返回的是可直接追加进检索的补充词元；没有命中返回空。

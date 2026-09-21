@@ -103,7 +103,11 @@ fn transactions_scopes_pagination_and_persistence() {
     assert_eq!(kb.memories().list(&page).unwrap().items[0].header.id, b);
     assert!(matches!(kb.memories().get(c, &ReadFilter::default()), Err(Error::NotFound(_))));
     let mut moved = memory("moved", "private"); moved.record.id = Some(a);
-    assert!(matches!(kb.memories().upsert(moved), Err(Error::Conflict(_))));
+    kb.memories().upsert(moved).unwrap();
+    let private = ReadFilter { namespace: "default".into(), scopes: vec!["private".into()], ..Default::default() };
+    assert_eq!(kb.memories().get(a, &private).unwrap().header.scope, "private", "作用域可以改");
+    let mut restored = first.clone(); restored.record.id = Some(a);
+    kb.memories().upsert(restored).unwrap();
     let revision = kb.health().unwrap().revision;
     assert!(kb.memories().upsert_many(&[memory("valid", "public"), MemoryInput::new(" ")]).is_err());
     assert_eq!(kb.health().unwrap().revision, revision);
@@ -2280,4 +2284,78 @@ fn the_index_forgets_batch_deleted_records() {
     kb.memories().delete_by_filter(&ReadFilter::default()).unwrap();
     kb.update_index().unwrap();
     assert!(kb.search(&query).unwrap().hits.is_empty(), "删之后索引里也没有了");
+}
+
+/// 谓词等价登记要能撤：按词删只动它自己，清整域一次清空。
+#[test]
+fn predicate_equivalents_can_be_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.graph().set_predicate_equivalents("demo", &[
+        vec!["alpha".into(), "beta".into(), "gamma".into()],
+        vec!["delta".into(), "epsilon".into()],
+    ]).unwrap();
+    assert_eq!(kb.graph().predicate_equivalents("demo").unwrap().len(), 2, "两组");
+    // 删一个词，它所属的组缩小，别组不动。
+    let only = vec!["gamma".to_string()];
+    assert_eq!(kb.graph().delete_predicate_equivalents("demo", Some(&only)).unwrap().value, 1);
+    let groups = kb.graph().predicate_equivalents("demo").unwrap();
+    assert_eq!(groups.len(), 2, "同组其余词还在");
+    assert!(!groups.iter().flatten().any(|term| term == "gamma"), "gamma 已经不在表里");
+    // 没登记过的词删不动，也不报错。
+    let unknown = vec!["zeta".to_string()];
+    assert_eq!(kb.graph().delete_predicate_equivalents("demo", Some(&unknown)).unwrap().value, 0);
+    // 不给词就是清整域。
+    assert_eq!(kb.graph().delete_predicate_equivalents("demo", None).unwrap().value, 4);
+    assert!(kb.graph().predicate_equivalents("demo").unwrap().is_empty(), "整域清空");
+}
+
+/// 谓词元规则要能撤，内置的 sys:same_as 同样能撤。
+#[test]
+fn predicate_rules_can_be_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.graph().set_predicate_rule("father", Some("child"), false).unwrap();
+    assert!(kb.graph().delete_predicate_rule("father").unwrap().value);
+    assert!(!kb.graph().delete_predicate_rule("father").unwrap().value, "再删就是没命中");
+    assert!(!kb.graph().delete_predicate_rule("never-registered").unwrap().value);
+    assert!(kb.graph().delete_predicate_rule("sys:same_as").unwrap().value, "内置规则也要能撤");
+}
+
+/// 笔记根目录登记要能注销，注销后这个领域回到「没登记」的状态。
+#[test]
+fn a_notes_root_can_be_deregistered() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let root = dir.path().join("docs");
+    std::fs::create_dir_all(&root).unwrap();
+    kb.notes().set_root("demo", &root.to_string_lossy()).unwrap();
+    assert!(kb.notes().root("demo").unwrap().is_some());
+    assert!(kb.notes().unset_root("demo").unwrap());
+    assert!(kb.notes().root("demo").unwrap().is_none());
+    assert!(!kb.notes().unset_root("demo").unwrap(), "再注销就是没命中");
+}
+
+/// 记录的作用域可以改；被关系引用的实体不能直接换域，得先解除引用。
+#[test]
+fn a_record_can_change_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let id = kb.memories().upsert(memory("换作用域", "public")).unwrap().value.header.id;
+    let mut moved = memory("换作用域", "private");
+    moved.record.id = Some(id);
+    kb.memories().upsert(moved).unwrap();
+    let private = ReadFilter { namespace: "default".into(), scopes: vec!["private".into()], ..Default::default() };
+    assert_eq!(kb.memories().get(id, &private).unwrap().header.scope, "private");
+
+    let entities = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("alice"), entity("bob")], ..Default::default() })
+        .unwrap().value.entities;
+    kb.graph().apply_batch(&GraphBatch { relations: vec![RelationInput { record: RecordInput::default(),
+        subject_id: entities[0].header.id, predicate: "knows".into(), object_id: entities[1].header.id,
+        confidence: 1.0, reason: String::new() }], ..Default::default() }).unwrap();
+    let mut linked = entity("alice");
+    linked.record.id = Some(entities[0].header.id);
+    linked.record.scope = "private".into();
+    assert!(kb.graph().apply_batch(&GraphBatch { entities: vec![linked], ..Default::default() }).is_err(),
+        "被关系引用的实体不能直接换域");
 }

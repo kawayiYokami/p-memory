@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "p-memory"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "chrono",
  "fs4",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "p-memory-python"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "p-memory",
  "pyo3",

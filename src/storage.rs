@@ -600,8 +600,15 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
             .ok_or_else(|| Error::NotFound(id.to_string()))?),
         None => None,
     };
-    if existing.as_ref().is_some_and(|v| v.3 != scope_id) {
-        return Err(Error::Conflict("an existing record cannot change scope; copy it to a new ID explicitly".into()));
+    if let (Some(id), true) = (input.id, existing.as_ref().is_some_and(|v| v.3 != scope_id)) {
+        // 换作用域会连带影响引用它的关系与事件，它们的端点必须与记录同域。
+        // 无引用的记录（记忆、笔记、孤立实体）直接换；有引用的先清掉引用再换。
+        let blocking: i64 = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM relations WHERE subject_id=?1 OR object_id=?1) \
+             + (SELECT COUNT(*) FROM event_participants WHERE entity_id=?1)", [id], |r| r.get(0))?;
+        if blocking > 0 {
+            return Err(Error::Conflict(format!("record {id} is referenced by {blocking} relation(s) or event participant row(s); remove those references before changing its scope")));
+        }
     }
     if let Some(expected) = input.expected_revision {
         if existing.as_ref().map(|v| v.2) != Some(expected) { return Err(Error::StaleRevision(input.id.map(|v| v.to_string()).unwrap_or_default())); }

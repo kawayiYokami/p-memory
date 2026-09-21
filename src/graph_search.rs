@@ -189,6 +189,17 @@ impl GraphStore {
             Ok(())
         })
     }
+
+    /// 撤销一条谓词元规则（对称或逆谓词）。内置的 `sys:same_as` 同样可以撤。
+    /// 返回是否命中；没登记过的谓词不报错。
+    pub fn delete_predicate_rule(&self, predicate: &str) -> Result<WriteReceipt<bool>> {
+        storage::validate_identity("predicate", predicate)?;
+        self.0.mutate_meta(|tx| {
+            let removed = tx.execute("DELETE FROM predicate_rules WHERE predicate_id=(SELECT id FROM strings WHERE text=?1)",
+                [crate::text::normalized_tag(predicate)])?;
+            Ok(removed > 0)
+        })
+    }
 }
 
 impl GraphView {

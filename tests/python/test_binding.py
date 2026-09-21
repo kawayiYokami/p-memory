@@ -20,6 +20,7 @@ from p_memory import (
     NotFoundError,
     PMemoryError,
     ValidationError,
+    delete_import_run,
     import_legacy,
 )
 
@@ -698,3 +699,56 @@ def test_batch_delete_without_matches_returns_zero(kb):
     assert kb.memories.delete_by_filter()["value"] == 0
     assert kb.graph.delete_by_filter()["value"] == 0
     assert kb.notes.delete_by_filter()["value"] == 0
+
+
+def test_predicate_equivalents_can_be_deleted(kb):
+    """谓词等价登记要能撤：按词删只动它自己，不给词就清整域。"""
+    kb.graph.set_predicate_equivalents("demo", [["alpha", "beta", "gamma"], ["delta", "epsilon"]])
+    assert len(kb.graph.predicate_equivalents("demo")) == 2
+    assert kb.graph.delete_predicate_equivalents("demo", ["gamma"])["value"] == 1
+    groups = kb.graph.predicate_equivalents("demo")
+    assert len(groups) == 2 and all("gamma" not in group for group in groups)
+    assert kb.graph.delete_predicate_equivalents("demo", ["zeta"])["value"] == 0
+    assert kb.graph.delete_predicate_equivalents("demo")["value"] == 4
+    assert kb.graph.predicate_equivalents("demo") == []
+
+
+def test_predicate_rules_can_be_deregistered(kb):
+    """谓词元规则要能撤，内置的 sys:same_as 同样能撤。"""
+    kb.graph.set_predicate_rule("father", inverse="child")
+    assert kb.graph.delete_predicate_rule("father")["value"] is True
+    assert kb.graph.delete_predicate_rule("father")["value"] is False
+    assert kb.graph.delete_predicate_rule("sys:same_as")["value"] is True
+
+
+def test_notes_root_can_be_unset(kb, tmp_path):
+    """笔记根目录登记要能注销。"""
+    kb.notes.set_root("demo", str(tmp_path))
+    assert kb.notes.root("demo") == str(tmp_path).replace("\\", "/")
+    assert kb.notes.unset_root("demo") is True
+    assert kb.notes.root("demo") is None
+    assert kb.notes.unset_root("demo") is False
+
+
+def test_import_ledger_row_can_be_removed(open_kb, tmp_path):
+    """导入台账要能删；删掉之后同一个来源可以在同一目录重导。"""
+    # 台账删除要独占打开数据目录，所以先把库关掉。
+    open_kb().close()
+    conn = sqlite3.connect(tmp_path / "data" / "store.sqlite3")
+    conn.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES ('src','fp','{}')")
+    conn.commit()
+    conn.close()
+    assert delete_import_run(destination=tmp_path / "data", source_id="src") is True
+    assert delete_import_run(destination=tmp_path / "data", source_id="src") is False
+
+
+def test_record_scope_can_change(kb):
+    """作用域可以改；图里被关系引用的实体不能直接换域。"""
+    id_ = kb.memories.upsert({"judgment": "换作用域"})["value"]["id"]
+    kb.memories.upsert({"id": id_, "judgment": "换作用域", "scope": "private"})
+    assert kb.memories.get(id_, filter={"scopes": ["private"]})["scope"] == "private"
+    batch = kb.graph.apply_batch(entities=[{"name": "甲"}, {"name": "乙"}])
+    jia, yi = [e["id"] for e in batch["value"]["entities"]]
+    kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
+    with pytest.raises(ConflictError):
+        kb.graph.apply_batch(entities=[{"id": jia, "name": "甲", "scope": "private"}])

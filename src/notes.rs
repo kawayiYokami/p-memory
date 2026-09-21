@@ -262,6 +262,15 @@ impl NoteStore {
             Ok(())
         })
     }
+    /// 注销该领域的笔记根目录登记。只影响之后写入时的路径计算，已入库的笔记不动。
+    /// 返回是否命中；没登记过的领域不报错。
+    pub fn unset_root(&self, namespace: &str) -> Result<bool> {
+        storage::validate_identity("namespace", namespace)?;
+        self.0.write(|writer| {
+            let namespace_id = storage::term_id(&writer.conn, namespace)?;
+            Ok(writer.conn.execute("DELETE FROM namespace_roots WHERE namespace_id=?1", [namespace_id])? > 0)
+        })
+    }
     /// 该领域登记的笔记根目录；没登记就是 `None`。
     pub fn root(&self, namespace: &str) -> Result<Option<String>> {
         let state = self.0.read()?;

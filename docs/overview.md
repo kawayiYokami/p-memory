@@ -61,5 +61,6 @@ p-memory 是给多个宿主共用的**离线记忆底层**：统一记忆、知�
 - `--notes-root` 对所有来源有效：只有落在该目录下的文件才会被当作笔记来源读入。
 - 默认是 **dry run**（只预览、不写入），加 `--apply` 才落库；来源数据库全程只读。
 - 导入按 `source_id` 记录批次指纹到 `import_runs`，重复导入同一快照会被识别（`already_imported`）。
+- 台账可以撤：`delete_import_run(destination=..., source_id=...)` 删掉那条记录，同一目录就能重新导入同一来源；只删台账，不动已导入的数据。
 
 接口契约见 [data-model](data-model.md)、[api-rust](api-rust.md)、[api-python](api-python.md)。

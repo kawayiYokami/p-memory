@@ -266,9 +266,31 @@ class GraphStore(_Store):
         return self._call("set_predicate_equivalents",
                           {"namespace": namespace, "groups": [list(group) for group in groups]})
 
+    def delete_predicate_equivalents(self, namespace: str, predicates: Sequence[str] | None = None) -> WriteReceipt:
+        """Drop registered predicate equivalence entries for a domain.
+
+        Pass ``predicates`` to remove just those words, or leave it out to clear
+        the whole domain's table. Words that were never registered are ignored.
+        """
+        return self._call("delete_predicate_equivalents",
+                          {"namespace": namespace, "predicates": None if predicates is None else list(predicates)})
+
     def predicate_equivalents(self, namespace: str) -> list[list[str]]:
         """List the predicate equivalence groups registered for a domain."""
         return self._call("predicate_equivalents", {"namespace": namespace})
+
+    def set_predicate_rule(self, predicate: str, inverse: str | None = None, symmetric: bool = False) -> WriteReceipt:
+        """Declare a predicate rule: symmetric, or carrying a known inverse.
+
+        The two are mutually exclusive, and rules only affect the in-memory edges
+        built at graph-search time.
+        """
+        return self._call("set_predicate_rule",
+                          {"predicate": predicate, "inverse": inverse, "symmetric": symmetric})
+
+    def delete_predicate_rule(self, predicate: str) -> WriteReceipt:
+        """Remove a predicate rule. The built-in ``sys:same_as`` can be removed too."""
+        return self._call("delete_predicate_rule", {"predicate": predicate})
 
     def expand_query(self, namespace: str, text: str) -> list[str]:
         """Expand ``text`` with synonyms of any registered predicate it contains.
@@ -312,6 +334,14 @@ class NoteStore(_Store):
     def set_root(self, namespace: str, root: str | os.PathLike) -> None:
         """登记该知识领域的笔记根目录：之后写入的路径必须是它的子路径，库里存相对路径。"""
         return self._call("set_root", {"namespace": namespace, "root": os.fspath(root)})
+
+    def unset_root(self, namespace: str) -> WriteReceipt:
+        """Deregister a domain's notes root directory.
+
+        Only affects how later writes resolve paths; notes already stored keep
+        the relative paths they were written with.
+        """
+        return self._kb.invoke("notes.unset_root", {"namespace": namespace})
 
     def root(self, namespace: str) -> str | None:
         """该领域登记的笔记根目录；没登记就是 None。"""
@@ -384,6 +414,15 @@ def import_legacy(*, source: str, source_id: str, database: str | os.PathLike, d
         "lookup_database": os.fspath(lookup_database) if lookup_database is not None else None,
         "notes_root": os.fspath(notes_root) if notes_root is not None else None,
         "namespace": namespace, "scope": scope, "dry_run": dry_run})))
+
+
+def delete_import_run(*, destination: str | os.PathLike, source_id: str) -> bool:
+    """Drop one import-ledger entry so the same source can be imported again.
+
+    Only the ledger row is removed; data already imported from that source stays.
+    """
+    return _unwrap(_native.delete_import_run(
+        _json({"destination": os.fspath(destination), "source_id": source_id})))
 
 
 class _AsyncStore:
