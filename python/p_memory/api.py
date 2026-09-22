@@ -195,6 +195,15 @@ class _Store:
     def get(self, id: str, *, filter: ReadFilter | None = None) -> dict:
         return self._call("get", {"id": id, "filter": self._kb._filter(filter)})
 
+    def get_many(self, ids: Sequence[int], *, filter: ReadFilter | None = None) -> dict[int, dict]:
+        """批量读取：等价于逐条 `get`，但一次往返。
+
+        只返回满足 `filter` 的记录，返回 `{id: record}`；未命中过滤条件的 id
+        不会出现在结果里（与逐条 `get` 报 NotFound 不同，请按缺失处理）。
+        """
+        result = self._call("get_many", {"ids": [int(i) for i in ids], "filter": self._kb._filter(filter)})
+        return {int(key): value for key, value in result.items()}
+
     def list(self, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
         return self._call("list", {"filter": self._kb._filter(filter), "limit": limit, "after": after})
 

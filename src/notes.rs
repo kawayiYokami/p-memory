@@ -283,6 +283,13 @@ impl NoteStore {
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note> {
         storage::get(self.0.read()?.conn(), &RecordKey { id }, filter)
     }
+    /// 批量读取一批笔记，只返回满足 `filter` 的那些。
+    ///
+    /// 语义等同于对每个 id 依次调用 `get`，但把过滤压成一条 SQL、一次取回，
+    /// 避免宿主逐条回库的往返开销。不满足过滤条件的 id 被静默跳过（不报错）。
+    pub fn get_many(&self, ids: &[i64], filter: &ReadFilter) -> Result<BTreeMap<i64, Note>> {
+        storage::load_many(self.0.read()?.conn(), ids, filter)
+    }
     pub fn list(&self, page: &PageRequest) -> Result<Page<Note>> { storage::list(self.0.read()?.conn(), RecordKind::Note, page) }
     pub fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk> {
         let state = self.0.read()?;

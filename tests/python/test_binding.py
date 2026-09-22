@@ -220,6 +220,27 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
         kb.notes.upsert_file(path=str(bad))
 
 
+def test_notes_get_many_batches_and_skips_missing(kb, tmp_path):
+    """批量读：一次取回多篇，字段与逐条 get 一致；不存在的 id 静默跳过。"""
+    a = tmp_path / "甲.md"
+    b = tmp_path / "乙.md"
+    a.write_text("甲正文", encoding="utf-8", newline="")
+    b.write_text("乙正文", encoding="utf-8", newline="")
+    note_a = kb.notes.upsert_file(path=str(a))["value"]
+    note_b = kb.notes.upsert_file(path=str(b))["value"]
+
+    batch = kb.notes.get_many([note_a["id"], note_b["id"]])
+    assert set(batch) == {note_a["id"], note_b["id"]}
+    assert batch[note_a["id"]] == kb.notes.get(note_a["id"])
+    assert batch[note_b["id"]] == kb.notes.get(note_b["id"])
+
+    partial = kb.notes.get_many([note_a["id"], 9_999_999])
+    assert set(partial) == {note_a["id"]}, "不存在的 id 应跳过而不是报错"
+
+    empty = kb.notes.get_many([])
+    assert empty == {}
+
+
 def test_chunks_from_one_note_collapse_with_the_note_total(kb, tmp_path):
     """同一篇笔记命中多片时只出一条，并报出这一篇共有多少片段命中。"""
     many = tmp_path / "对话.md"

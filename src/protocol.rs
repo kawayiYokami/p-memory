@@ -12,6 +12,8 @@ fn optional<T:DeserializeOwned+Default>(value:&Value,name:&str)->Result<T>{value
 #[derive(Deserialize)]
 struct IdRequest { id:i64, #[serde(default)] filter:ReadFilter }
 #[derive(Deserialize)]
+struct IdsRequest { ids: Vec<i64>, #[serde(default)] filter:ReadFilter }
+#[derive(Deserialize)]
 struct GraphId { id:i64, kind:RecordKind, #[serde(default)] filter:ReadFilter }
 
 pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
@@ -56,6 +58,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "notes.unset_root"=>encode(kb.notes().unset_root(&field::<String>(&args,"namespace")?)?),
         "notes.root"=>encode(kb.notes().root(&field::<String>(&args,"namespace")?)?),
         "notes.get"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get(r.id,&r.filter)?)},
+        "notes.get_many"=>{let r:IdsRequest=decode(args)?;encode(kb.notes().get_many(&r.ids,&r.filter)?)},
         "notes.list"=>encode(kb.notes().list(&decode(args)?)?),
         "notes.delete"=>{let r:IdRequest=decode(args)?;encode(kb.notes().delete(r.id,&r.filter)?)},
         "notes.delete_by_filter"=>encode(kb.notes().delete_by_filter(&optional::<ReadFilter>(&args,"filter")?)?),
