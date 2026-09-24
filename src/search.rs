@@ -325,7 +325,7 @@ impl KnowledgeBase {
             let tags: Vec<String> = request.filter.tags.iter().map(|t| text::normalized_tag(t)).collect();
             let mut scored: Vec<(RecordKey, f64)> = Vec::new();
             for scope in scopes {
-                let Some(partition) = self.partition(conn, space, &namespace, &scope)? else { continue };
+                let Some(partition) = self.partition(space, &namespace, &scope)? else { continue };
                 scored.extend(partition.search(vector, &vector_kinds, &tags, &request.filter.note_ids, limit, allowed.as_ref())?);
             }
             // 跨分区汇总后再统一排名：分区各自从 0 计 rank 会破坏 RRF 融合语义。

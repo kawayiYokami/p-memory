@@ -232,7 +232,7 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<crat
             let revision = storage::next_revision(conn, key.id)?;
             conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
                 params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
-            conn.execute("DELETE FROM embeddings WHERE record_id=?1", [key.id])?;
+            conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1", [key.id])?;
             // 正文与向量都改了，这个领域的向量分区跟着变。
             storage::touch_record_namespace(conn, key.id)?;
             documents.push(storage::index_document(conn, key.id, kind, body.clone())?);

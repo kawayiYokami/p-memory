@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 12;
+pub(crate) const SCHEMA_VERSION: i64 = 13;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -182,7 +182,10 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             // v11 -> v12：向量表补按 record_id 的索引。删 records 父行时 SQLite 按 record_id
             // 级联子表，主键前导列却是 space_id，缺这个索引就只能全表扫描——批量删除会把它
             // 放大成「条数 × 向量行数」。
-            11 => { tx.execute_batch("CREATE INDEX embeddings_by_record ON embeddings(record_id)")?; }
+            11 => { tx.execute_batch("CREATE INDEX IF NOT EXISTS embeddings_by_record ON embeddings(record_id)")?; }
+            // v12 -> v13：向量表整体搬到外挂库 vectors.sqlite3（自带路由字段与就绪标记），
+            // 主库不再持有向量数据。搬迁由 KnowledgeBase::open 在打开时检测完成，这里只登记版本。
+            12 => { /* 搬迁由打开流程做 */ }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -225,6 +228,16 @@ mod tests {
         // v10 之前没有谓词等价词表；回退到旧版本时删掉，供 v9→v10 迁移验证。
         if version < 10 {
             conn.execute_batch("DROP TABLE predicate_equivalents;").unwrap();
+        }
+        // v12 之前向量还在主库；回退到旧版本时把表补回（结构同 v11），供 v12→v13 迁移验证。
+        // 当前 schema.sql 已无 embeddings 表，只在回退时补建。
+        if version < 12 {
+            conn.execute_batch("CREATE TABLE embeddings (
+                space_id TEXT NOT NULL REFERENCES embedding_spaces(id) ON DELETE CASCADE,
+                record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                fingerprint TEXT NOT NULL, vector BLOB NOT NULL,
+                PRIMARY KEY(space_id, record_id)
+            ); CREATE INDEX embeddings_by_record ON embeddings(record_id);").unwrap();
         }
         // v11 之前 notes 没有 name 列；回退到旧版本时删掉，供 v10→v11 迁移验证。
         if (7..11).contains(&version) {
@@ -281,20 +294,27 @@ mod tests {
         assert_eq!(kb.graph().predicate_equivalents("demo").unwrap().len(), 1, "迁移后新表可用");
     }
 
-    /// v11 形态的库前滚到当前版本：向量表补上按 record_id 的索引。
-    /// 这条索引的作用可以直接验：删 records 父行时，级联到 embeddings 的那一步不再全表扫描。
+    /// v11 形态的库前滚到当前版本：向量表已搬进外挂库，按 record_id 的索引就位。
+    /// 索引在 `vectors.sqlite3` 里，删 records 时级联删向量走的是它自己的索引。
     #[test]
     fn rolls_v11_forward_indexing_the_vector_table() {
         let dir = tempfile::tempdir().unwrap();
         legacy_db(dir.path(), 11, "");
         let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
         assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
-        let conn = Connection::open(dir.path().join("store.sqlite3")).unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
-        let plans: Vec<String> = conn.prepare("EXPLAIN QUERY PLAN DELETE FROM records WHERE id=1").unwrap()
-            .query_map([], |row| row.get::<_, String>(3)).unwrap().map(|row| row.unwrap()).collect();
-        let embedding_plan = plans.iter().find(|plan| plan.contains("embeddings")).expect("删父行会级联到向量表");
-        assert!(embedding_plan.starts_with("SEARCH"), "级联删除必须走索引而不是全表扫描：{embedding_plan}");
+        // 向量库已建，表与索引都在。
+        let conn = Connection::open(dir.path().join("vectors.sqlite3")).unwrap();
+        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert!(tables.contains(&"embeddings".to_string()), "向量库应有 embeddings 表");
+        let indexes: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='index'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert!(indexes.iter().any(|i| i == "embeddings_by_record"), "向量库应有按 record_id 的索引：{indexes:?}");
+        // 主库不再留 embeddings 表。
+        let main = Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        let main_tables: Vec<String> = main.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert!(!main_tables.contains(&"embeddings".to_string()), "主库不应再留 embeddings 表");
     }
 
     /// v4 形态的笔记 + 切片（带 content 与两条派生列）前滚到当前版本：

@@ -166,11 +166,11 @@ kb.update_index()?;    // 追平待办（写入不就地索引；批量导入后
 
 ## 存储与备份
 
-一个目录一个库：`store.sqlite3`（权威）+ `text-v2/`（可重建的全文索引）+ `writer.lock`。
+一个目录一个库：`store.sqlite3`（权威）+ `vectors.sqlite3`（向量外挂派生库）+ `text-v2/`（可重建的全文索引）+ `writer.lock`。
 
 ```rust
-kb.backup("./backup.sqlite3")?;                                  // 在线备份
-let restored = KnowledgeBase::restore("./backup.sqlite3", "./data2")?;
+kb.backup("./backup.sqlite3")?;                                  // 在线备份（同时生成 backup.sqlite3.vectors）
+let restored = KnowledgeBase::restore("./backup.sqlite3", "./data2")?;  // 若同目录存在 .vectors 备份则一并还原
 ```
 
 字段级细节见 [data-model](data-model.md)，完整签名见 [api-rust](api-rust.md)。

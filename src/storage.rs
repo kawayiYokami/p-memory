@@ -11,7 +11,7 @@ use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::{File, OpenOp
 /// 只在库内补向量那条线程正在补齐时才试：它提交的正是读者要看的待办，
 /// 而那份提交一落地待办就空了，循环随即结束。别的时候（例如批量导入的写者占着写锁）
 /// 一律不试，读路径绝不为索引排队——那正是当初吞吐塌方的成因。
-const SELF_HEAL_ATTEMPTS: usize = 1000;
+
 
 /// 写者：独占的写连接 + 跨进程文件锁。只挡其他写者，不挡读。
 pub(crate) struct Writer { pub conn: Connection, _file_lock: File }
@@ -106,6 +106,10 @@ impl Drop for TouchLog {
 pub(crate) struct Engine {
     pub writer: Mutex<Option<Writer>>,
     pub readers: Mutex<Option<Readers>>,
+    /// 向量外挂库 `vectors.sqlite3` 的写连接与读连接池：与主库同目录、独立 WAL、独立锁。
+    /// 向量是派生检索索引，读写不走主库通道，补齐线程的写不会占用业务写的写锁。
+    pub vector_writer: Mutex<Option<Writer>>,
+    pub vector_readers: Mutex<Option<Readers>>,
     /// `TextIndex` 自带内部写锁、`IndexReader` 可并发检索，用 `Arc` 共享给所有读线程。
     /// 放进 `Option` 是为了 `close` 时能真正销毁它——Tantivy 的写锁由 `IndexWriter` 持有，
     /// 不销毁就无法释放，目录也重开不了。
@@ -127,6 +131,22 @@ pub(crate) struct Engine {
 fn open_reader(root: &Path) -> Result<Connection> {
     let conn = Connection::open(root.join("store.sqlite3"))?;
     conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
+    // 向量库外挂：读路径也要看得见它（缺口核对、指纹比对都靠 ATTACH 读）。
+    conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
+    Ok(conn)
+}
+
+/// 向量外挂库的连接：独立文件、独立 WAL；`foreign_keys` 关掉——它只存自己的路由快照，
+/// 不跟主库做任何外键级联。
+fn open_vector_writer(root: &Path) -> Result<Connection> {
+    let conn = Connection::open(root.join("vectors.sqlite3"))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch(include_str!("vectors_schema.sql"))?;
+    Ok(conn)
+}
+fn open_vector_reader(root: &Path) -> Result<Connection> {
+    let conn = Connection::open(root.join("vectors.sqlite3"))?;
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;")?;
     Ok(conn)
 }
 
@@ -157,13 +177,25 @@ impl KnowledgeBase {
         if !file_lock.try_lock_exclusive()? { return Err(Error::Locked(root.display().to_string())); }
         let mut write_conn = Connection::open(root.join("store.sqlite3"))?;
         schema::initialize(&mut write_conn)?;
+        // 向量外挂库：主库有 embeddings 表说明是旧库，先把它整表搬进 vectors.sqlite3。
+        // 搬迁在主库写连接上做，搬完再 ATTACH，避免挂一个还不存在的文件。
+        let needs_vector_migration: bool = write_conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embeddings'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
+        if needs_vector_migration { crate::embeddings::migrate_vectors(&root, &mut write_conn)?; }
+        // 向量库文件此刻必须已存在（迁移会建，新库也要建）：否则 ATTACH 查不到表。
+        let vector_writer = open_vector_writer(&root)?;
+        // 向量库外挂：写路径的删除与指纹核对也要看得见它。
+        write_conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
         let index = Arc::new(TextIndex::open(&root)?);
         index.recover(&write_conn)?;
         // 只读连接在 schema 建好之后再开，保证它看到的是完整结构。
         let reader = open_reader(&root)?;
+        let vector_reader = open_vector_reader(&root)?;
         let engine = Arc::new(Engine {
             writer: Mutex::new(Some(Writer { conn: write_conn, _file_lock: file_lock })),
             readers: Mutex::new(Some(Readers { idle: vec![reader] })),
+            vector_writer: Mutex::new(Some(Writer { conn: vector_writer, _file_lock: OpenOptions::new().create(true).truncate(false).read(true).write(true).open(root.join("vector_writer.lock"))? })),
+            vector_readers: Mutex::new(Some(Readers { idle: vec![vector_reader] })),
             index: RwLock::new(Some(index)), vectors: VectorCache::new(),
             embedders: crate::embeddings::EmbedderRegistry::new(),
             rerankers: crate::search::RerankerRegistry::new(),
@@ -198,6 +230,8 @@ impl KnowledgeBase {
             None => Ok(()),
         };
         *guard = None;
+        *self.engine.vector_writer.lock() = None;
+        *self.engine.vector_readers.lock() = None;
         // 必须真正销毁索引：Tantivy 的目录写锁由 IndexWriter 持有，不销毁就释放不掉。
         *self.engine.index.write() = None;
         *self.engine.readers.lock() = None;
@@ -219,15 +253,27 @@ impl KnowledgeBase {
         Ok(ReadGuard { engine: &self.engine, conn: Some(conn) })
     }
 
-    /// 取一个向量分区：缓存里有就直接复用，否则按需载入后写入缓存。
+    /// 取一个向量分区：缓存里有就直接复用，否则从向量外挂库按需载入。
     /// 载入过程不持缓存锁——否则一个慢分区会挡住所有其他分区的查询。
-    pub(crate) fn partition(&self, conn: &Connection, space: &crate::embeddings::EmbeddingSpace,
+    /// 向量库是独立文件、独立连接，载入期间不碰主库。
+    pub(crate) fn partition(&self, space: &crate::embeddings::EmbeddingSpace,
         namespace: &str, scope: &str) -> Result<Option<Arc<crate::embeddings::Partition>>> {
         let key = (space.id.clone(), namespace.to_string(), scope.to_string());
         let epoch = self.engine.vectors.epoch_of(namespace);
         let cached = self.engine.vectors.entries.lock().get(&key).cloned();
         if let Some(partition) = cached { return Ok(partition); }
-        let loaded = crate::embeddings::Partition::load(conn, space, namespace, scope)?.map(Arc::new);
+        let loaded = {
+            let conn = {
+                let mut readers = self.engine.vector_readers.lock();
+                match readers.as_mut() {
+                    Some(readers) => readers.idle.pop().unwrap_or_else(|| open_vector_reader(&self.engine.root).unwrap_or_else(|_| unreachable!())),
+                    None => return Err(Error::Closed),
+                }
+            };
+            let result = crate::embeddings::Partition::load(&conn, space, namespace, scope)?;
+            if let Some(readers) = self.engine.vector_readers.lock().as_mut() { readers.idle.push(conn); }
+            result.map(Arc::new)
+        };
         // 载入期间这个领域可能被写过：版本号变了就说明手上这份已经过期，索性不写缓存。
         // 复查版本号与写条目要在同一把条目锁里：否则失效正好落在两步之间时，
         // 一份过期分区会被永久留在表里，直到这个领域下次被写。
@@ -246,25 +292,10 @@ impl KnowledgeBase {
     pub(crate) fn sync_index_if_behind(&self, conn: &Connection) -> Result<()> {
         let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
         if pending == 0 { return Ok(()); }
-        // 库内补向量那条线程也会提交索引，而它提交的正是读者要看的待办：
-        // 它补齐期间允许读者短暂等一等。别的写者一概不等——批量导入时写者会长期占着写锁，
-        // 读路径为它排队就是当初那次吞吐塌方的成因。
-        let filling = self.engine.vectorizer.get().map(|vectorizer| vectorizer.clone());
-        for _ in 0..SELF_HEAL_ATTEMPTS {
-            match self.engine.writer.try_lock() {
-                Some(mut guard) => return match guard.as_mut() {
-                    Some(writer) => self.index()?.sync(&writer.conn),
-                    None => Ok(()),
-                },
-                None => {
-                    // 待办已经被提交掉了（多半就是那条线程提交的）：不必再等。
-                    let still: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-                    if still == 0 { return Ok(()); }
-                    // 它没在补齐就说明是别的写者占着写锁，读路径不为它排队。
-                    if !filling.as_ref().is_some_and(|vectorizer| vectorizer.is_filling()) { return Ok(()); }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
+        // 抢得到写锁就顺手追平；抢不到就走，不为任何写者排队。
+        // 向量补齐已拆到外挂库，不再占主库写锁，读者没有需要等的对象。
+        if let Some(mut guard) = self.engine.writer.try_lock() {
+            if let Some(writer) = guard.as_mut() { self.index()?.sync(&writer.conn)?; }
         }
         Ok(())
     }
@@ -315,10 +346,18 @@ impl KnowledgeBase {
     /// 按记录所属领域取名字；已经删掉的记录查不到领域，不影响（删记录不会造出缺口）。
     fn invalidate_readiness(&self, conn: &Connection) {
         let Ok(mut stmt) = conn.prepare("SELECT DISTINCT s.text FROM index_updates u
-            JOIN records r ON r.id=u.record_id JOIN strings s ON s.id=r.namespace_id") else { return };
-        let Ok(namespaces) = stmt.query_map([], |r| r.get::<_, String>(0)) else { return };
-        for namespace in namespaces.flatten() {
-            let _ = crate::embeddings::clear_vector_ready(conn, &namespace);
+            JOIN records r ON r.id=u.record_id JOIN strings s ON s.id=r.namespace_id") else {
+            return;
+        };
+        let Ok(namespaces) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return;
+        };
+        let namespaces: Vec<String> = namespaces.flatten().collect();
+        if namespaces.is_empty() { return; }
+        let mut guard = self.engine.vector_writer.lock();
+        let Some(vector_writer) = guard.as_mut() else { return; };
+        for namespace in namespaces {
+            let _ = crate::embeddings::clear_vector_ready(&vector_writer.conn, &namespace);
         }
     }
 
@@ -349,15 +388,23 @@ impl KnowledgeBase {
     /// 写入不再就地索引，使用方（尤其批量导入）在合适时机调用本方法即可；
     /// 期间读取走 `sync_index_if_behind` 自愈兜底。
     pub fn update_index(&self) -> Result<HealthReport> {
-        self.catch_up_index()?;
+        self.catch_up_index(true)?;
+        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.notify_work(); }
         self.health()
     }
 
     /// 只追平索引、不做健康检查。向量化前必须走一次：
     /// 切片正文只存在索引里，索引没追平就取不到正文，只能拿到空串。
-    pub(crate) fn catch_up_index(&self) -> Result<()> {
-        let mut guard = self.engine.writer.lock();
-        let writer = guard.as_mut().ok_or(Error::Closed)?;
+    /// 调用方主动 `sync` 时（blocking）追平是它语义的一部分，阻塞拿锁做完；
+    /// 后台线程（非 blocking）只在拿得到时顺手做，抢不到说明前台正在写，待办留给下一轮。
+    pub(crate) fn catch_up_index(&self, blocking: bool) -> Result<()> {
+        if blocking {
+            let mut guard = self.engine.writer.lock();
+            let Some(writer) = guard.as_mut() else { return Ok(()) };
+            return self.index()?.sync(&writer.conn);
+        }
+        let Some(mut guard) = self.engine.writer.try_lock() else { return Ok(()) };
+        let Some(writer) = guard.as_mut() else { return Ok(()) };
         self.index()?.sync(&writer.conn)
     }
 
@@ -439,18 +486,31 @@ impl KnowledgeBase {
             let _ = std::fs::remove_file(target);
             return Err(err.into());
         }
+        // 向量外挂库也备份：它是派生索引，但备份恢复后不该要求重新跑模型。
+        let vectors_target = target.with_file_name(format!("{}.vectors", target.file_name().unwrap().to_string_lossy()));
+        if let Err(err) = state.conn().backup("vectors", &vectors_target, None) {
+            let _ = std::fs::remove_file(&vectors_target);
+            return Err(err.into());
+        }
         Ok(())
     }
 
     /// Restores to a new directory; search indexes are rebuilt from the snapshot.
     pub fn restore(snapshot: impl AsRef<Path>, directory: impl AsRef<Path>) -> Result<Self> {
-        let source = Connection::open_with_flags(snapshot.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let snapshot = snapshot.as_ref();
+        let source = Connection::open_with_flags(snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let app: i64 = source.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = source.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if app != schema::APPLICATION_ID { return Err(Error::Validation("snapshot is not a p-memory database".into())); }
         if version != schema::SCHEMA_VERSION { return Err(Error::SchemaVersion { found: version, supported: schema::SCHEMA_VERSION }); }
         std::fs::create_dir(directory.as_ref())?;
         source.backup(rusqlite::MAIN_DB, directory.as_ref().join("store.sqlite3"), None)?;
+        // 向量库备份在同目录、同名加 .vectors 后缀；有就恢复，没有就由补齐线程重建。
+        let vectors_snapshot = snapshot.with_file_name(format!("{}.vectors", snapshot.file_name().unwrap().to_string_lossy()));
+        if vectors_snapshot.exists() {
+            let vectors_source = Connection::open_with_flags(&vectors_snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            vectors_source.backup(rusqlite::MAIN_DB, directory.as_ref().join("vectors.sqlite3"), None)?;
+        }
         Self::open(directory)
     }
 }
@@ -631,7 +691,7 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
                 params![id, namespace_id, kind.code(), scope_id, updated, revision, metadata_json, evidence_json,
                     fingerprint, payload_json])?;
             // Updating text invalidates every space's embedding in the same transaction.
-            conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
+            conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
             (id, revision)
         }
         None => {
@@ -998,6 +1058,8 @@ pub(crate) fn delete_record(conn: &Connection, key: &RecordKey) -> Result<bool> 
         other => other?,
     };
     if changed > 0 {
+        // 向量外挂库没有外键级联，删记录时显式清掉它的向量。
+        conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1", [key.id])?;
         next_revision(conn, key.id)?;
         if let Some(namespace) = namespace { touch_namespace(&namespace); }
     }
@@ -1092,8 +1154,7 @@ mod tests {
 
     /// 让某个领域的向量分区进缓存。空领域也会被缓存成空分区，所以不必真造向量。
     fn cache_partition(kb: &KnowledgeBase, space: &crate::embeddings::EmbeddingSpace, namespace: &str) {
-        let guard = kb.read().unwrap();
-        kb.partition(guard.conn(), space, namespace, "public").unwrap();
+        kb.partition(space, namespace, "public").unwrap();
     }
 
     /// 当前缓存着哪些领域的向量分区。

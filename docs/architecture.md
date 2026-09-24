@@ -98,8 +98,8 @@ erDiagram
     notes ||--o{ chunks : "note_id"
     records ||--|| chunks : "record_id"
 
-    records ||--o{ embeddings : "record_id"
-    embedding_spaces ||--o{ embeddings : "space_id"
+    records ||--o{ embeddings : "record_id（外挂库 vectors.sqlite3，无跨库外键）"
+    embedding_spaces ||--o{ embeddings : "space_id（外挂库 vectors.sqlite3，无跨库外键）"
 
     strings {
         INTEGER id PK
@@ -162,9 +162,15 @@ erDiagram
         INTEGER dimension
         INTEGER text_version
     }
+    %% embeddings 在 vectors.sqlite3，不在本库；此处仅示意它与主表的关系
     embeddings {
-        TEXT space_id FK
-        INTEGER record_id FK
+        TEXT space_id
+        INTEGER record_id
+        TEXT namespace
+        TEXT scope
+        INTEGER kind
+        TEXT tags_json
+        INTEGER note_id
         TEXT fingerprint
         BLOB vector
     }
@@ -177,8 +183,8 @@ erDiagram
 - 各领域投影表（`entities`/`relations`/`notes`/`chunks` 等）的 `record_id` 直接复用 `records.id`，靠外键与级联删除维持一致性。
 - 笔记的路径与文件名都在 `notes` 表存一次；领域必须登记过根目录（`namespace_roots`）才允许写入，路径存的是减掉根目录的相对路径，文件名是写入时用 `file_stem` 取下的 `name` 列。路径拆成目录段与文件名后分别落在索引的 `path` 列与 `name` 列上，只挂在这一篇第一片；目录段不参与常规匹配，只在「书名块不够」的兜底查询里被查。切片还带一条 `note` 列（所属笔记 id），用来按笔记精确统计「这一篇有多少片段命中」，检索时同一篇只保留排名最高的一片。路径段仍写在每一条切片记录上供筛选。
 - `chunks.fingerprint` 保留「内容未变则复用向量」的语义：`ordinal` 与内容都没变的切片复用原 `record_id`，向量继续有效。记录指纹按「正文 + 标签」算，标签换了（例如刚登记根目录拆出路径段）指纹就换，旧向量作废。
-- `embedding_spaces` 的 `id` 是文本（模型标识），`embeddings` 是「空间 × 记录」的复合主键。
-- `index_updates`、`import_runs`、`meta` 是辅助表：索引重放日志、导入批次指纹、修订号计数器。
+- `embedding_spaces` 的 `id` 是文本（模型标识），留在主库；`embeddings` 是「空间 × 记录」的复合主键，连同 `namespace`/`scope`/`kind`/`tags_json`/`note_id` 一起住在 `vectors.sqlite3`，加载分区时纯读该库、不回主库。
+- `index_updates`、`import_runs`、`meta` 是辅助表：索引重放日志、导入批次指纹、修订号计数器。`vector_meta` 在向量库，存就绪标记。
 
 ## 4. 一次写入的时序
 
@@ -206,5 +212,5 @@ sequenceDiagram
 ```
 
 - 数据提交与索引更新分开：写入只登记待办（`index_updates`）并在同一个调用里把文档写进索引 writer，不 commit；索引由使用方在合适时机调用 `update_index()` 一趟提交、只提交一次。读取若发现待办会尽力自愈（抢不到写锁就跳过，绝不排队），所以写入后照样能查到，只是索引可能滞后到那一刻。
-- **写入一行向量都不产生、一次模型都不调**。向量化是独立的一步：批次结束后由调用方调 `sync` 补齐，库内线程兜底，且线程是纯事件触发（开库、注册或切换模型、改档位、写入提交后各叫一次），不轮询、不设定时。库内线程只写 `embeddings` 表，不写业务记录、不改索引。
+- **写入一行向量都不产生、一次模型都不调**。向量化是独立的一步：批次结束后由调用方调 `sync` 补齐，库内线程兜底，且线程是纯事件触发（开库、注册或切换模型、改档位、写入提交后各叫一次），不轮询、不设定时。库内线程只写 `vectors.sqlite3` 的 `embeddings` 表，不写业务记录、不改索引、不碰主库写锁。
 - 正文只读一次、只切一次：写入时就地切好，随文档一路带到索引；索引阶段不再回读源文件。唯一需要回源的是重建（格式升级、索引损坏、上次写入未收尾）与向量化取切片正文——后者的正文只存在索引里，所以补齐前先把索引追平。

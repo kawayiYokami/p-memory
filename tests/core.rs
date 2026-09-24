@@ -257,6 +257,8 @@ fn namespace_switch_disables_vectorization_and_degrades() {
     kb.embeddings().set_namespace_vectorization("other", false).unwrap();
     let mut muted = memory("被关闭向量化的内容", "public"); muted.record.namespace = "other".into();
     kb.memories().upsert(muted).unwrap();
+    // 索引提交由使用方择时做：这里显式追平，不依赖读者自愈撞上写锁空窗的时机。
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "被关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
         embed_space: Some("v".into()), ..Default::default() };
     let result = kb.search(&request).unwrap();
@@ -408,6 +410,31 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     let hits = kb.search(&wide).unwrap().hits;
     assert_eq!(hits[0].key.id, second);
     assert!(hits.iter().all(|hit| hit.key.id != first), "旧切片的向量没有留下");
+}
+
+/// 删空间要连向量库一起清：定义在主库，向量与就绪标记在外挂库，跨库没有外键级联。
+#[test]
+fn deleting_a_space_removes_its_vectors_and_readiness() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    kb.memories().upsert(memory("会被忘掉的一条", "public")).unwrap();
+    fill(&kb, "v");
+    assert!(kb.embeddings().vector_ready("default", "v", "memory").unwrap());
+    // 向量真的写进了外挂库。
+    let vconn = rusqlite::Connection::open(dir.path().join("vectors.sqlite3")).unwrap();
+    let before: i64 = vconn.query_row("SELECT COUNT(*) FROM embeddings WHERE space_id='v'", [], |r| r.get(0)).unwrap();
+    assert!(before > 0, "补齐后向量库里该空间该有向量");
+
+    kb.embeddings().delete_space("v").unwrap();
+
+    let after: i64 = vconn.query_row("SELECT COUNT(*) FROM embeddings WHERE space_id='v'", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, 0, "删空间后向量库里不该留孤儿向量");
+    let marks: i64 = vconn.query_row("SELECT COUNT(*) FROM vector_meta WHERE key GLOB 'vector_ready:*:v:*'", [], |r| r.get(0)).unwrap();
+    assert_eq!(marks, 0, "删空间后就绪标记也该清掉");
+    // 主库定义也没了。
+    assert!(kb.embeddings().spaces().unwrap().iter().all(|s| s.id != "v"), "主库定义已删");
+    // 同名空间重新注册后从头就绪。
+    space(&kb, "v", 4);
+    assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap(), "重注册后要重新补齐才算就绪");
 }
 
 #[test]

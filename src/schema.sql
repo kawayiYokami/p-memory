@@ -114,15 +114,8 @@ CREATE TABLE embedding_spaces (
     id TEXT PRIMARY KEY, model TEXT NOT NULL, dimension INTEGER NOT NULL, text_version INTEGER NOT NULL,
     encoding TEXT NOT NULL DEFAULT 'sq8'
 );
-CREATE TABLE embeddings (
-    space_id TEXT NOT NULL REFERENCES embedding_spaces(id) ON DELETE CASCADE,
-    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
-    fingerprint TEXT NOT NULL, vector BLOB NOT NULL,
-    PRIMARY KEY(space_id, record_id)
-);
--- 删除 records 父行时 SQLite 按 record_id 级联子表；主键的前导列是 space_id，
--- 单靠主键只能全表扫描。批量删除会把这个扫描乘以条数，所以单独为 record_id 建索引。
-CREATE INDEX embeddings_by_record ON embeddings(record_id);
+-- 向量住进独立库 vectors.sqlite3，与 Tantivy 同级：派生索引、自包含路由、单向消费、零反写主库。
+-- 主库只留 embedding_spaces（空间定义），向量行本身在外挂库。
 CREATE TABLE index_updates (
     revision INTEGER PRIMARY KEY, record_id INTEGER NOT NULL
 );

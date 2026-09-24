@@ -19,10 +19,12 @@ pub struct EmbeddingSpace {
 }
 /// 待嵌入文本，只在库内部流转（`sync` 三段式循环的中间产物）。
 #[derive(Debug, Clone)]
-pub(crate) struct EmbeddingInput { pub key: RecordKey, pub text: String, pub fingerprint: String }
+pub(crate) struct EmbeddingInput { pub key: RecordKey, pub text: String, pub fingerprint: String,
+    pub namespace: String, pub scope: String, pub kind: RecordKind, pub tags: Vec<String>, pub note_id: i64 }
 /// 一批算好的向量，只由库自己产出并写回。
 #[derive(Debug, Clone)]
-pub(crate) struct EmbeddingWrite { pub key: RecordKey, pub fingerprint: String, pub values: Vec<f32> }
+pub(crate) struct EmbeddingWrite { pub key: RecordKey, pub fingerprint: String, pub values: Vec<f32>,
+    pub namespace: String, pub scope: String, pub kind: RecordKind, pub tags: Vec<String>, pub note_id: i64 }
 
 #[derive(Clone)]
 pub struct EmbeddingStore(pub(crate) KnowledgeBase);
@@ -352,7 +354,8 @@ fn target_enabled_sql(target: VectorizeTarget) -> String {
 /// 正文取不到的（切片文档还没进索引）在这里就是空串，由使用方决定要不要跳过。
 pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIndex, space_id: &str, namespace: Option<&str>,
     target: Option<VectorizeTarget>, limit: usize, after: Option<i64>, ids: Option<&[i64]>) -> Result<Vec<EmbeddingInput>> {
-    let mut sql = String::from("SELECT r.id,r.kind,r.payload_json,r.fingerprint FROM records r JOIN strings n ON n.id=r.namespace_id WHERE 1=1");
+    let mut sql = String::from("SELECT r.id,r.kind,r.payload_json,r.fingerprint,n.text,s.text FROM records r \
+        JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE 1=1");
     let mut values: Vec<SqlValue> = Vec::new();
     if let Some(namespace) = namespace {
         sql.push_str(" AND n.text=?");
@@ -360,7 +363,7 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
     }
     sql.push_str(&format!(" AND ({})", match target { Some(target) => target_enabled_sql(target), None => enabled_kinds_sql() }));
     sql.push_str(" AND COALESCE((SELECT value FROM meta WHERE key='vectorize:'||n.text),1)=1");
-    sql.push_str(" AND NOT EXISTS(SELECT 1 FROM embeddings e WHERE e.space_id=? AND e.record_id=r.id AND e.fingerprint=r.fingerprint)");
+    sql.push_str(&format!(" AND NOT EXISTS(SELECT 1 FROM vectors.embeddings e WHERE e.space_id=? AND e.record_id=r.id AND e.fingerprint=r.fingerprint)"));
     values.push(SqlValue::Text(space_id.into()));
     if let Some(ids) = ids {
         if ids.is_empty() { return Ok(Vec::new()); }
@@ -375,14 +378,14 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
     values.push(SqlValue::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
-    let mut candidates: Vec<(i64, i64, String, String)> = Vec::new();
-    for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
+    let mut candidates: Vec<(i64, i64, String, String, String, String)> = Vec::new();
+    for row in stmt.query_map(params_from_iter(values), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))? {
         candidates.push(row?);
     }
     // 切片正文唯一的副本在索引里，按记录 ID 取回；其余记录的正文由 payload 现算，不碰文件。
-    let chunk_ids: Vec<i64> = candidates.iter().filter(|(_, kind, _, _)| *kind == RecordKind::Chunk.code()).map(|(id, _, _, _)| *id).collect();
+    let chunk_ids: Vec<i64> = candidates.iter().filter(|(_, kind, _, _, _, _)| *kind == RecordKind::Chunk.code()).map(|(id, _, _, _, _, _)| *id).collect();
     let bodies = if chunk_ids.is_empty() { BTreeMap::new() } else { index.bodies(&chunk_ids)? };
-    for (id, kind_code, payload_json, fingerprint) in candidates {
+    for (id, kind_code, payload_json, fingerprint, namespace, scope) in candidates {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: Option<serde_json::Value> = serde_json::from_str(&payload_json).ok();
         let body = match kind {
@@ -394,13 +397,17 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
             (RecordKind::Entity, Some(payload)) => payload.get("name").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
             _ => String::new(),
         };
+        let tags = record_tags(conn, id)?;
         // 记忆是短句，标签是它的另一半特征，两者一起送进向量；其余记录用正文，实体的规范名补在正文前。
-        let text = match (kind, record_tags(conn, id)?) {
+        let text = match (kind, &tags) {
             (RecordKind::Memory, tags) if !tags.is_empty() => format!("{body}\n{}", tags.join(" ")),
             (RecordKind::Entity, _) if !name.is_empty() => format!("{name}\n{body}"),
             _ => body,
         };
-        items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint });
+        let note_id = if kind == RecordKind::Chunk {
+            conn.query_row("SELECT note_id FROM chunks WHERE record_id=?1", [id], |r| r.get(0)).optional()?.unwrap_or(0)
+        } else { 0 };
+        items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint, namespace, scope, kind, tags, note_id });
     }
     Ok(items)
 }
@@ -433,26 +440,34 @@ fn vector_ready_key(namespace: &str, space_id: &str, target: VectorizeTarget) ->
 }
 
 /// 某领域的某一档在该空间下是否已补齐。读不到标记就是没就绪。
+/// 就绪标记住在向量库的 `vector_meta`，与向量行同库。
 pub(crate) fn vector_ready(conn: &Connection, namespace: &str, space_id: &str, target: VectorizeTarget) -> Result<bool> {
-    let value: Option<i64> = conn.query_row("SELECT value FROM meta WHERE key=?1", [vector_ready_key(namespace, space_id, target)], |r| r.get(0)).optional()?;
-    Ok(value == Some(1))
+    let key = vector_ready_key(namespace, space_id, target);
+    let value: Option<String> = conn.query_row("SELECT value FROM vectors.vector_meta WHERE key=?1",
+        [&key], |r| r.get(0)).optional()?;
+    Ok(value.as_deref() == Some("1"))
 }
 
-/// 记下或撤掉某领域某一档在该空间上的就绪标记。
+/// 记下或撤掉某领域某一档在该空间上的就绪标记，写进向量库自己的 meta。
 fn set_vector_ready(conn: &Connection, namespace: &str, space_id: &str, target: VectorizeTarget, ready: bool) -> Result<()> {
+    let key = vector_ready_key(namespace, space_id, target);
     if ready {
-        conn.execute("INSERT INTO meta(key,value) VALUES (?1,1) ON CONFLICT(key) DO UPDATE SET value=1", [vector_ready_key(namespace, space_id, target)])?;
+        conn.execute("INSERT INTO vector_meta(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+            [&key])?;
     } else {
-        conn.execute("DELETE FROM meta WHERE key=?1", [vector_ready_key(namespace, space_id, target)])?;
+        conn.execute("DELETE FROM vector_meta WHERE key=?1", [&key])?;
     }
     Ok(())
 }
 
 /// 作废某领域的全部就绪标记。记录或档位一变，「应向量化集合」就变了，
 /// 必须等补齐核对过再重新标；按前缀精确比对，不依赖 LIKE 的转义规则。
+/// 标记在向量库自己的 meta 里，撤它不动主库。
+/// `conn` 是向量外挂库的写连接。
 pub(crate) fn clear_vector_ready(conn: &Connection, namespace: &str) -> Result<()> {
     let prefix = format!("vector_ready:{}:", text::normalized_tag(namespace));
-    conn.execute("DELETE FROM meta WHERE substr(key,1,?1)=?2", params![prefix.chars().count() as i64, prefix])?;
+    conn.execute("DELETE FROM vector_meta WHERE substr(key,1,?1)=?2",
+        params![prefix.chars().count() as i64, prefix])?;
     Ok(())
 }
 
@@ -561,10 +576,15 @@ impl EmbeddingStore {
         let receipt = self.0.mutate_meta(|tx| {
             tx.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![vectorize_key(namespace), i64::from(enabled)])?;
-            // 总闸一变，「应向量化集合」就变了：已记的就绪状态当场作废。
-            clear_vector_ready(tx, namespace)?;
             Ok(enabled)
         })?;
+        // 总闸一变，「应向量化集合」就变了：已记的就绪状态当场作废。
+        {
+            let mut guard = self.0.engine.vector_writer.lock();
+            if let Some(writer) = guard.as_mut() {
+                clear_vector_ready(&writer.conn, namespace)?;
+            }
+        }
         // 总闸开了就多了一批该补的：叫线程去补。
         if let Some(vectorizer) = self.0.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(receipt)
@@ -586,10 +606,15 @@ impl EmbeddingStore {
         let receipt = self.0.mutate_meta(|tx| {
             tx.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![target_vectorize_key(namespace, target), i64::from(enabled)])?;
-            // 档位一变，「应向量化集合」就变了：已记的就绪状态当场作废。
-            clear_vector_ready(tx, namespace)?;
             Ok(enabled)
         })?;
+        // 档位一变，「应向量化集合」就变了：已记的就绪状态当场作废。
+        {
+            let mut guard = self.0.engine.vector_writer.lock();
+            if let Some(writer) = guard.as_mut() {
+                clear_vector_ready(&writer.conn, namespace)?;
+            }
+        }
         // 开了档就多了一批该补的：叫线程去补，别等谁再想起来。
         if let Some(vectorizer) = self.0.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(receipt)
@@ -625,12 +650,8 @@ impl EmbeddingStore {
     /// 一次补齐：追平索引 → 补缺口 → 核对并标记就绪。
     /// `blocking` 为假时拿不到回调就跳过，后台线程不与调用方抢模型。
     fn fill(&self, space_id: &str, batch: usize, blocking: bool) -> Result<SyncReport> {
-        // 后台补齐期间举牌子：读路径据此知道「待办马上就有人提交」，愿意稍等。
-        // 调用方自己调 sync 时不必举——那是它自己的线程，它自己决定要不要等。
-        let _filling = if blocking { None } else { self.0.engine.vectorizer.get().map(|vectorizer| vectorizer.begin_fill()) };
         let Some(entry) = self.0.engine.embedders.get(space_id) else { return Ok(SyncReport::default()) };
-        // 切片正文只存在索引里：先追平索引，正文才取得到。
-        self.0.catch_up_index()?;
+        self.0.catch_up_index(blocking)?;
         let report = self.drain(space_id, &entry, batch, blocking)?;
         if report.interrupted.is_some() { self.0.note_degrade(Degrade::EmbedFailed); }
         self.verify_and_mark(space_id)?;
@@ -644,37 +665,43 @@ impl EmbeddingStore {
     /// 刚写完的记录于是短暂查不到。核对期间有人写过就重来（最多几次）；
     /// 一直有人在写就不标：宁可停在未就绪，也不给「补了半个领域」的假象。
     fn verify_and_mark(&self, space_id: &str) -> Result<()> {
-        for _ in 0..VERIFY_ATTEMPTS {
+        for _attempt in 0..VERIFY_ATTEMPTS {
             let (revision, marks) = {
                 let state = self.0.read()?;
                 let index = self.0.index()?;
                 let conn = state.conn();
-                // 索引没追平就不断言：切片正文只存在索引里，追不平就会把它当成空正文。
                 let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
                 if pending > 0 { return Ok(()); }
                 let revision = storage::current_revision(conn)?;
                 let mut marks = Vec::new();
                 for namespace in storage::record_namespaces(conn)? {
                     for target in VectorizeTarget::ALL {
-                        // 关掉的档不生成向量，也就无所谓就绪；标记清掉，开着的时候要重新补齐。
                         let enabled = target_vectorization(conn, &namespace, target)?;
-                        let ready = enabled && !has_gap(conn, &index, space_id, &namespace, target)?;
+                        let gap = has_gap(conn, &index, space_id, &namespace, target)?;
+                        let ready = enabled && !gap;
                         marks.push((namespace.clone(), target, ready));
                     }
                 }
                 (revision, marks)
             };
-            // 核对期间有人写过：这份结论已经过期，重来。
-            let settled = { let state = self.0.read()?; storage::current_revision(state.conn())? == revision };
-            if !settled { continue; }
-            self.0.mutate_meta(|tx| {
-                // 落标记前再看一眼待办：读到有，说明刚才的核对已经被后来的一次写入推翻。
-                let pending: i64 = tx.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-                if pending > 0 { return Ok(()); }
-                for (namespace, target, ready) in &marks { set_vector_ready(tx, namespace, space_id, *target, *ready)?; }
-                Ok(())
-            })?;
-            return Ok(());
+            {
+                let mut guard = self.0.engine.vector_writer.lock();
+                let writer = guard.as_mut().ok_or(Error::Closed)?;
+                let (current_rev, pending) = {
+                    let state = self.0.read()?;
+                    let conn = state.conn();
+                    let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
+                    let current_rev = storage::current_revision(conn)?;
+                    (current_rev, pending)
+                };
+                if pending > 0 || current_rev != revision {
+                    continue;
+                }
+                for (namespace, target, ready) in &marks {
+                    set_vector_ready(&writer.conn, namespace, space_id, *target, *ready)?;
+                }
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -683,8 +710,7 @@ impl EmbeddingStore {
     fn drain(&self, space_id: &str, entry: &Arc<Mutex<EmbedderEntry>>, batch: usize, blocking: bool) -> Result<SyncReport> {
         let mut report = SyncReport::default();
         let acquired = if blocking { Some(entry.lock()) } else { entry.try_lock() };
-        // 调用方正在补齐就用同一把锁排队，后台补决不为此排队：拿不到就等下一轮。
-        let Some(mut guard) = acquired else { return Ok(report) };
+        let Some(mut guard) = acquired else { return Ok(report); };
         let mut cursor: Option<i64> = None;
         loop {
             let limit = batch.min(guard.effective_batch).max(1);
@@ -693,15 +719,12 @@ impl EmbeddingStore {
                 let index = self.0.index()?;
                 pending_candidates(state.conn(), &index, space_id, None, None, limit, cursor, None)?
             };
-            // 游标按原始候选推进：正文取不到的（切片文档还没进索引）与正文为空的一律跳过，
-            // 但它们不该把游标卡住，否则同一批会被反复取回来。
             let Some(last) = candidates.last().map(|input| input.key.id) else { break };
             let pending: Vec<EmbeddingInput> = candidates.into_iter().filter(embeddable).collect();
             if pending.is_empty() { cursor = Some(last); continue; }
             report.scanned += pending.len();
             let texts: Vec<String> = pending.iter().map(|input| input.text.clone()).collect();
             let values = match embed_with_retry(&mut guard, &texts) {
-                // 批次过大：减半后重跑同一段，游标不动，因此不会漏掉记录。
                 EmbedOutcome::Shrunk => continue,
                 EmbedOutcome::Failed(message) => { report.interrupted = Some(message); break; }
                 EmbedOutcome::Vectors(values) => values,
@@ -711,10 +734,11 @@ impl EmbeddingStore {
                 break;
             }
             let writes: Vec<EmbeddingWrite> = pending.iter().zip(values).map(|(input, vector)|
-                EmbeddingWrite { key: input.key, fingerprint: input.fingerprint.clone(), values: vector }).collect();
+                EmbeddingWrite { key: input.key, fingerprint: input.fingerprint.clone(), values: vector,
+                    namespace: input.namespace.clone(), scope: input.scope.clone(), kind: input.kind,
+                    tags: input.tags.clone(), note_id: input.note_id }).collect();
             match self.put(space_id, &writes) {
                 Ok(receipt) => { report.written += receipt.value; report.batches += 1; }
-                // 回调期间记录被改写：本批作废，它会以新指纹在下一轮重新出现。
                 Err(Error::StaleRevision(_)) => {}
                 Err(error) => return Err(error),
             }
@@ -723,28 +747,60 @@ impl EmbeddingStore {
         Ok(report)
     }
 
-    /// Atomic batch: no vectors are written if any input is invalid or stale.
+    /// 一批向量落进外挂库：指纹在主库读连接上核，写入只走向量库自己的写连接。
+    /// 回调期间主库里的记录被改写过就整批作废——它会在下一轮以新指纹重新出现。
     pub(crate) fn put(&self, space_id: &str, writes: &[EmbeddingWrite]) -> Result<WriteReceipt<usize>> {
-        self.0.mutate(|tx| {
-            let space = get_space(tx, space_id)?;
+        let space = { let state = self.0.read()?; get_space(state.conn(), space_id)? };
+        // 指纹核对在主库读连接上做：不拿主库写锁，也不为核对去写主库。
+        {
+            let state = self.0.read()?;
             for write in writes {
-                let actual: Option<String> = tx.query_row("SELECT fingerprint FROM records WHERE id=?1", [write.key.id], |r| r.get(0)).optional()?;
+                let actual: Option<String> = state.conn().query_row("SELECT fingerprint FROM records WHERE id=?1", [write.key.id], |r| r.get(0)).optional()?;
                 let actual = actual.ok_or_else(|| Error::NotFound(write.key.id.to_string()))?;
                 if actual != write.fingerprint { return Err(Error::StaleRevision(write.key.id.to_string())); }
-                let normalized = normalize(&write.values, space.dimension)?;
-                let bytes = encode_values(&normalized, &space.encoding)?;
-                tx.execute("INSERT INTO embeddings(space_id,record_id,fingerprint,vector) VALUES (?1,?2,?3,?4)
-                    ON CONFLICT(space_id,record_id) DO UPDATE SET fingerprint=excluded.fingerprint,vector=excluded.vector",
-                    params![space_id, write.key.id, write.fingerprint, bytes])?;
             }
-            // 向量一落盘，这些记录所属领域的向量分区就变了。
-            for write in writes { storage::touch_record_namespace(tx, write.key.id)?; }
-            Ok(writes.len())
-        })
+        }
+        let mut guard = self.0.engine.vector_writer.lock();
+        let writer = guard.as_mut().ok_or(Error::Closed)?;
+        let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for write in writes {
+            let normalized = normalize(&write.values, space.dimension)?;
+            let bytes = encode_values(&normalized, &space.encoding)?;
+            tx.execute("INSERT INTO embeddings(space_id,record_id,namespace,scope,kind,tags_json,note_id,fingerprint,vector)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                ON CONFLICT(space_id,record_id) DO UPDATE SET
+                namespace=excluded.namespace,scope=excluded.scope,kind=excluded.kind,
+                tags_json=excluded.tags_json,note_id=excluded.note_id,
+                fingerprint=excluded.fingerprint,vector=excluded.vector",
+                params![space_id, write.key.id, write.namespace, write.scope, write.kind.code(),
+                    serde_json::to_string(&write.tags)?, write.note_id, write.fingerprint, bytes])?;
+        }
+        tx.commit()?;
+        // 向量一落盘，这些记录所属领域的向量分区就变了。
+        let touched: std::collections::HashSet<String> = writes.iter().map(|w| w.namespace.clone()).collect();
+        self.0.engine.vectors.invalidate_namespaces(&touched);
+        Ok(WriteReceipt { value: writes.len(), revision: 0 })
     }
 
+    /// 删掉一个向量空间：定义在主库，向量与就绪标记在外挂库，两边一起清。
+    /// 外挂库没有跨库外键，主库删行不会级联，这里显式补两条删除。
     pub fn delete_space(&self, id: &str) -> Result<WriteReceipt<bool>> {
-        self.0.mutate_meta(|tx| Ok(tx.execute("DELETE FROM embedding_spaces WHERE id=?1", [id])? > 0))
+        let receipt = self.0.mutate_meta(|tx| {
+            let deleted = tx.execute("DELETE FROM embedding_spaces WHERE id=?1", [id])? > 0;
+            Ok(deleted)
+        })?;
+        if receipt.value {
+            let mut guard = self.0.engine.vector_writer.lock();
+            if let Some(writer) = guard.as_mut() {
+                writer.conn.execute("DELETE FROM embeddings WHERE space_id=?1", [id])?;
+                // 就绪键形如 vector_ready:<领域>:<空间>:<档位>。空间 id 是第二段：
+                // 找到第一个冒号之后、到第二个冒号之间的子串，精确比对。
+                writer.conn.execute("DELETE FROM vector_meta WHERE key GLOB 'vector_ready:*:'||?1||':*'", [id])?;
+            }
+        }
+        // 该空间所有分区条目一并作废：它们指向的向量行已经没了。
+        self.0.engine.vectors.invalidate();
+        Ok(receipt)
     }
 }
 
@@ -782,17 +838,7 @@ pub(crate) struct Vectorizer {
     /// 有活待补的记号。置位与唤醒必须在同一把锁里做：线程是「持锁看记号、再睡」的，
     /// 只在锁外置位会落进这两步之间，信号丢了线程就一直睡到下一次唤醒。
     pending: AtomicBool,
-    /// 后台正在补齐。读路径据此决定要不要为「索引待办」稍等：等的是这一次补齐，
-    /// 它会把待办提交掉；别的写者占着写锁时读路径一律不等。
-    filling: AtomicBool,
     handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-/// 补齐期间举着的牌子：线程一动手就立起来，补齐结束（含出错与提前返回）自动放下。
-pub(crate) struct FillGuard(Arc<Vectorizer>);
-
-impl Drop for FillGuard {
-    fn drop(&mut self) { self.0.filling.store(false, AtomicOrdering::SeqCst); }
 }
 
 impl Vectorizer {
@@ -800,7 +846,7 @@ impl Vectorizer {
     /// 线程只持弱引用：库被丢掉时它自己收尾，不会被这条线程吊住不放。
     pub(crate) fn start(engine: &Arc<crate::storage::Engine>) -> Result<Arc<Self>> {
         let vectorizer = Arc::new(Self { stopping: Mutex::new(false), signal: Condvar::new(),
-            pending: AtomicBool::new(true), filling: AtomicBool::new(false), handle: Mutex::new(None) });
+            pending: AtomicBool::new(true), handle: Mutex::new(None) });
         let worker = Arc::clone(&vectorizer);
         let engine = Arc::downgrade(engine);
         let handle = std::thread::Builder::new().name("p-memory-vectorize".into())
@@ -808,15 +854,6 @@ impl Vectorizer {
         *vectorizer.handle.lock() = Some(handle);
         Ok(vectorizer)
     }
-
-    /// 后台线程开始补齐，举起牌子。
-    fn begin_fill(self: &Arc<Self>) -> FillGuard {
-        self.filling.store(true, AtomicOrdering::SeqCst);
-        FillGuard(Arc::clone(self))
-    }
-
-    /// 后台线程是否正在补齐。读路径只在这时候才为索引待办稍等。
-    pub(crate) fn is_filling(&self) -> bool { self.filling.load(AtomicOrdering::SeqCst) }
 
     /// 叫一次：有活要补。写入提交、注册模型、改档位都会说一声。
     /// 只置记号并唤醒，不阻塞调用方，也不叫模型。
@@ -868,7 +905,7 @@ fn work_loop(engine: &Weak<crate::storage::Engine>, vectorizer: &Vectorizer) {
 }
 
 /// 一行常驻向量的元信息。`note` 是它所属笔记的记录 id，只有 chunk 有归属，其余为 0。
-struct VectorRow { key: RecordKey, kind: RecordKind, tags: Vec<String>, note: i64 }
+struct VectorRow { key: RecordKey, kind: RecordKind, tags: Vec<String>, note: i64, #[allow(dead_code)] fingerprint: String }
 /// 分区内的向量以**存储形态**常驻：sq8 空间保留原始 i8 码与逐条 scale，
 /// 不再展开成 f32，因此常驻内存与磁盘体积同量级（1024 维约 1KB/条，而非 4KB/条）。
 enum PartitionData {
@@ -897,12 +934,10 @@ impl Partition {
         // 行只按序号取自己那段向量），而排序会让 SQLite 把整行搬进临时 B 树再读回来——
         // 一万行 1KB 的向量就是几十 MB 白走两遍。索引本身按 (space_id, record_id) 走，
         // 行序天然是 id 升序。
-        let mut stmt = conn.prepare("SELECT r.id,r.kind,e.vector,
-            (SELECT json_group_array(t.text) FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=r.id),
-            COALESCE((SELECT c.note_id FROM chunks c WHERE c.record_id=r.id),0)
-            FROM embeddings e JOIN records r ON r.id=e.record_id AND r.fingerprint=e.fingerprint
-            WHERE e.space_id=?1 AND r.namespace_id=(SELECT id FROM strings WHERE text=?2)
-              AND r.scope_id=(SELECT id FROM strings WHERE text=?3)")?;
+        // 向量外挂库自包含路由：namespace/scope/kind/tags/note_id 全在向量行里，
+        // 加载分区纯读 vectors.sqlite3，不回主库 join。
+        let mut stmt = conn.prepare("SELECT record_id,kind,vector,tags_json,note_id,fingerprint
+            FROM embeddings WHERE space_id=?1 AND namespace=?2 AND scope=?3")?;
         let sq8 = space.encoding == "sq8";
         let mut partition = Self {
             dimension: space.dimension,
@@ -916,6 +951,8 @@ impl Partition {
             let bytes: Vec<u8> = row.get(2)?;
             let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(3)?)?;
             let note: i64 = row.get(4)?;
+            // 指纹带上，检索时跟主库核对，主库改了这条就作废。
+            let fingerprint: String = row.get(5)?;
             match &mut partition.data {
                 PartitionData::F32(values) => {
                     let decoded = decode_values(&bytes, space.dimension, "f32")?;
@@ -929,7 +966,7 @@ impl Partition {
                     codes.extend(decoded);
                 }
             }
-            partition.rows.push(VectorRow { key, kind, tags, note });
+            partition.rows.push(VectorRow { key, kind, tags, note, fingerprint });
         }
         Ok(if partition.rows.is_empty() { None } else { Some(partition) })
     }
@@ -1008,7 +1045,7 @@ mod tests {
         // 四行向量都与查询同向：分数并列，只能按 key 决出名次。
         let build = |order: &[i64]| Partition {
             dimension,
-            rows: order.iter().map(|id| VectorRow { key: RecordKey { id: *id }, kind: RecordKind::Memory, tags: vec![], note: 0 }).collect(),
+            rows: order.iter().map(|id| VectorRow { key: RecordKey { id: *id }, kind: RecordKind::Memory, tags: vec![], note: 0, fingerprint: String::new() }).collect(),
             data: PartitionData::F32(order.iter().flat_map(|_| [1.0f32, 0.0, 0.0, 0.0]).collect()),
         };
         let top_two = |partition: &Partition| -> Vec<i64> {
@@ -1080,4 +1117,51 @@ mod tests {
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3, "限流应当退避重试后成功");
         assert_eq!(throttled.effective_batch, 4, "限流不触发减半");
     }
+}
+
+/// 把主库 `embeddings` 整表搬进外挂库 `vectors.sqlite3`，搬完删掉主库那张表。
+/// 路由字段（namespace/scope/kind/tags/note_id）从主库现算补齐；就绪标记从主库 meta 搬过来。
+/// 幂等：外挂库已建好且主库已无该表时直接返回。
+pub(crate) fn migrate_vectors(root: &std::path::Path, main_conn: &mut Connection) -> Result<()> {
+    let path = root.join("vectors.sqlite3");
+    // 外挂库先建好，再把旧表按批搬过去；搬完主库删表，就绪标记一起带走。
+    let mut vector_conn = open_vector_writer_for_migration(&path)?;
+    vector_conn.execute_batch(include_str!("vectors_schema.sql"))?;
+    // 主库侧把 embeddings 读到内存，再按行写进外挂库——外挂库刚建好时是空的，
+    // 逐行 INSERT 比重写 ATTACH 更直白，行数也不会大到撑不住。
+    let mut stmt = main_conn.prepare("SELECT space_id,record_id,fingerprint,vector FROM embeddings")?;
+    let rows: Vec<(String, i64, String, Vec<u8>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    // 逐行从主库取路由字段，写进外挂库。
+    let tx = vector_conn.transaction()?;
+    for (space_id, record_id, fingerprint, vector) in rows {
+        let (namespace, scope, kind, tags_json, note_id): (String, String, i64, String, i64) = main_conn.query_row(
+            "SELECT n.text,s.text,r.kind,
+                COALESCE((SELECT json_group_array(t.text) FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=r.id),'[]'),
+                COALESCE((SELECT c.note_id FROM chunks c WHERE c.record_id=r.id),0)
+             FROM records r JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id=?1",
+            [record_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        tx.execute("INSERT OR REPLACE INTO embeddings(space_id,record_id,namespace,scope,kind,tags_json,note_id,fingerprint,vector)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![space_id, record_id, namespace, scope, kind, tags_json, note_id, fingerprint, vector])?;
+    }
+    // 就绪标记一起搬走：主库 meta 里的 vector_ready:* 挪进 vector_meta。
+    let mut ready_stmt = main_conn.prepare("SELECT key,value FROM meta WHERE key LIKE 'vector_ready:%'")?;
+    let ready_rows: Vec<(String, i64)> = ready_stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+    drop(ready_stmt);
+    for (key, value) in ready_rows {
+        tx.execute("INSERT OR REPLACE INTO vector_meta(key,value) VALUES (?1,?2)", params![key, value.to_string()])?;
+    }
+    tx.commit()?;
+    // 搬完才删主库表与旧标记。
+    main_conn.execute_batch("DROP TABLE embeddings; DELETE FROM meta WHERE key LIKE 'vector_ready:%';")?;
+    Ok(())
+}
+
+/// 迁移期间向量库的写连接：不开 WAL（文件刚建，还没进 WAL 目录），直接建表写。
+fn open_vector_writer_for_migration(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;")?;
+    Ok(conn)
 }

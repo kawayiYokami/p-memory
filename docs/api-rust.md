@@ -51,8 +51,8 @@ impl KnowledgeBase {
 
 ### 备份与恢复
 
-- `backup(target)`：SQLite 在线备份，包含向量。目标文件已存在时拒绝覆盖（先 `create_new` 占位）。
-- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；全文索引从数据重建。目标目录已存在会失败。
+- `backup(target)`：SQLite 在线备份，主库与向量库分别备份为 `target` 与 `target.vectors`。目标文件已存在时拒绝覆盖（先 `create_new` 占位）。
+- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；同目录存在 `snapshot.vectors` 时一并还原向量库，否则向量路降级待补齐。全文索引从数据重建。目标目录已存在会失败。
 
 ### 健康检查
 

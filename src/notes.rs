@@ -182,7 +182,7 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
                 let fingerprint = storage::record_fingerprint(&chunk.content, &header.tags);
                 conn.execute("UPDATE records SET fingerprint=?2,updated_at_us=MAX(updated_at_us,?3) WHERE id=?1",
                     params![id, fingerprint, header.updated_at_us])?;
-                conn.execute("DELETE FROM embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
+                conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
                 // 标签与指纹都动过，这个领域的向量分区跟着变。
                 storage::touch_namespace(&header.namespace);
                 let (name, path, exclude) = storage::index_columns(conn, RecordKind::Chunk, &payload);
