@@ -379,27 +379,45 @@ fn decode_all<T: DeserializeOwned>(values: &BTreeMap<i64, Value>, ids: &[i64]) -
 /// 以这批实体为端点的关系 id（它是主语或宾语都算）。
 fn incident_relations(conn: &Connection, entity_ids: &[i64], filter: &ReadFilter) -> Result<Vec<i64>> {
     let (condition, values) = storage::filter_sql(filter, &[RecordKind::Relation], false)?;
-    let placeholders = vec!["?"; entity_ids.len()].join(",");
-    let sql = format!("SELECT rl.record_id FROM relations rl JOIN records r ON r.id=rl.record_id \
-        WHERE (rl.subject_id IN ({placeholders}) OR rl.object_id IN ({placeholders})) AND {condition} ORDER BY rl.record_id");
-    let params: Vec<SqlValue> = entity_ids.iter().map(|id| SqlValue::Integer(*id))
-        .chain(entity_ids.iter().map(|id| SqlValue::Integer(*id))).chain(values).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    // 分片查：端点数超过 SQLite 单条语句的参数上限时会撞 `too many SQL variables`。
+    // 两端用 OR，同一条关系可能分属两批各命中一次，故合并后去重。
+    let mut out: Vec<i64> = Vec::new();
+    for chunk in entity_ids.chunks(storage::SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT rl.record_id FROM relations rl JOIN records r ON r.id=rl.record_id \
+            WHERE (rl.subject_id IN ({placeholders}) OR rl.object_id IN ({placeholders})) AND {condition} ORDER BY rl.record_id");
+        let params: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Integer(*id))
+            .chain(chunk.iter().map(|id| SqlValue::Integer(*id))).chain(values.iter().cloned()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
+        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 /// 两端都落在这批实体里的关系 id。
 fn relations_between(conn: &Connection, entity_ids: &[i64], filter: &ReadFilter) -> Result<Vec<i64>> {
     let (condition, values) = storage::filter_sql(filter, &[RecordKind::Relation], false)?;
-    let placeholders = vec!["?"; entity_ids.len()].join(",");
-    let sql = format!("SELECT rl.record_id FROM relations rl JOIN records r ON r.id=rl.record_id \
-        WHERE rl.subject_id IN ({placeholders}) AND rl.object_id IN ({placeholders}) AND {condition} ORDER BY rl.record_id");
-    let params: Vec<SqlValue> = entity_ids.iter().map(|id| SqlValue::Integer(*id))
-        .chain(entity_ids.iter().map(|id| SqlValue::Integer(*id))).chain(values).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    let members: BTreeSet<i64> = entity_ids.iter().copied().collect();
+    // 只按主语分片、宾语在内存里筛「落在成员集合内」。直接对两端各分片会把 AND 拆散：
+    // 主语与宾语分属两批的关系，两批里都不同时满足，就会被漏掉。
+    let mut out: Vec<i64> = Vec::new();
+    for chunk in entity_ids.chunks(storage::SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT rl.record_id, rl.object_id FROM relations rl JOIN records r ON r.id=rl.record_id \
+            WHERE rl.subject_id IN ({placeholders}) AND {condition} ORDER BY rl.record_id");
+        let params: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Integer(*id)).chain(values.iter().cloned()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map(params_from_iter(params), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))? {
+            let (record_id, object_id) = row?;
+            if members.contains(&object_id) { out.push(record_id); }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 /// 参与者里至少有两个落在这批实体里的事件 id。
@@ -407,14 +425,31 @@ fn relations_between(conn: &Connection, entity_ids: &[i64], filter: &ReadFilter)
 /// 先在参与者表上按 `entity_id` 收窄并分组筛，再回 `records` 过滤领域：领域条件是挂在
 /// `event_id` 上的，同一个事件的所有参与行要么全过、要么全不过，所以先筛后筛结果相同。
 /// 反过来拿 `records` 当驱动表，会对领域内每一个事件逐条探测参与者表，代价高一个数量级。
+///
+/// 分片按 `entity_id` 取参与行、再在内存里按事件聚合「去重实体数 >= 2」。直接对 `IN (...)`
+/// 分片会把同一事件的两个实体拆到两批里，`HAVING` 就再也凑不齐、漏掉这些事件。
 fn events_between(conn: &Connection, entity_ids: &[i64], filter: &ReadFilter) -> Result<Vec<i64>> {
     let (condition, values) = storage::filter_sql(filter, &[RecordKind::Event], false)?;
-    let placeholders = vec!["?"; entity_ids.len()].join(",");
-    let sql = format!("SELECT e.event_id FROM (SELECT event_id FROM event_participants \
-        WHERE entity_id IN ({placeholders}) GROUP BY event_id HAVING COUNT(DISTINCT entity_id) >= 2) e \
-        JOIN records r ON r.id=e.event_id WHERE {condition} ORDER BY e.event_id");
-    let params: Vec<SqlValue> = entity_ids.iter().map(|id| SqlValue::Integer(*id)).chain(values).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    let mut per_event: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for chunk in entity_ids.chunks(storage::SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT event_id, entity_id FROM event_participants WHERE entity_id IN ({placeholders})");
+        let params: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Integer(*id)).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        for row in stmt.query_map(params_from_iter(params), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))? {
+            let (event_id, entity_id) = row?;
+            per_event.entry(event_id).or_default().insert(entity_id);
+        }
+    }
+    let candidates: Vec<i64> = per_event.into_iter().filter(|(_, members)| members.len() >= 2).map(|(event_id, _)| event_id).collect();
+    let mut out: Vec<i64> = Vec::new();
+    for chunk in candidates.chunks(storage::SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT r.id FROM records r WHERE r.id IN ({placeholders}) AND {condition} ORDER BY r.id");
+        let params: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::Integer(*id)).chain(values.iter().cloned()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
+        out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    Ok(out)
 }

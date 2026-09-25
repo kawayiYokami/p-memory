@@ -1311,6 +1311,27 @@ fn search_with_context_attaches_entity_neighborhood() {
     assert!(plain.context.entities.is_empty() && plain.context.relations.is_empty());
 }
 
+/// 命中数超过内部切批粒度时，邻域装配（记录→实体、端点→关系）必须分片走完，不撞 SQLite 变量上限。
+#[test]
+fn search_with_context_handles_more_hits_than_one_sql_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.graph().apply_batch(&GraphBatch { entities: vec![entity("张三")], ..Default::default() }).unwrap();
+    // 1100 条命中记录，全部挂到同一实体张三：记录数超过 SQL_BATCH，装配必须跨批。
+    let inputs: Vec<MemoryInput> = (0..1100).map(|i| {
+        let mut m = memory(&format!("深夜的会面记录 {i}"), "public");
+        m.record.tags = vec!["张三".into()];
+        m
+    }).collect();
+    kb.memories().upsert_many(&inputs).unwrap();
+    kb.update_index().unwrap();
+    let request = SearchRequest { query: "深夜 会面".into(), kinds: vec![RecordKind::Memory],
+        limit: 1100, candidate_limit: Some(2000), ..Default::default() };
+    let hits = kb.search_with_context(&request, 10).unwrap();
+    assert!(hits.len() > 999, "命中数应跨过内部切批粒度，实际 {}", hits.len());
+    assert!(hits.iter().all(|h| h.context.entities.iter().any(|e| e.name == "张三")), "每条命中都挂到张三");
+}
+
 #[test]
 fn batched_context_matches_per_hit_expansion() {
     let dir = tempfile::tempdir().unwrap();

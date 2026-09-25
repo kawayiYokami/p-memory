@@ -514,37 +514,46 @@ impl KnowledgeBase {
         if record_ids.is_empty() { return Ok(out); }
         let state = self.read()?;
         let conn = state.conn();
-        // 1. 记录 → 实体：所有命中记录一次查完。
+        // 1. 记录 → 实体：所有命中记录一次查完。命中可能上千条，按批分片展开 `IN (...)`。
         let (entity_condition, entity_values) = storage::filter_sql(filter, &[RecordKind::Entity], false)?;
-        let record_placeholders = vec!["?"; record_ids.len()].join(",");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT DISTINCT rt.record_id, ea.entity_id FROM record_tags rt \
-             JOIN entity_aliases ea ON ea.alias_id=rt.tag_id \
-             JOIN records r ON r.id=ea.entity_id \
-             WHERE rt.record_id IN ({record_placeholders}) AND {entity_condition} ORDER BY rt.record_id, ea.entity_id"
-        ))?;
-        let params = record_ids.iter().map(|id| SqlValue::Integer(*id)).chain(entity_values).collect::<Vec<_>>();
         let mut seeds: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
-        for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-            let (record_id, entity_id) = row?;
-            seeds.entry(record_id).or_default().insert(entity_id);
+        for chunk in record_ids.chunks(storage::SQL_BATCH) {
+            let record_placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT rt.record_id, ea.entity_id FROM record_tags rt \
+                 JOIN entity_aliases ea ON ea.alias_id=rt.tag_id \
+                 JOIN records r ON r.id=ea.entity_id \
+                 WHERE rt.record_id IN ({record_placeholders}) AND {entity_condition} ORDER BY rt.record_id, ea.entity_id"
+            ))?;
+            let params = chunk.iter().map(|id| SqlValue::Integer(*id)).chain(entity_values.iter().cloned()).collect::<Vec<_>>();
+            for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+                let (record_id, entity_id) = row?;
+                seeds.entry(record_id).or_default().insert(entity_id);
+            }
         }
         let roots: Vec<i64> = seeds.values().flatten().copied().collect::<BTreeSet<_>>().into_iter().collect();
         if roots.is_empty() { return Ok(out); }
         // 2. 一次查出这批实体上的全部 1 跳关系记录。关系记录按 `filter` 过滤，端点按去掉 tags 的
         // `entity_filter` 过滤——与逐条版保持一致（tags 约束关系，scope 约束端点）。
         let (relation_condition, relation_values) = storage::filter_sql(filter, &[RecordKind::Relation], false)?;
-        let root_placeholders = vec!["?"; roots.len()].join(",");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT rl.record_id, rl.subject_id, rl.object_id FROM relations rl JOIN records r ON r.id=rl.record_id \
-             WHERE (rl.subject_id IN ({root_placeholders}) OR rl.object_id IN ({root_placeholders})) AND {relation_condition} \
-             ORDER BY rl.record_id"
-        ))?;
-        let params = roots.iter().map(|id| SqlValue::Integer(*id)).chain(roots.iter().map(|id| SqlValue::Integer(*id))).chain(relation_values).collect::<Vec<_>>();
         let mut edges: Vec<(i64, i64, i64)> = Vec::new();
-        for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
-            edges.push(row?);
+        for chunk in roots.chunks(storage::SQL_BATCH) {
+            let root_placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT rl.record_id, rl.subject_id, rl.object_id FROM relations rl JOIN records r ON r.id=rl.record_id \
+                 WHERE (rl.subject_id IN ({root_placeholders}) OR rl.object_id IN ({root_placeholders})) AND {relation_condition} \
+                 ORDER BY rl.record_id"
+            ))?;
+            let params = chunk.iter().map(|id| SqlValue::Integer(*id))
+                .chain(chunk.iter().map(|id| SqlValue::Integer(*id))).chain(relation_values.iter().cloned()).collect::<Vec<_>>();
+            for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+                edges.push(row?);
+            }
         }
+        // 分片会按批分段返回，重新按 relation_id 排序，复原单条语句 `ORDER BY rl.record_id` 的顺序
+        // （「每个实体各自按 limit 截断」依赖这个顺序）；跨批重复命中的同一行在此去重。
+        edges.sort_by_key(|(id, _, _)| *id);
+        edges.dedup_by_key(|(id, _, _)| *id);
         // 3. 批量取种子实体、端点实体和关系记录。
         let entity_filter = ReadFilter { tags: vec![], ..filter.clone() };
         let root_entities: BTreeMap<i64, Entity> = storage::load_many(conn, &roots, filter)?;
