@@ -454,6 +454,27 @@ def test_vectorization_targets_are_independent(kb, tmp_path):
         reopened.close()
 
 
+def test_sync_scoped_to_one_namespace_leaves_others_untouched(kb):
+    """sync 传 namespace 时只补该领域：别的领域不写向量、不被标就绪；不传则全库补齐。"""
+    kb.embeddings.register_space({"id": "v", "model": "m", "dimension": 4})
+    kb.embeddings.register_embedder("v", lambda texts: [[1.0, 0.0, 0.0, 0.0] for _ in texts])
+    kb.memories.upsert_by_judgment(judgment="本域的内容")
+    kb.memories.upsert_by_judgment(judgment="别域的内容", namespace="other")
+    kb.update_index()
+
+    report = kb.embeddings.sync("v", namespace="other")["value"]
+    assert report["written"] == 1, "只补指定领域那一条"
+    assert kb.embeddings.vector_ready("other", "v", "memory") is True
+    assert kb.embeddings.vector_ready("default", "v", "memory") is False, "别的领域没被标就绪"
+    assert kb.search("别域的内容", filter={"namespace": "other"}, kinds=["memory"], embed_space="v", text=False)["hits"]
+    assert kb.search("本域的内容", kinds=["memory"], embed_space="v", text=False)["hits"] == [], "本域未补齐"
+
+    # 不传 namespace：全库补齐，本域也补上。
+    kb.embeddings.sync("v")
+    assert kb.embeddings.vector_ready("default", "v", "memory") is True
+    assert kb.search("本域的内容", kinds=["memory"], embed_space="v", text=False)["hits"]
+
+
 def test_reranker_reorders_and_reports_diagnostics(kb):
     """重排回调在两路候选合并之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
     for i in range(4):

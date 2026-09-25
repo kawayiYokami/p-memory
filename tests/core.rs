@@ -67,13 +67,13 @@ fn space(kb: &KnowledgeBase, id: &str, dimension: usize) {
     kb.embeddings().register_embedder(id, FakeEmbedder::new(dimension)).unwrap();
 }
 /// 批次结束之后调用方触发的那次补齐。补完缺口，该档才会被标成就绪、向量路才放行。
-fn fill(kb: &KnowledgeBase, space_id: &str) -> SyncReport { kb.embeddings().sync(space_id, 32).unwrap().value }
+fn fill(kb: &KnowledgeBase, space_id: &str) -> SyncReport { kb.embeddings().sync(space_id, 32, None).unwrap().value }
 /// 补齐只由使用方显式触发：每次尝试都显式跑一轮 `sync`，再看该档是否就绪。
 /// 库里已没有后台线程，「等一等它自己会补上」那条路不存在了。
 fn sync_and_ready(kb: &KnowledgeBase, namespace: &str, space_id: &str, target: &str, budget_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
     loop {
-        let _ = kb.embeddings().sync(space_id, 32);
+        let _ = kb.embeddings().sync(space_id, 32, None);
         if kb.embeddings().vector_ready(namespace, space_id, target).unwrap() { return true; }
         if std::time::Instant::now() >= deadline { return false; }
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -166,7 +166,7 @@ fn sync_fills_missing_vectors_incrementally_and_aborts_on_failure() {
     kb.update_index().unwrap();
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
     // 没有注册回调时 sync 是配置错误。
-    assert!(matches!(kb.embeddings().sync("v", 4), Err(Error::Validation(_))));
+    assert!(matches!(kb.embeddings().sync("v", 4, None), Err(Error::Validation(_))));
     let embedder = FakeEmbedder::new(4);
     let lengths = embedder.lengths();
     kb.embeddings().register_embedder_with("v", embedder, EmbedderOptions { max_batch: 4, max_tokens_per_text: None }).unwrap();
@@ -175,7 +175,7 @@ fn sync_fills_missing_vectors_incrementally_and_aborts_on_failure() {
     assert!(lengths.lock().unwrap().iter().all(|(_, length)| *length <= 4), "每批不得超过声明的 max_batch");
     // 已补齐再 sync：增量为零，回调不再被调用。
     let calls_after_fill = lengths.lock().unwrap().len();
-    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0);
+    assert_eq!(kb.embeddings().sync("v", 32, None).unwrap().value.written, 0);
     assert_eq!(lengths.lock().unwrap().len(), calls_after_fill);
     // 检索只给搜索词：库自己嵌入查询词。
     let hits = kb.search(&vector_query("v", "待向量化 1", vec![RecordKind::Memory])).unwrap();
@@ -205,7 +205,7 @@ fn sync_stops_after_the_first_failing_batch() {
     let gated = kb.search(&vector_query("v", "甲", vec![RecordKind::Memory])).unwrap();
     assert!(gated.hits.is_empty() && gated.diagnostics.degraded.contains(&Degrade::VectorNotReady));
     // 中断不影响已完成的批次：稳定之后再 sync，能补的都已补过，没有可写的增量。
-    let settled = kb.embeddings().sync("v", 2).unwrap().value;
+    let settled = kb.embeddings().sync("v", 2, None).unwrap().value;
     assert_eq!(settled.written, 0);
     assert!(settled.interrupted.is_some());
     // 换一条能用的回调：上次补好的向量留着不重算，补完才放行。
@@ -293,6 +293,29 @@ fn namespace_switch_disables_vectorization_and_degrades() {
 }
 
 #[test]
+fn sync_scoped_to_one_namespace_leaves_the_others_untouched() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
+    // 两个领域各写一条记忆，都待补向量。
+    let default_id = kb.memories().upsert(memory("本域的内容", "public")).unwrap().value.header.id;
+    let mut other = memory("别域的内容", "public"); other.record.namespace = "other".into();
+    let other_id = kb.memories().upsert(other).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    // 只补 other 域：别的领域一个字节都不动。
+    let report = kb.embeddings().sync("v", 32, Some("other")).unwrap().value;
+    assert_eq!(report.written, 1, "只补指定领域的那一条");
+    assert!(kb.embeddings().vector_ready("other", "v", "memory").unwrap(), "指定领域被标成就绪");
+    assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap(), "别的领域没被标就绪");
+    assert!(kb.search(&vector_query("v", "本域的内容", vec![RecordKind::Memory])).unwrap().hits.is_empty(), "本域未补齐，向量路不给结果");
+    let other_query = SearchRequest { query: "别域的内容".into(), kinds: vec![RecordKind::Memory], embed_space: Some("v".into()),
+        text: false, filter: ReadFilter { namespace: "other".into(), ..Default::default() }, ..Default::default() };
+    assert_eq!(kb.search(&other_query).unwrap().hits[0].key.id, other_id, "指定领域已补齐、向量路可查");
+    // 再全库补一次，本域也补上。
+    fill(&kb, "v");
+    assert!(kb.embeddings().vector_ready("default", "v", "memory").unwrap());
+    assert_eq!(kb.search(&vector_query("v", "本域的内容", vec![RecordKind::Memory])).unwrap().hits[0].key.id, default_id);
+}
+
+#[test]
 fn vectorization_targets_are_independent_per_namespace() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
     // 内置默认：记忆与图谱开、笔记关。
@@ -317,7 +340,7 @@ fn vectorization_targets_are_independent_per_namespace() {
     // 记忆不生成向量；同一时刻写的实体照旧生成，两档互不牵连。
     assert!(kb.search(&vector_query("v", "记忆档关闭时的措辞", vec![RecordKind::Memory])).unwrap().hits.is_empty());
     assert_eq!(kb.search(&vector_query("v", "记忆档关闭时写入的实体", vec![RecordKind::Entity])).unwrap().hits[0].key.id, entity_id);
-    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的档位不该被 sync 补出向量");
+    assert_eq!(kb.embeddings().sync("v", 32, None).unwrap().value.written, 0, "关闭的档位不该被 sync 补出向量");
     // 开关只管「是否生成」：重新打开后这一条才补上向量。
     kb.embeddings().set_vectorization("default", "memory", true).unwrap();
     assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "重新打开后补齐缺的那一条");
@@ -345,7 +368,7 @@ fn notes_switch_gates_chunk_vectors_and_keeps_existing_ones() {
     // 关掉笔记档：向量留在库里（sync 没有需要补的），只是不再进向量路。
     kb.embeddings().set_vectorization("default", "notes", false).unwrap();
     assert!(kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits.is_empty());
-    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "已有向量仍在，无需重算");
+    assert_eq!(kb.embeddings().sync("v", 32, None).unwrap().value.written, 0, "已有向量仍在，无需重算");
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
     fill(&kb, "v");
     assert_eq!(kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits[0].key.id, chunk);
@@ -363,7 +386,7 @@ fn namespace_master_switch_overrides_every_target() {
     let mut muted = memory("总闸关闭时的措辞", "public"); muted.record.namespace = "other".into();
     kb.memories().upsert(muted).unwrap();
     kb.update_index().unwrap();
-    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0);
+    assert_eq!(kb.embeddings().sync("v", 32, None).unwrap().value.written, 0);
     let request = SearchRequest { query: "总闸关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
         embed_space: Some("v".into()), ..Default::default() };
     let result = kb.search(&request).unwrap();
@@ -414,7 +437,7 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     std::fs::write(&path, "第一版切片措辞").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
     kb.update_index().unwrap();
-    kb.embeddings().sync("v", 32).unwrap();
+    kb.embeddings().sync("v", 32, None).unwrap();
     let first = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
     assert_eq!(kb.search(&vector_query("v", "第一版切片措辞", vec![RecordKind::Chunk])).unwrap().hits[0].key.id, first);
     // 关闭状态下改正文：旧切片的向量照旧随记录作废，也不生成新的。
@@ -425,7 +448,7 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     let second = kb.notes().chunks(note2.header.id, &ReadFilter::default()).unwrap()[0].header.id;
     assert_ne!(second, first, "先删后加：切片记录随更新换代");
     assert_ne!(note2.header.id, note.header.id, "笔记记录同样换代");
-    assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的笔记档不补新向量");
+    assert_eq!(kb.embeddings().sync("v", 32, None).unwrap().value.written, 0, "关闭的笔记档不补新向量");
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
     assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000), "只有新切片需要补向量");
     let mut wide = vector_query("v", "第二版切片措辞", vec![RecordKind::Chunk]); wide.limit = 10;
@@ -477,7 +500,7 @@ fn caller_syncs_after_the_batch_ends() {
     assert_eq!(hits.len(), 1);
     // 关闭库后不再接受任何调用。
     kb.close().unwrap();
-    assert!(matches!(kb.embeddings().sync("v", 32), Err(Error::Closed)));
+    assert!(matches!(kb.embeddings().sync("v", 32, None), Err(Error::Closed)));
     // 重开同一目录：上次补好的向量还在，只补这之后新出现的缺口。
     let reopened = KnowledgeBase::open(dir.path()).unwrap();
     space(&reopened, "v", 4);
@@ -791,7 +814,7 @@ fn oversized_batches_shrink_to_fit() {
         if texts.len() > 4 { return Err(EmbedCallbackError::too_large("at most 4")); }
         Ok(texts.iter().map(|text| fallback_vector(text, 4)).collect())
     }, EmbedderOptions { max_batch: 8, max_tokens_per_text: None }).unwrap();
-    kb.embeddings().sync("v", 32).unwrap();
+    kb.embeddings().sync("v", 32, None).unwrap();
     assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "八条都补上了");
     let calls = lengths.lock().unwrap().clone();
     let shrink_at = calls.iter().position(|len| *len == 8).expect("先按声明的 8 条试一次");
@@ -805,11 +828,11 @@ fn swapping_models_keeps_the_old_space_usable() {
     for i in 0..3 { kb.memories().upsert(memory(&format!("换模型 {i}"), "public")).unwrap(); }
     kb.update_index().unwrap();
     space(&kb, "old", 4);
-    kb.embeddings().sync("old", 32).unwrap();
+    kb.embeddings().sync("old", 32, None).unwrap();
     // 换模型：新建空间 + 新回调 + sync；旧空间不动，退回只是检索改回旧空间。
     kb.embeddings().register_space(EmbeddingSpace { id: "new".into(), model: "fixture/v2".into(), dimension: 8, text_version: 1, encoding: "sq8".into() }).unwrap();
     kb.embeddings().register_embedder("new", FakeEmbedder::new(8)).unwrap();
-    kb.embeddings().sync("new", 32).unwrap();
+    kb.embeddings().sync("new", 32, None).unwrap();
     // 只断言终态，不数这一次写了多少。
     assert!(sync_and_ready(&kb, "default", "new", "memory", 15_000), "换上新模型后补齐并标记就绪");
     let kinds = vec![RecordKind::Memory];
@@ -865,7 +888,7 @@ fn packed_and_precise_spaces_rank_the_same_vectors_together() {
         kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension: 8, text_version: 1, encoding: encoding.into() }).unwrap();
         kb.embeddings().register_embedder(id, FakeEmbedder::new(8)).unwrap();
         // 使用方显式同步一次，补完缺口才标记就绪。
-        kb.embeddings().sync(id, 50).unwrap();
+        kb.embeddings().sync(id, 50, None).unwrap();
         assert!(sync_and_ready(&kb, "default", id, "memory", 15_000), "空间 {id} 补齐并标记就绪");
     }
     let kinds = vec![RecordKind::Memory];
@@ -2545,7 +2568,7 @@ fn vector_reconcile_deletes_orphans_and_fills_gaps() {
     }
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     space(&kb, "v", 4);
-    let report = kb.embeddings().sync("v", 32).unwrap().value;
+    let report = kb.embeddings().sync("v", 32, None).unwrap().value;
     assert_eq!(report.deleted, 1, "孤儿向量被对账清掉");
     {
         let vconn = rusqlite::Connection::open(dir.path().join("vectors.sqlite3")).unwrap();

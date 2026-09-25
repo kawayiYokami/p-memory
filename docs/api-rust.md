@@ -257,14 +257,14 @@ impl EmbeddingStore {
     fn vectorization(&self, namespace: &str, target: &str) -> Result<bool>;
     fn set_vectorization(&self, namespace: &str, target: &str, enabled: bool) -> Result<WriteReceipt<bool>>;
     fn vector_ready(&self, namespace: &str, space_id: &str, target: &str) -> Result<bool>;
-    fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>>;
+    fn sync(&self, space_id: &str, batch: usize, namespace: Option<&str>) -> Result<WriteReceipt<SyncReport>>;
     fn delete_space(&self, id: &str) -> Result<WriteReceipt<bool>>;
 }
 ```
 
 - 空间定义不可变；重复注册相同定义幂等。
 - `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
-- `sync(space_id, batch)` 是**向量对账**（对外写入口之一，显式调用）：取消就绪 → 读向量库、读主库 → 算差异 → 先删后生成 → 核对并标就绪。「需要删的」是向量库里记录已不在主库的孤儿行；「需要生成的」是缺向量与指纹不符的记录。它不提交索引、不碰主库写锁：切片正文要等写入侧 `update_index` 之后才读得到，未提交的这一轮计入缺口、该档停在未就绪。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
+- `sync(space_id, batch, namespace)` 是**向量对账**（对外写入口之一，显式调用）：取消就绪 → 读向量库、读主库 → 算差异 → 先删后生成 → 核对并标就绪。`namespace` 为 `None` 时覆盖全库所有领域；给了就只处理该领域——撤标记、删孤儿、补齐、核缺口全部收窄到它，别的领域一个字节都不动。这让下游可以只给一个领域建向量。「需要删的」是向量库里记录已不在主库的孤儿行；「需要生成的」是缺向量与指纹不符的记录。它不提交索引、不碰主库写锁：切片正文要等写入侧 `update_index` 之后才读得到，未提交的这一轮计入缺口、该档停在未就绪。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
 - `vector_ready(namespace, space_id, target)` 读的是「领域 × 向量空间 × 档位」的就绪标记（落盘在 `meta`），`target` 取 `memory` / `graph` / `notes`，三档各自独立记、各自放行：记忆补完了不表示图谱也补完了。未就绪的档在检索里被剔出向量路，其余已就绪的档照常走向量；三档全被剔才记 `vector_not_ready`。对账以「取消就绪」开场，核对过才重标；改总闸或改档位也会让标记当场作废。
 - 写入路径**不产生向量**、不碰向量库：`upsert` / `delete` 只做主库与索引的事。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一由使用方显式调一次 `sync` 对账。库里没有后台线程，没人调 `sync` 就一直是缺口、该档停在未就绪。
 - 补齐是**使用方主动叫一次**的同步动作，不做轮询、不设触发条件：调一次就把当前缺口按批补完，再逐档核对并标成就绪。

@@ -635,16 +635,23 @@ impl EmbeddingStore {
     /// 索引尚未被写入侧提交时这批切片这轮取不到正文、跳过，等调用方 `update_index`
     /// 之后再调一次。模型调用是网络往返，绝不持有任何库锁：循环严格三段式——
     /// 读快照取一批文本（随即放锁）→ 调回调（不持任何库锁）→ 短事务写回这一批。
-    pub fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>> {
+    /// `namespace` 为 `None` 时覆盖全库所有领域；给了就只处理该领域——撤标记、删孤儿、补齐、
+    /// 核缺口全部收窄到它，别的领域一个字节都不动。
+    pub fn sync(&self, space_id: &str, batch: usize, namespace: Option<&str>) -> Result<WriteReceipt<SyncReport>> {
         storage::validate_limit(batch)?;
+        if let Some(namespace) = namespace { storage::validate_identity("namespace", namespace)?; }
         let Some(entry) = self.0.engine.embedders.get(space_id) else {
             return Err(Error::Validation(format!("no embedder registered for space {space_id}")));
         };
-        // 1. 取消就绪：本空间的就绪标记全部先撤，差异补齐核对过再重标。
+        // 1. 取消就绪：本次覆盖范围的就绪标记先撤，差异补齐核对过再重标。
         {
             let mut guard = self.0.engine.vector_writer.lock();
             let writer = guard.as_mut().ok_or(Error::Closed)?;
-            writer.conn.execute("DELETE FROM vector_meta WHERE key GLOB 'vector_ready:*:'||?1||':*'", [space_id])?;
+            match namespace {
+                Some(namespace) => { writer.conn.execute("DELETE FROM vector_meta WHERE key GLOB 'vector_ready:'||?2||':'||?1||':*'",
+                    params![space_id, text::normalized_tag(namespace)])?; }
+                None => { writer.conn.execute("DELETE FROM vector_meta WHERE key GLOB 'vector_ready:*:'||?1||':*'", [space_id])?; }
+            }
         }
         // 2. 读两边、算差异：需要删的 = 向量库里记录已不在主库的孤儿行
         //    （删除流程跨库非原子，断电可能留下它们）。指纹不符的不用删——
@@ -656,10 +663,18 @@ impl EmbeddingStore {
                 let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
                 rows.collect::<std::result::Result<HashSet<_>, _>>()?
             };
+            let scoped = namespace.map(text::normalized_tag);
             let mut guard = self.0.engine.vector_writer.lock();
             let writer = guard.as_mut().ok_or(Error::Closed)?;
-            let mut stmt = writer.conn.prepare("SELECT record_id,namespace FROM embeddings WHERE space_id=?1")?;
-            let mut rows = stmt.query(params![space_id])?;
+            let sql = match scoped {
+                Some(_) => "SELECT record_id,namespace FROM embeddings WHERE space_id=?1 AND namespace=?2",
+                None => "SELECT record_id,namespace FROM embeddings WHERE space_id=?1",
+            };
+            let mut stmt = writer.conn.prepare(sql)?;
+            let mut rows = match &scoped {
+                Some(namespace) => stmt.query(params![space_id, namespace])?,
+                None => stmt.query(params![space_id])?,
+            };
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
                 let (record_id, namespace): (i64, String) = (row.get(0)?, row.get(1)?);
@@ -682,25 +697,25 @@ impl EmbeddingStore {
             self.0.engine.vectors.invalidate_namespaces(&touched);
         }
         // 4. 后生成：缺向量与指纹不符的记录分批补齐。
-        let filled = self.drain(space_id, &entry, batch)?;
+        let filled = self.drain(space_id, &entry, batch, namespace)?;
         report.scanned = filled.scanned;
         report.written = filled.written;
         report.batches = filled.batches;
         report.interrupted = filled.interrupted;
         if report.interrupted.is_some() { self.0.note_degrade(Degrade::EmbedFailed); }
         // 5. 逐档核对缺口，把补齐的标成就绪。
-        self.verify_and_mark(space_id)?;
+        self.verify_and_mark(space_id, namespace)?;
         let state = self.0.read()?;
         Ok(WriteReceipt { value: report, revision: storage::current_revision(state.conn())? })
     }
 
-    /// 逐档核对缺口并把结果写成就绪标记（该档缺口为 0 才算就绪）。
+    /// 逐档核对缺口并把结果写成就绪标记（该档缺口为 0 才算就绪）。`namespace` 给了就只核它。
     ///
     /// 核对在**读连接**上做，写锁只用于最后落标记：核对要扫一遍记录，
     /// 若整段扣着写锁，写入与读取的自愈都会被它挡住——读路径拿不到写锁就不再等，
     /// 刚写完的记录于是短暂查不到。核对期间有人写过就重来（最多几次）；
     /// 一直有人在写就不标：宁可停在未就绪，也不给「补了半个领域」的假象。
-    fn verify_and_mark(&self, space_id: &str) -> Result<()> {
+    fn verify_and_mark(&self, space_id: &str, namespace: Option<&str>) -> Result<()> {
         for _attempt in 0..VERIFY_ATTEMPTS {
             let (revision, marks) = {
                 let state = self.0.read()?;
@@ -708,7 +723,9 @@ impl EmbeddingStore {
                 let conn = state.conn();
                 let revision = storage::current_revision(conn)?;
                 let mut marks = Vec::new();
+                let scoped = namespace.map(text::normalized_tag);
                 for namespace in storage::record_namespaces(conn)? {
+                    if let Some(scoped) = &scoped { if &namespace != scoped { continue; } }
                     for target in VectorizeTarget::ALL {
                         let enabled = target_vectorization(conn, &namespace, target)?;
                         let gap = has_gap(conn, &index, space_id, &namespace, target)?;
@@ -734,8 +751,8 @@ impl EmbeddingStore {
         Ok(())
     }
 
-    /// 分段补齐的实际循环。
-    fn drain(&self, space_id: &str, entry: &Arc<Mutex<EmbedderEntry>>, batch: usize) -> Result<SyncReport> {
+    /// 分段补齐的实际循环。`namespace` 给了就只扫它。
+    fn drain(&self, space_id: &str, entry: &Arc<Mutex<EmbedderEntry>>, batch: usize, namespace: Option<&str>) -> Result<SyncReport> {
         let mut report = SyncReport::default();
         let mut guard = entry.lock();
         let mut cursor: Option<i64> = None;
@@ -744,7 +761,7 @@ impl EmbeddingStore {
             let candidates = {
                 let state = self.0.read()?;
                 let index = self.0.index()?;
-                pending_candidates(state.conn(), &index, space_id, None, None, limit, cursor, None)?
+                pending_candidates(state.conn(), &index, space_id, namespace, None, limit, cursor, None)?
             };
             let Some(last) = candidates.last().map(|input| input.key.id) else { break };
             let pending: Vec<EmbeddingInput> = candidates.into_iter().filter(embeddable).collect();

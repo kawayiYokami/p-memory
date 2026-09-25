@@ -406,10 +406,14 @@ class EmbeddingStore:
         """设置某档开关；只决定以后是否生成向量，已有向量保留。"""
         return self._kb.invoke("embeddings.set_vectorization", {"namespace": namespace, "target": target, "enabled": enabled})
 
-    def sync(self, space_id: str, *, batch: int = 32) -> WriteReceipt:
+    def sync(self, space_id: str, *, batch: int = 32, namespace: str | None = None) -> WriteReceipt:
         """批次处理完之后由使用方调一次补齐：把缺失向量的记录分批补齐，
-        最后核对缺口、把补齐的领域标成就绪。库内没有后台线程，没人调就一直缺着。"""
-        return self._kb.invoke("embeddings.sync", {"space_id": space_id, "batch": batch})
+        最后核对缺口、把补齐的领域标成就绪。库内没有后台线程，没人调就一直缺着。
+        默认补齐全库所有领域；传 `namespace` 时只补该领域，别的领域不受影响。"""
+        payload = {"space_id": space_id, "batch": batch}
+        if namespace is not None:
+            payload["namespace"] = namespace
+        return self._kb.invoke("embeddings.sync", payload)
 
     def vector_ready(self, namespace: str, space_id: str, target: str) -> bool:
         """该领域的某一档在该空间下是否已补齐，`target` 取 memory / graph / notes。

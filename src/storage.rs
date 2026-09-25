@@ -1250,7 +1250,7 @@ mod tests {
         }).unwrap();
         for namespace in ["a", "b"] { cache_partition(&kb, &space, namespace); }
         kb.memories().upsert(crate::MemoryInput::new("补齐用的一条")).unwrap();
-        kb.embeddings().sync("v", 32).unwrap();
+        kb.embeddings().sync("v", 32, None).unwrap();
 
         let cached = cached_namespaces(&kb);
         assert!(cached.contains("a") && cached.contains("b"),
