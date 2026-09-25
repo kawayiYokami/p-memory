@@ -16,7 +16,8 @@ kb.search("关键词") # -> SearchResult
 kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_tokens_total=8192)
 kb.health()        # -> dict
-kb.update_index()  # 提交写入攒下的增删并对账收敛索引（批量导入后调用一次）
+kb.update_index()  # 提交写入攒下的索引增删并清掉已落地的写标记（批量写入后调用一次）
+kb.reconcile_index()  # 显式对账：全文索引与主库求差集对齐（稳态下是空操作）
 kb.backup(target)
 kb.close()
 
@@ -28,15 +29,15 @@ p_memory.KnowledgeBase.restore(snapshot, directory)  # 类方法
 `filter` 支持 `namespace` / `scopes` / `tags` / `note_ids` 四个维度，彼此取交集。`note_ids` 给出一批笔记的记录 id 后，候选只在这批笔记的切片内产生，其余记录不参与命中，空表示不限定——这是把宿主的「书内搜索」迁进 p-memory 的入口。
 异步封装 `AsyncKnowledgeBase` 才提供 `open(path, **options)` 类方法（`async def`）。
 
-删除有两种粒度：`delete(id)` 删单条，`delete_by_filter(filter)` 按过滤条件整批删。三个存储域都有 `delete_by_filter`，返回 `{"value": 删除条数, "revision": ...}`：
+删除只按 id 批量走（单个 id 也是批量的一种），三个存储域都是 `delete(ids)`，返回 `{"value": 实际删除条数, "revision": ...}`：
 
 ```python
-kb.memories.delete_by_filter(filter={"namespace": "demo"})                  # 整个域
-kb.graph.delete_by_filter(filter={"namespace": "demo"})                     # 实体/关系/事件连边一起清
-kb.notes.delete_by_filter(filter={"namespace": "demo", "tags": ["draft"]})  # 只删带这个标签的笔记
+kb.memories.delete([1, 2, 3])          # 一批记忆
+kb.graph.delete("entity", [jia, yi])   # 一批图记录（kind 指明实体/关系/事件）
+kb.notes.delete([note_id])             # 一批笔记，切片随笔记一起删
 ```
 
-过滤条件里的 `namespace` 决定删哪个域，`scopes` / `tags` / `note_ids` 收窄范围；空命中返回 0，不是错误。图谱域按「关系 → 事件 → 实体」的顺序连边一起删，笔记域连带切片，级联顺序由库内部保证，调用方不必先解除引用。返回值只计主记录（图谱域是实体/关系/事件之和，笔记域只计笔记本身，随笔记删掉的切片不单独计数）。若某个待删实体仍被过滤条件之外的关系引用，抛 `ConflictError`，整个事务回滚，不做部分删除。
+主库查 id，命中才继续：非目标类型或不存在的 id 静默跳过，不算错误。删除的次序是写锁内主库标记先行 → 删向量行与主库行 → 出锁后摘索引词条；中途断电，主库上的「正在删除」标记让下次开机把没删完的做完。子记录（切片）先于笔记落库，RESTRICT 引用不会拦；若待删实体仍被关系引用，抛 `ConflictError`，标记留在主库，引用清掉之后的下次开机会把这条删除自动做完。
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
 谓词元规则与等价词在 Python 侧都可用：`kb.graph.set_predicate_rule(predicate, inverse=None, symmetric=False)` 登记对称/逆谓词、`kb.graph.delete_predicate_rule(predicate)` 撤销（内置 `sys:same_as` 同样可撤）；`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.delete_predicate_equivalents(namespace, predicates=None)` 撤销（不给词就清掉整域）、`kb.graph.expand_query(namespace, text)` 单独调用扩散。扩散也已在全文路与预设检索图谱路内部自动生效。
@@ -69,7 +70,7 @@ kb.search_preset("rag", "朱樱和白露的同学是谁", embed_space="e5")
 ```python
 kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 768})
 kb.embeddings.register_embedder("e5", my_embed_fn, max_batch=50)   # 注册即用样本校验
-kb.embeddings.sync("e5", batch=50)                                # 补缺口 → 逐档核对并标记就绪（切片正文要等 update_index 之后才补得上）
+kb.embeddings.sync("e5", batch=50)                                # 向量对账：清孤儿、补缺口、逐档标就绪（切片正文要等 update_index 之后才补得上）
 kb.embeddings.vector_ready("demo", "e5", "memory")           # 记忆档补完了没有；未就绪的档不走向量
 kb.memories.upsert_by_judgment(judgment="……")                      # 写入不碰向量，向量留给批次结束的 sync
 kb.search("偏好", embed_space="e5")                                # 库嵌入查询词，宿主只给词

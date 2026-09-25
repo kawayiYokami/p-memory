@@ -140,7 +140,7 @@ class KnowledgeBase:
     def register_event_sink(self, callback: Callable) -> None:
         """注册事件回调：`callback(event: dict) -> None`。
 
-        库在关键执行点产出事件（`search`、`index_rebuild`），交给这个回调；
+        库在关键执行点产出事件（`search`），交给这个回调；
         落盘、轮转、保留多久都由宿主自己负责，库不碰文件。
 
         库在检索线程里同步调用回调，所以它必须非阻塞——在里面做同步 IO 或
@@ -159,16 +159,14 @@ class KnowledgeBase:
     def health(self) -> dict[str, Any]:
         return self.invoke("health")
 
-    def rebuild_indexes(self) -> dict[str, Any]:
-        return self.invoke("rebuild_indexes")
-
-    def rebuild_progress(self) -> dict[str, Any]:
-        """读一次全文索引重建的进度快照（`active` / `processed` / `total`），可在重建进行时轮询。"""
-        return self.invoke("rebuild_progress")
-
     def update_index(self) -> dict[str, Any]:
-        """追平写入累积的待索引待办（批量导入后调用一次即可）。"""
+        """提交写入攒下的索引增删（批量写入后调用一次即可）。"""
         return self.invoke("update_index")
+
+    def reconcile_index(self) -> dict[str, Any]:
+        """显式对账：把全文索引与主库求差集对齐。停电恢复覆盖不了的残余
+        （例如绕过 API 直改主库）由这里一次收敛；稳态下调用是空操作。"""
+        return self.invoke("reconcile")
 
     def backup(self, path: str | os.PathLike) -> None:
         self.invoke("backup", {"path": os.fspath(path)})
@@ -207,16 +205,14 @@ class _Store:
     def list(self, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
         return self._call("list", {"filter": self._kb._filter(filter), "limit": limit, "after": after})
 
-    def delete(self, id: str, *, filter: ReadFilter | None = None) -> WriteReceipt:
-        return self._call("delete", {"id": id, "filter": self._kb._filter(filter)})
-
-    def delete_by_filter(self, *, filter: ReadFilter | None = None) -> WriteReceipt:
-        """删除过滤条件命中的全部记录，返回删除条数（`value`）。空命中返回 0。
-
-        过滤条件里的 `namespace` 决定删哪个域，`scopes` / `tags` / `note_ids` 用于收窄。
-        图谱域按「关系 → 事件 → 实体」的顺序连边一起删；笔记域连带切片。
-        """
-        return self._call("delete_by_filter", {"filter": self._kb._filter(filter)})
+    def delete(self, ids: int | str | Sequence[int | str], *, filter: ReadFilter | None = None) -> WriteReceipt:
+        """批量删除：`ids` 是一批记录 id（单个 id 也是批量的一种）。
+        主库查 id，命中才继续；未命中的 id 静默跳过，返回实际删除条数（`value`）。
+        主库标记先行、索引词条派生先行退、向量与主库行最后落；断电留下的
+        「正在删除」标记会在下次开机把没删完的做完。"""
+        if isinstance(ids, (int, str)):
+            ids = [ids]
+        return self._call("delete", {"ids": [int(i) for i in ids], "filter": self._kb._filter(filter)})
 
 
 class MemoryStore(_Store):
@@ -257,8 +253,12 @@ class GraphStore(_Store):
     def list(self, kind: RecordKind, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
         return self._call("list", {"kind": kind, "page": {"filter": self._kb._filter(filter), "limit": limit, "after": after}})
 
-    def delete(self, kind: RecordKind, id: str, *, filter: ReadFilter | None = None) -> WriteReceipt:
-        return self._call("delete", {"kind": kind, "id": id, "filter": self._kb._filter(filter)})
+    def delete(self, kind: RecordKind, ids: int | str | Sequence[int | str], *,
+               filter: ReadFilter | None = None) -> WriteReceipt:
+        """批量删除图记录：`ids` 是一批记录 id（单个 id 也是批量的一种）。"""
+        if isinstance(ids, (int, str)):
+            ids = [ids]
+        return self._call("delete", {"kind": kind, "ids": [int(i) for i in ids], "filter": self._kb._filter(filter)})
 
     def resolve(self, name: str, *, filter: ReadFilter | None = None, limit: int = 10) -> list[dict]:
         return self._call("resolve", {"name": name, "filter": self._kb._filter(filter), "limit": limit})
@@ -336,9 +336,16 @@ class GraphStore(_Store):
 class NoteStore(_Store):
     prefix = "notes"
 
-    def upsert_file(self, data: NoteFileInput | None = None, **fields: Any) -> WriteReceipt:
-        """按文件路径同步一篇笔记：正文取文件原文，路径即身份，标题取文件名（去扩展名）。"""
-        return self._call("upsert_file", self._kb._input(data, fields))
+    def upsert_file(self, data: NoteFileInput | Sequence[NoteFileInput] | None = None,
+                    **fields: Any) -> WriteReceipt:
+        """按文件路径同步笔记：正文取文件原文，路径即身份，标题取文件名（去扩展名）。
+        更新就是「先删后加」：同路径已有笔记，先把旧笔记连同切片整条删掉再当新笔记写入，
+        切片记录全部新开，向量由向量对账照主库重算。传列表即批量，一次写锁整批处理。"""
+        if isinstance(data, (list, tuple)):
+            payload = [self._kb._input(item) for item in data]
+        else:
+            payload = self._kb._input(data, fields)
+        return self._call("upsert_file", payload)
 
     def set_root(self, namespace: str, root: str | os.PathLike) -> None:
         """登记该知识领域的笔记根目录：之后写入的路径必须是它的子路径，库里存相对路径。"""
@@ -503,17 +510,13 @@ class AsyncKnowledgeBase:
         kb = await self._ensure_open()
         await asyncio.to_thread(kb.backup, path)
 
-    async def rebuild_indexes(self) -> dict:
-        kb = await self._ensure_open()
-        return await asyncio.to_thread(kb.rebuild_indexes)
-
-    async def rebuild_progress(self) -> dict:
-        kb = await self._ensure_open()
-        return await asyncio.to_thread(kb.rebuild_progress)
-
     async def update_index(self) -> dict:
         kb = await self._ensure_open()
         return await asyncio.to_thread(kb.update_index)
+
+    async def reconcile_index(self) -> dict:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.reconcile_index)
 
     async def close(self) -> None:
         async with self._lock:

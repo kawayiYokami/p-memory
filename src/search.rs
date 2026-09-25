@@ -212,8 +212,8 @@ impl KnowledgeBase {
     pub fn reranker_registered(&self) -> bool { self.engine.rerankers.is_registered() }
 
     /// 全文路。派生索引查询失败时返回 `Index`，由调用方隔离文本路——索引没有「重建」这条路。
+    /// 读路径一次都不拿写锁：写入攒下的索引增删何时可见，由写入侧的 `update_index` 决定。
     fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, field: MatchField) -> Result<Vec<(RecordKey, f64)>> {
-        self.sync_index_if_behind(conn)?;
         let Some(index_filter) = index_filter(conn, filter, kinds)? else { return Ok(Vec::new()) };
         // 领域登记了谓词等价词时先扩散：把同义写法一并纳入召回（如「beta」补「alpha」）。
         let expanded = crate::graph::match_predicate_synonyms(conn, &filter.namespace, query)?;
@@ -588,7 +588,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// 索引查询失败时隔离文本路，不静默退回空文本；故障排除后重检索照常命中，
-    /// 无需任何重建——索引与主库的一致性由下一次对账收敛。
+    /// 无需任何重建——派生索引坏了就隔离，好了就接着用。
     /// token 计数按字符密度估算：ASCII ≈ 4 字符/token，非 ASCII ≈ 2 字符/token，向上取整。
     #[test]
     fn token_count_follows_character_density() {
@@ -610,6 +610,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::open(dir.path()).unwrap();
         kb.memories().upsert(MemoryInput::new("索引故障恢复的独有措辞")).unwrap();
+        // 索引提交是写入路径的职责：先提交，检索不替写者收尾。
+        kb.update_index().unwrap();
         let index = kb.index().unwrap();
         let request = SearchRequest {
             query: "索引故障恢复的独有措辞".into(), kinds: vec![RecordKind::Memory],

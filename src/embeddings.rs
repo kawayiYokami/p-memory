@@ -509,9 +509,9 @@ fn embed_with_retry(entry: &mut EmbedderEntry, texts: &[String]) -> EmbedOutcome
     }
 }
 
-/// 一次内部同步的实际完成量。中断时已写回的批次保留，未跑的批次不写。
+/// 一次对账的实际完成量。中断时已写回的批次保留，未跑的批次不写。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SyncReport { pub scanned: usize, pub written: usize, pub batches: usize, pub interrupted: Option<String> }
+pub struct SyncReport { pub scanned: usize, pub written: usize, pub batches: usize, pub deleted: usize, pub interrupted: Option<String> }
 
 impl EmbeddingStore {
     pub fn register_space(&self, space: EmbeddingSpace) -> Result<WriteReceipt<EmbeddingSpace>> {
@@ -630,33 +630,68 @@ impl EmbeddingStore {
         vector_ready(state.conn(), namespace, space_id, target)
     }
 
-    /// 内部同步：库拿该空间注册的回调，把缺失向量的记录分批补齐。宿主不参与。
-    ///
-    /// 它是四个触发时机里的「调用方主动叫一次」：补完缺口，再逐档核对缺口、把补齐的档标成就绪。
-    /// 它不提交索引、不碰主库写锁：切片的正文存在索引里，索引尚未被写入侧提交时，
-    /// 这批切片这一轮取不到正文、跳过，等调用方 `update_index` 之后再被唤醒补上。
-    /// 模型调用是网络往返，绝不能持有库锁，所以循环严格三段式：
+    /// 向量对账（对外写入口之一，显式调用）：取消就绪 → 读向量库、读主库 → 算差异 →
+    /// 先删后生成 → 核对并标就绪。它不提交索引、不碰主库写锁：切片的正文存在索引里，
+    /// 索引尚未被写入侧提交时这批切片这轮取不到正文、跳过，等调用方 `update_index`
+    /// 之后再调一次。模型调用是网络往返，绝不持有任何库锁：循环严格三段式——
     /// 读快照取一批文本（随即放锁）→ 调回调（不持任何库锁）→ 短事务写回这一批。
-    /// 失败即中断：已写回的批次保留，未跑的批次不写。
     pub fn sync(&self, space_id: &str, batch: usize) -> Result<WriteReceipt<SyncReport>> {
         storage::validate_limit(batch)?;
-        if self.0.engine.embedders.get(space_id).is_none() {
+        let Some(entry) = self.0.engine.embedders.get(space_id) else {
             return Err(Error::Validation(format!("no embedder registered for space {space_id}")));
+        };
+        // 1. 取消就绪：本空间的就绪标记全部先撤，差异补齐核对过再重标。
+        {
+            let mut guard = self.0.engine.vector_writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            writer.conn.execute("DELETE FROM vector_meta WHERE key GLOB 'vector_ready:*:'||?1||':*'", [space_id])?;
         }
-        let report = self.fill(space_id, batch)?;
+        // 2. 读两边、算差异：需要删的 = 向量库里记录已不在主库的孤儿行
+        //    （删除流程跨库非原子，断电可能留下它们）。指纹不符的不用删——
+        //    主键就是 (space, record)，生成阶段原地覆盖。
+        let orphans: Vec<(i64, String)> = {
+            let main_ids: HashSet<i64> = {
+                let state = self.0.read()?;
+                let mut stmt = state.conn().prepare("SELECT id FROM records")?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                rows.collect::<std::result::Result<HashSet<_>, _>>()?
+            };
+            let mut guard = self.0.engine.vector_writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            let mut stmt = writer.conn.prepare("SELECT record_id,namespace FROM embeddings WHERE space_id=?1")?;
+            let mut rows = stmt.query(params![space_id])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let (record_id, namespace): (i64, String) = (row.get(0)?, row.get(1)?);
+                if !main_ids.contains(&record_id) { out.push((record_id, namespace)); }
+            }
+            out
+        };
+        let mut report = SyncReport::default();
+        // 3. 先删：孤儿向量行一次清掉。
+        if !orphans.is_empty() {
+            let mut guard = self.0.engine.vector_writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for (record_id, _) in &orphans {
+                tx.execute("DELETE FROM embeddings WHERE space_id=?1 AND record_id=?2", params![space_id, record_id])?;
+            }
+            tx.commit()?;
+            report.deleted = orphans.len();
+            let touched: HashSet<String> = orphans.iter().map(|(_, namespace)| namespace.clone()).collect();
+            self.0.engine.vectors.invalidate_namespaces(&touched);
+        }
+        // 4. 后生成：缺向量与指纹不符的记录分批补齐。
+        let filled = self.drain(space_id, &entry, batch)?;
+        report.scanned = filled.scanned;
+        report.written = filled.written;
+        report.batches = filled.batches;
+        report.interrupted = filled.interrupted;
+        if report.interrupted.is_some() { self.0.note_degrade(Degrade::EmbedFailed); }
+        // 5. 逐档核对缺口，把补齐的标成就绪。
+        self.verify_and_mark(space_id)?;
         let state = self.0.read()?;
         Ok(WriteReceipt { value: report, revision: storage::current_revision(state.conn())? })
-    }
-
-    /// 一次补齐：补缺口 → 核对并标记就绪。只由使用方显式调 `sync` 触发，库内没有任何线程替它跑。
-    /// 它不碰主库写锁、不提交索引：切片正文取不到（索引还没被写入侧提交）时这一轮跳过，
-    /// 该档停在未就绪，等使用方 `update_index` 之后再调一次 `sync`。索引提交是写入路径的事，与向量化无关。
-    fn fill(&self, space_id: &str, batch: usize) -> Result<SyncReport> {
-        let Some(entry) = self.0.engine.embedders.get(space_id) else { return Ok(SyncReport::default()) };
-        let report = self.drain(space_id, &entry, batch)?;
-        if report.interrupted.is_some() { self.0.note_degrade(Degrade::EmbedFailed); }
-        self.verify_and_mark(space_id)?;
-        Ok(report)
     }
 
     /// 逐档核对缺口并把结果写成就绪标记（该档缺口为 0 才算就绪）。
@@ -1026,51 +1061,4 @@ mod tests {
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3, "限流应当退避重试后成功");
         assert_eq!(throttled.effective_batch, 4, "限流不触发减半");
     }
-}
-
-/// 把主库 `embeddings` 整表搬进外挂库 `vectors.sqlite3`，搬完删掉主库那张表。
-/// 路由字段（namespace/scope/kind/tags/note_id）从主库现算补齐；就绪标记从主库 meta 搬过来。
-/// 幂等：外挂库已建好且主库已无该表时直接返回。
-pub(crate) fn migrate_vectors(root: &std::path::Path, main_conn: &mut Connection) -> Result<()> {
-    let path = root.join("vectors.sqlite3");
-    // 外挂库先建好，再把旧表按批搬过去；搬完主库删表，就绪标记一起带走。
-    let mut vector_conn = open_vector_writer_for_migration(&path)?;
-    vector_conn.execute_batch(include_str!("vectors_schema.sql"))?;
-    // 主库侧把 embeddings 读到内存，再按行写进外挂库——外挂库刚建好时是空的，
-    // 逐行 INSERT 比重写 ATTACH 更直白，行数也不会大到撑不住。
-    let mut stmt = main_conn.prepare("SELECT space_id,record_id,fingerprint,vector FROM embeddings")?;
-    let rows: Vec<(String, i64, String, Vec<u8>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect::<std::result::Result<_, _>>()?;
-    drop(stmt);
-    // 逐行从主库取路由字段，写进外挂库。
-    let tx = vector_conn.transaction()?;
-    for (space_id, record_id, fingerprint, vector) in rows {
-        let (namespace, scope, kind, tags_json, note_id): (String, String, i64, String, i64) = main_conn.query_row(
-            "SELECT n.text,s.text,r.kind,
-                COALESCE((SELECT json_group_array(t.text) FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=r.id),'[]'),
-                COALESCE((SELECT c.note_id FROM chunks c WHERE c.record_id=r.id),0)
-             FROM records r JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id=?1",
-            [record_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
-        tx.execute("INSERT OR REPLACE INTO embeddings(space_id,record_id,namespace,scope,kind,tags_json,note_id,fingerprint,vector)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![space_id, record_id, namespace, scope, kind, tags_json, note_id, fingerprint, vector])?;
-    }
-    // 就绪标记一起搬走：主库 meta 里的 vector_ready:* 挪进 vector_meta。
-    let mut ready_stmt = main_conn.prepare("SELECT key,value FROM meta WHERE key LIKE 'vector_ready:%'")?;
-    let ready_rows: Vec<(String, i64)> = ready_stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
-    drop(ready_stmt);
-    for (key, value) in ready_rows {
-        tx.execute("INSERT OR REPLACE INTO vector_meta(key,value) VALUES (?1,?2)", params![key, value.to_string()])?;
-    }
-    tx.commit()?;
-    // 搬完才删主库表与旧标记。
-    main_conn.execute_batch("DROP TABLE embeddings; DELETE FROM meta WHERE key LIKE 'vector_ready:%';")?;
-    Ok(())
-}
-
-/// 迁移期间向量库的写连接：不开 WAL（文件刚建，还没进 WAL 目录），直接建表写。
-fn open_vector_writer_for_migration(path: &std::path::Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;")?;
-    Ok(conn)
 }

@@ -160,8 +160,8 @@ impl Default for PageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> { pub items: Vec<T>, pub next_cursor: Option<String> }
 
-/// 一次已提交的写入。派生索引不在写入路径上提交——由使用方在合适时机调用
-/// `update_index` 一趟提交并对账收敛；期间读取走自愈兜底，保证仍查得到。
+/// 一次已提交的写入。索引不在写入路径上提交——写入把文档/词条当场攒进 writer，
+/// 由使用方在合适时机调用 `update_index` 一次提交；向量由向量对账照主库重算。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteReceipt<T> {
     pub value: T,

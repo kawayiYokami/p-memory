@@ -160,14 +160,15 @@ kb.embeddings().set_vectorization("demo", "notes", false)?;
 let receipt = kb.memories().upsert(m)?;
 receipt.value;         // 写入结果
 receipt.revision;      // 提交后的库版本
-kb.update_index()?;    // 提交写入攒下的增删并对账收敛索引（写入不就地索引；批量导入后调用一次即可）
+kb.update_index()?;    // 提交写入攒下的索引增删（写入当场攒、这里一次提交；批量写入后调用一次即可）
+kb.reconcile_index()?; // 显式对账：全文索引与主库求差集对齐（停电恢复覆盖不了的残余；稳态下是空操作）
 ```
 
 所有错误是 `p_memory::Error`，`err.code()` 给稳定字符串码，便于跨进程 / 跨语言处理。
 
 ## 存储与备份
 
-一个目录一个库：`store.sqlite3`（权威）+ `vectors.sqlite3`（向量外挂派生库）+ `text-v2/`（派生全文索引，靠对账收敛到主库）+ `writer.lock`。
+一个目录一个库：`store.sqlite3`（权威，记录带停电恢复标记）+ `vectors.sqlite3`（向量外挂派生库）+ `text-v2/`（派生全文索引，写路径当场落位）+ `writer.lock`。
 
 ```rust
 kb.backup("./backup.sqlite3")?;                                  // 在线备份（同时生成 backup.sqlite3.vectors）

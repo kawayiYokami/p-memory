@@ -212,28 +212,60 @@ impl TextIndex {
         Ok(())
     }
 
-    /// 索引是否可能与主库不一致（有攒下未提交的增删，或删过记录尚未对账）。
-    pub fn is_dirty(&self) -> bool { self.dirty.load(Ordering::SeqCst) }
+    /// 索引是否攒有未提交的增删。只由本结构内部维护：`stage` / `stage_deletions` 置位，
+    /// `commit_staged` 提交后清位。它不是关于主库的断言，只是 writer 自己的队列盈亏。
+    fn is_dirty(&self) -> bool { self.dirty.load(Ordering::SeqCst) }
 
-    /// 标脏：记录被删时调用。删除不动索引，只把索引标成「需要重新对账」。
-    pub fn mark_dirty(&self) { self.dirty.store(true, Ordering::SeqCst); }
+    /// 把删除流程就地交来的记录 id 摘出索引：按记录 ID 逐个删词条，尚未提交所以对搜索不可见。
+    /// commit 由 `update_index`（或关闭时的收尾）一次做完。
+    pub fn stage_deletions(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let writer = self.writer.lock();
+        for id in ids { writer.delete_term(Term::from_field_u64(self.fields.key, *id as u64)); }
+        self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 
     /// 把写路径攒下的增删提交落盘。无变更时连提交都不做。
     pub fn commit_staged(&self, conn: &Connection) -> Result<()> {
         let mut writer = self.writer.lock();
-        if !self.dirty.load(Ordering::SeqCst) { return Ok(()); }
+        if !self.is_dirty() { return Ok(()); }
         self.finish(&mut writer, conn, storage::current_revision(conn)?)?;
         self.dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    /// 同步：先把写路径攒下的增删提交（让读者看见），再对账收敛。
-    /// 没有待办账本，也没有第二条路——索引和主库一致与否，只由 `reconcile` 的差集判定。
+    /// 停电恢复：按主库标记把「正在写入」的记录重新折成索引文档攒进 writer。
+    /// 内容一律以主库现状为准，切片正文回源文件重切；笔记自己不占索引文档。
+    /// 正文取不到的记录（源文件已不在）折叠出空正文的文档，不保留标记——
+    /// 稳态由写路径保证对齐，没有「补不上就留标记」这回事。
+    pub fn stage_records(&self, conn: &Connection, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!("SELECT id,namespace_id,kind,scope_id,payload_json FROM records \
+            WHERE id IN ({placeholders}) AND kind<>?");
+        let mut values: Vec<rusqlite::types::Value> = ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+        values.push(rusqlite::types::Value::Integer(RecordKind::Note.code()));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+        let mut documents = Vec::new();
+        let mut files: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut paths: HashMap<i64, (Vec<String>, String)> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let (id, namespace_id, kind_code, scope_id, payload_json) =
+                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?);
+            let Some(kind) = RecordKind::from_code(kind_code) else { continue };
+            if let Some(item) = self.document_for(&mut files, &mut paths, id, namespace_id, scope_id, kind, &payload_json, conn) {
+                documents.push(item);
+            }
+        }
+        self.stage(&documents)
+    }
+
+    /// 提交写入攒下的增删。索引与主库之间没有常设对账：写操作当场把索引改到位，
+    /// 只在停电（主库标记恢复）或下游显式调用时才跑一次 `reconcile` 差集。
     pub fn sync(&self, conn: &Connection) -> Result<()> {
-        self.commit_staged(conn)?;
-        self.reconcile(conn)?;
-        self.dirty.store(false, Ordering::SeqCst);
-        Ok(())
+        self.commit_staged(conn)
     }
 
     /// 从一条记录的原始行折成一个索引文档。切片正文只存在索引里，索引侧补它时回源文件重切；
@@ -491,7 +523,7 @@ mod tests {
     }
 
     /// 删除只摘对应的 doc，不碰别的文档、也不做任何「推倒重来」。对齐下面两条一起看：
-    /// 删两条后同步，索引里恰好少这两个 id，其余仍在。
+    /// 删两条后提交，索引里恰好少这两个 id，其余仍在。
     #[test]
     fn delete_removes_exactly_the_matching_documents() {
         let dir = tempfile::tempdir().unwrap();
@@ -500,37 +532,41 @@ mod tests {
         let index = kb.index().unwrap();
         assert_eq!(index.indexed_ids().unwrap().len(), 5);
 
-        // 删两条，此刻不追索引：主库已删、索引还留着，是允许的短暂不一致。
+        // 删两条：删除流程把词条摘进 writer，此刻不提交：主库已删、索引还留着，是允许的短暂不一致。
         let ids = all_ids(&kb);
-        kb.memories().delete(ids[0], &crate::ReadFilter::default()).unwrap();
-        kb.memories().delete(ids[2], &crate::ReadFilter::default()).unwrap();
+        kb.memories().delete(&[ids[0], ids[2]], &crate::ReadFilter::default()).unwrap();
 
         kb.update_index().unwrap();
         let remaining = index.indexed_ids().unwrap();
-        assert_eq!(remaining.len(), 3, "对账后索引里恰好多出的那两条被摘掉");
+        assert_eq!(remaining.len(), 3, "提交后索引里恰好多出的那两条被摘掉");
         assert!(!remaining.contains(&ids[0]) && !remaining.contains(&ids[2]));
-        assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[3]) && remaining.contains(&ids[4]));
+        assert!(remaining.contains(&ids[1]) && !remaining.contains(&ids[2]) && remaining.contains(&ids[4]));
     }
 
-    /// 删一条、不调 update_index 就丢弃句柄（进程未收尾），重开库也不允许出现任何重建：
-    /// 开库的对账只摘掉那条孤儿 doc，其余文档一个不动。
+    /// 删一条、不调 update_index 就丢弃句柄（进程未收尾）：攒着的词条丢了，主库记录也没了、
+    /// 标记随行消失。重开库不做任何自动对账——孤儿 doc 原样留着，直到下游显式要求对齐，
+    /// 而且对齐只摘那一条，其余文档一个不动。
     #[test]
-    fn reopen_after_delete_does_not_rebuild_the_whole_index() {
+    fn reopen_does_not_reconcile_and_explicit_reconcile_only_touched_the_orphan() {
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::open(dir.path()).unwrap();
         seed(&kb, 4);
         let ids = all_ids(&kb);
-        kb.memories().delete(ids[1], &crate::ReadFilter::default()).unwrap();
+        kb.memories().delete(&[ids[1]], &crate::ReadFilter::default()).unwrap();
         // 不调 update_index，直接丢弃句柄：删除只落在主库，索引里还留着那条 doc。
         drop(kb);
 
         let kb = KnowledgeBase::open(dir.path()).unwrap();
         let remaining = kb.index().unwrap().indexed_ids().unwrap();
-        assert_eq!(remaining.len(), 3, "重开时的对账只摘掉已删那一条");
+        assert_eq!(remaining.len(), 4, "重开库不做自动对账，孤儿 doc 原样留着");
+        // 下游显式对齐：只摘掉已删那一条。
+        kb.reconcile_index().unwrap();
+        let remaining = kb.index().unwrap().indexed_ids().unwrap();
+        assert_eq!(remaining.len(), 3, "显式对账只摘掉已删那一条");
         assert!(remaining.contains(&ids[0]) && remaining.contains(&ids[2]) && remaining.contains(&ids[3]));
     }
 
-    /// 索引文档缺失（模拟上次提交没跟上）时，对账把缺的补回来，其余不动。
+    /// 索引文档缺失（模拟上次提交没跟上）时，重开库不自动补——补齐只发生在下游显式对账。
     /// 这里用「建好索引后删掉索引目录再重开」来制造「索引里什么都缺」的极端情形。
     #[test]
     fn reconcile_restores_missing_documents() {
@@ -541,7 +577,9 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("text-v2")).unwrap();
 
         let kb = KnowledgeBase::open(dir.path()).unwrap();
-        assert_eq!(kb.index().unwrap().indexed_ids().unwrap().len(), 6, "缺的文档应被对账补回");
+        assert_eq!(kb.index().unwrap().indexed_ids().unwrap().len(), 0, "重开库不自动补缺");
+        kb.reconcile_index().unwrap();
+        assert_eq!(kb.index().unwrap().indexed_ids().unwrap().len(), 6, "缺的文档应被显式对账补回");
         let request = SearchRequest { query: "对账测试条目3".into(), kinds: vec![RecordKind::Memory],
             vector: false, rerank: false, ..Default::default() };
         assert!(!kb.search(&request).unwrap().hits.is_empty(), "补回的文档应可检索");

@@ -14,12 +14,15 @@ struct IdRequest { id:i64, #[serde(default)] filter:ReadFilter }
 #[derive(Deserialize)]
 struct IdsRequest { ids: Vec<i64>, #[serde(default)] filter:ReadFilter }
 #[derive(Deserialize)]
+struct GraphIdsRequest { kind:RecordKind, ids: Vec<i64>, #[serde(default)] filter:ReadFilter }
+#[derive(Deserialize)]
 struct GraphId { id:i64, kind:RecordKind, #[serde(default)] filter:ReadFilter }
 
 pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
     match operation {
         "health"=>encode(kb.health()?),
         "update_index"=>encode(kb.update_index()?),
+        "reconcile"=>encode(kb.reconcile_index()?),
         "backup"=>{kb.backup(field::<String>(&args,"path")?)?;Ok(Value::Null)},
         "close"=>{kb.close()?;Ok(Value::Null)},
         "search"=>encode(kb.search(&decode(args)?)?),
@@ -29,15 +32,13 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "memories.upsert_by_judgment"=>encode(kb.memories().upsert_by_judgment(decode(args)?)?),
         "memories.get"=>{let r:IdRequest=decode(args)?;encode(kb.memories().get(r.id,&r.filter)?)},
         "memories.list"=>encode(kb.memories().list(&decode(args)?)?),
-        "memories.delete"=>{let r:IdRequest=decode(args)?;encode(kb.memories().delete(r.id,&r.filter)?)},
-        "memories.delete_by_filter"=>encode(kb.memories().delete_by_filter(&optional::<ReadFilter>(&args,"filter")?)?),
+        "memories.delete"=>{let r:IdsRequest=decode(args)?;encode(kb.memories().delete(&r.ids,&r.filter)?)},
         "memories.feedback"=>encode(kb.memories().feedback(&decode(args)?)?),
         "memories.decay"=>encode(kb.memories().decay(&optional::<ReadFilter>(&args,"filter")?,&optional::<DecayPolicy>(&args,"policy")?,optional(&args,"now_us")?)?),
         "graph.apply_batch"=>encode(kb.graph().apply_batch(&decode(args)?)?),
         "graph.get"=>{let r:GraphId=decode(args)?;encode(kb.graph().get(r.kind,r.id,&r.filter)?)},
         "graph.list"=>encode(kb.graph().list(field(&args,"kind")?,&optional::<PageRequest>(&args,"page")?)?),
-        "graph.delete"=>{let r:GraphId=decode(args)?;encode(kb.graph().delete(r.kind,r.id,&r.filter)?)},
-        "graph.delete_by_filter"=>encode(kb.graph().delete_by_filter(&optional::<ReadFilter>(&args,"filter")?)?),
+        "graph.delete"=>{let r:GraphIdsRequest=decode(args)?;encode(kb.graph().delete(r.kind,&r.ids,&r.filter)?)},
         "graph.resolve"=>encode(kb.graph().resolve(&field::<String>(&args,"name")?,&optional::<ReadFilter>(&args,"filter")?,args.get("limit").cloned().map(decode).transpose()?.unwrap_or(10))?),
         "graph.set_predicate_equivalents"=>encode(kb.graph().set_predicate_equivalents(&field::<String>(&args,"namespace")?,&field::<Vec<Vec<String>>>(&args,"groups")?)?),
         "graph.delete_predicate_equivalents"=>{let namespace=field::<String>(&args,"namespace")?;let predicates=match args.get("predicates"){None|Some(Value::Null)=>None,Some(value)=>Some(decode::<Vec<String>>(value.clone())?)};encode(kb.graph().delete_predicate_equivalents(&namespace,predicates.as_deref())?)},
@@ -51,15 +52,18 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "graph.path"=>encode(kb.graph().path(field::<i64>(&args,"from")?,field::<i64>(&args,"to")?,&optional::<ReadFilter>(&args,"filter")?)?),
         "graph.strongly_connected"=>encode(kb.graph().strongly_connected(&optional::<ReadFilter>(&args,"filter")?)?),
         "graph.component_count"=>encode(kb.graph().build_graph(&optional::<ReadFilter>(&args,"filter")?)?.component_count()),
-        "notes.upsert_file"=>encode(kb.notes().upsert_file(decode(args)?)?),
+        "notes.upsert_file"=>{
+            // 单条与批量两种形状：数组走批量入口（一次写锁整批先删后加），对象按批量一条处理。
+            if let Ok(files)=decode::<Vec<crate::notes::NoteFileInput>>(args.clone()) { encode(kb.notes().upsert_files(&files)?) }
+            else { encode(kb.notes().upsert_file(decode(args)?)?) }
+        },
         "notes.set_root"=>{kb.notes().set_root(&field::<String>(&args,"namespace")?,&field::<String>(&args,"root")?)?;Ok(Value::Null)},
         "notes.unset_root"=>encode(kb.notes().unset_root(&field::<String>(&args,"namespace")?)?),
         "notes.root"=>encode(kb.notes().root(&field::<String>(&args,"namespace")?)?),
         "notes.get"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get(r.id,&r.filter)?)},
         "notes.get_many"=>{let r:IdsRequest=decode(args)?;encode(kb.notes().get_many(&r.ids,&r.filter)?)},
         "notes.list"=>encode(kb.notes().list(&decode(args)?)?),
-        "notes.delete"=>{let r:IdRequest=decode(args)?;encode(kb.notes().delete(r.id,&r.filter)?)},
-        "notes.delete_by_filter"=>encode(kb.notes().delete_by_filter(&optional::<ReadFilter>(&args,"filter")?)?),
+        "notes.delete"=>{let r:IdsRequest=decode(args)?;encode(kb.notes().delete(&r.ids,&r.filter)?)},
         "notes.chunks"=>{let r:IdRequest=decode(args)?;encode(kb.notes().chunks(r.id,&r.filter)?)},
         "notes.get_chunk"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get_chunk(r.id,&r.filter)?)},
         "embeddings.register_space"=>encode(kb.embeddings().register_space(decode(args)?)?),

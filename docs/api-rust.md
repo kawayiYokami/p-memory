@@ -42,7 +42,7 @@ impl KnowledgeBase {
 ### 并发语义
 
 - **一个数据目录在同一时刻只允许一个进程持有写锁**，同进程内可通过 `Clone` 共享句柄。
-- 所有写入走 `mutate`，事务失败即整体回滚；写入不就地索引，由 `update_index()` 一趟提交并对账收敛（见 [architecture](architecture.md)）。
+- 所有写入走 `mutate`（或组合写流程），事务失败即整体回滚；写入把索引文档/词条当场攒进 writer，由 `update_index()` 一趟提交（见 [architecture](architecture.md)）。写操作在主库记录上留「正在写入 / 正在删除」标记，断电后下次开机按标记把没完成的写删按主库现状重做。
 - 写入提交后会清空向量缓存，保证后续检索看到最新向量。
 - **写是串行的，读是并发的**：所有写入共用一把写锁、按到达顺序排队；读取不经过写锁，
   每次从空闲池取一条只读连接（池空则新建），所以同一句柄上的多个读可以真正并行执行。
@@ -51,12 +51,12 @@ impl KnowledgeBase {
 ### 备份与恢复
 
 - `backup(target)`：SQLite 在线备份，主库与向量库分别备份为 `target` 与 `target.vectors`。目标文件已存在时拒绝覆盖（先 `create_new` 占位）。
-- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；同目录存在 `snapshot.vectors` 时一并还原向量库，否则向量路降级待补齐。全文索引目录不随快照复制，打开后由对账从主库补齐。目标目录已存在会失败。
+- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；同目录存在 `snapshot.vectors` 时一并还原向量库，否则向量路降级待补齐。全文索引目录不随快照复制，打开后由 `reconcile_index()` 显式对账从主库补齐。目标目录已存在会失败。
 
 ### 健康检查
 
 - `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
-- `update_index()` 把写入路径攒下的增删提交一次，再对主库算差集收敛索引，返回新的健康报告。写入路径不调用它；批量导入后调用一次即可，期间读取走自愈兜底。
+- `update_index()` 把写入路径攒下的增删提交一次，并清掉「正在写入」标记（删除标记保留，它代表删除没做完），返回新的健康报告。索引提交是写入路径的职责，读取永不代劳。索引与主库的差集对齐只发生在下游显式调用 `reconcile_index()` 时（停电标记恢复覆盖不了的残余，例如绕过 API 直改主库）；稳态下对账是空操作。
 
 ### 注册模型回调
 
@@ -139,8 +139,7 @@ impl MemoryStore {
 
     fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory>;
     fn list(&self, request: &PageRequest) -> Result<Page<Memory>>;
-    fn delete(&self, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>>;
-    fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
+    fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
 
     fn feedback(&self, request: &FeedbackRequest) -> Result<WriteReceipt<FeedbackReport>>;
     fn decay(&self, filter: &ReadFilter, policy: &DecayPolicy, at: Option<i64>) -> Result<WriteReceipt<DecayReport>>;
@@ -150,7 +149,7 @@ impl MemoryStore {
 - `upsert`：按 `id` 更新；未给 `id` 则新建。`state = None` 时保留既有状态。
 - `upsert_many`：批内**全成功或全回滚**。
 - `upsert_by_judgment`：在同一 `namespace`+`scope` 内按归一化论断去重。命中多条同一论断时报 `conflict`（要求改用按 ID 更新）；命中唯一记录时合并 metadata 与 evidence。
-- `delete_by_filter`：删除过滤条件命中的全部记忆，返回删除条数。过滤条件里的 `namespace` 决定删哪个域，`scopes`/`tags` 收窄范围；空命中返回 0，不是错误。记忆没有子表，单条删除与批量删除走同一条删除路径。
+- `delete`：按 id 批量删除记忆，返回实际删除条数。主库查 id，命中才继续；不存在的 id 静默跳过，空批返回 0。
 - `feedback`：`useful_ids` 必须是 `recalled_ids` 的子集。有用项提升强度/计数/有用分；**非固定保留且处于 T1（`tier0 <= score < tier1`）的未命中项减 1 强度**。返回 `FeedbackReport { recalled, boosted, penalized }`。
 - `decay`：对命中的记忆按策略衰减，返回 `DecayReport { decayed, retirement_candidates }`。固定保留的记忆不衰减。详见 [lifecycle](lifecycle.md)。
 
@@ -166,8 +165,7 @@ impl GraphStore {
     fn neighbors(&self, id: i64, filter: &ReadFilter, limit: usize) -> Result<Neighborhood>;
     fn events_for_entity(&self, id: i64, filter: &ReadFilter, limit: usize) -> Result<Vec<Event>>;
 
-    fn delete(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>>;
-    fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
+    fn delete(&self, kind: RecordKind, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
 }
 ```
 
@@ -177,7 +175,7 @@ impl GraphStore {
 - `neighbors` 返回一跳关系与对端实体；标签过滤只约束关系，作用域同时约束端点。
 - `get`/`list`/`delete` 只接受 `Entity`/`Relation`/`Event`，其他类型报 `validation`。
 - 删除被引用的实体或事件参与者关系，由外键 `RESTRICT` 报 `conflict`；调用方须先解除引用。
-- `delete_by_filter`：删除过滤条件命中的全部图记录（实体、关系、事件），返回删除条数。删除顺序固定为**关系 → 事件 → 实体**，级联顺序由库内部保证，调用方不必知道外键怎么连。若某个待删实体仍被过滤条件之外的关系或事件引用，删除被外键拦下、报 `conflict`，整个事务回滚，不做部分删除。
+- `delete`：按 id 批量删除图记录（`kind` 指明实体/关系/事件），返回实际删除条数。主库查 id，命中才继续。若待删实体仍被关系或事件引用，删除被外键拦下、报 `conflict`：主库上的「正在删除」标记保留，引用清掉之后的下次开机把这条删除自动做完。
 
 ## 图搜索
 
@@ -231,19 +229,17 @@ impl NoteStore {
     fn list(&self, page: &PageRequest) -> Result<Page<Note>>;
     fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk>;
     fn chunks(&self, note_id: i64, filter: &ReadFilter) -> Result<Vec<Chunk>>;
-    fn delete(&self, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>>;
-    fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
+    fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
 }
 ```
 
-- `upsert_file` 按给定文件路径同步一篇笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；路径即身份，同一路径定位到同一笔记。监听与对账在使用方，库只处理给到的这一个文件。
+- `upsert_file` / `upsert_files` 按给定文件路径同步笔记：库读文件，正文取文件原文，标题取文件名（去扩展名）；路径即身份。更新不是原位改写，而是「先删后加」：同路径已有笔记，先把旧笔记连同全部切片整条删掉（写锁内落主库标记、删向量行与主库行，出锁后摘索引词条），再当新笔记写入，切片记录全部新开，向量由向量对账照主库重算。下游给的记录 id 一律忽略：笔记身份就是 `(namespace, scope, path)`。批量入口一次写锁整批处理 SQL。
 - `set_root` 登记该领域的笔记根目录（必须是一个已存在的目录），`root` 读回来；落了 `namespace_roots` 表。**根目录是写入笔记的前提**：没登记就写入直接报 `validation`；登记之后写入的路径必须是它的子路径，否则同样报 `validation`，库里存减掉根目录的相对路径，`Note.source` 取回时再拼回绝对路径。
 - **相对路径拆成标签**：目录段原样、文件名去扩展名，与调用方给的标签合并去重，写到这一篇的每一条切片上（库里 `record_tags`，索引里标签文本与标签 id 各一列）。
 - **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。**笔记记录不进索引**，要文件列表按库里的标签翻笔记。
-- 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
-- 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引还没提交就先提交一次）。写入时文件缺失直接报错；索引侧补切片文档时文件缺失只让那批切片正文为空。
-- `delete` 先删切片再删笔记。
-- `delete_by_filter`：删除过滤条件命中的全部笔记，返回删除条数（只计笔记本身，随笔记一起删掉的切片是级联产物、不单独计数）。空命中返回 0。每篇都先删切片再删笔记。
+- 更新后切片记录全部换代：旧切片连同向量在删除阶段消失，新切片以新记录 id 落库。
+- 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引没提交就取不到，写入侧 `update_index` 之后再来）。写入时文件缺失直接报错；停电恢复重折切片文档时文件缺失折叠出空正文的文档，标记照样清掉。
+- `delete`：按 id 批量删除笔记，返回实际删除的记录行数（一篇笔记连带它的切片逐行计）。每篇都先删切片再删笔记。
 - `chunk_text(content, target)` 是公开辅助函数，可脱离数据库单独调用。
 
 ## EmbeddingStore
@@ -268,9 +264,9 @@ impl EmbeddingStore {
 
 - 空间定义不可变；重复注册相同定义幂等。
 - `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
-- `sync(space_id, batch)` 是**批次结束后的补齐**，宿主不参与向量计算。它按固定顺序走完两件事：按缺口分批补齐 → 逐档核对缺口，把缺口为 0 的档标成**就绪**。它不提交索引、不碰主库写锁：切片正文要等写入侧 `update_index` 之后才读得到，未提交的这一轮计入缺口、该档停在未就绪。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
-- `vector_ready(namespace, space_id, target)` 读的是「领域 × 向量空间 × 档位」的就绪标记（落盘在 `meta`），`target` 取 `memory` / `graph` / `notes`，三档各自独立记、各自放行：记忆补完了不表示图谱也补完了。未就绪的档在检索里被剔出向量路，其余已就绪的档照常走向量；三档全被剔才记 `vector_not_ready`。写入、删除记录、改总闸或改档位都会让标记当场作废，要重新走一次 `sync` 核对过才会再标。
-- 写入路径**不产生向量**：`upsert` 一条记忆或笔记只做两件事——入库与把文档写进索引 writer。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一由使用方在批次结束后显式调一次 `sync` 补齐。库里没有后台线程，没人调 `sync` 就一直是缺口、该档停在未就绪。
+- `sync(space_id, batch)` 是**向量对账**（对外写入口之一，显式调用）：取消就绪 → 读向量库、读主库 → 算差异 → 先删后生成 → 核对并标就绪。「需要删的」是向量库里记录已不在主库的孤儿行；「需要生成的」是缺向量与指纹不符的记录。它不提交索引、不碰主库写锁：切片正文要等写入侧 `update_index` 之后才读得到，未提交的这一轮计入缺口、该档停在未就绪。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
+- `vector_ready(namespace, space_id, target)` 读的是「领域 × 向量空间 × 档位」的就绪标记（落盘在 `meta`），`target` 取 `memory` / `graph` / `notes`，三档各自独立记、各自放行：记忆补完了不表示图谱也补完了。未就绪的档在检索里被剔出向量路，其余已就绪的档照常走向量；三档全被剔才记 `vector_not_ready`。对账以「取消就绪」开场，核对过才重标；改总闸或改档位也会让标记当场作废。
+- 写入路径**不产生向量**、不碰向量库：`upsert` / `delete` 只做主库与索引的事。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一由使用方显式调一次 `sync` 对账。库里没有后台线程，没人调 `sync` 就一直是缺口、该档停在未就绪。
 - 补齐是**使用方主动叫一次**的同步动作，不做轮询、不设触发条件：调一次就把当前缺口按批补完，再逐档核对并标成就绪。
 - `namespace_vectorization` / `set_namespace_vectorization` 是某知识域的**总闸**；`vectorization(ns, target)` / `set_vectorization(ns, target, enabled)` 是域内的**档位开关**，`target` 取 `memory` / `graph` / `notes`，三者互不牵连。读数时没设置过的档位落到内置默认（记忆开、图谱开、笔记关），非法档位名报 `validation`。四者都落盘在 `meta` 表。
 - 开关只决定是否生成向量：已有向量保留，检索时按启用档位过滤；总闸关闭时该域既不生成向量、也不走向量路。

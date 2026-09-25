@@ -46,6 +46,7 @@ def sync_and_ready(kb, namespace: str, space_id: str, target: str, budget_s: flo
 def test_memory_roundtrip_is_a_flat_dict(kb):
     """写回、取回、检索三处拿到的都是同一个扁平 dict，记录头字段已平铺。"""
     receipt = kb.memories.upsert_by_judgment(judgment="用户偏好简短回答", tags=["偏好"])
+    kb.update_index()
     memory = receipt["value"]
 
     assert isinstance(memory, dict)
@@ -68,7 +69,9 @@ def test_memory_roundtrip_is_a_flat_dict(kb):
 def test_upsert_by_judgment_deduplicates_within_scope(kb):
     """同一句论断重复写入合并成一条，不产生第二行。"""
     first = kb.memories.upsert_by_judgment(judgment="同一句论断")
+    kb.update_index()
     second = kb.memories.upsert_by_judgment(judgment="同一句论断")
+    kb.update_index()
 
     assert first["value"]["id"] == second["value"]["id"]
     assert kb.health()["record_count"] == 1
@@ -92,7 +95,9 @@ def test_scope_filter_hides_records_written_to_other_scopes(open_kb):
 def test_tags_filter_is_conjunctive(kb):
     """多标签是 AND：只带其中一个标签的记录不会被 tags=[a,b] 选中。"""
     kb.memories.upsert_by_judgment(judgment="带两个标签", tags=["a", "b"])
+    kb.update_index()
     kb.memories.upsert_by_judgment(judgment="只带一个标签", tags=["a"])
+    kb.update_index()
 
     hits = kb.search("标签", filter={"tags": ["a", "b"]})["hits"]
     assert [h["record"]["judgment"] for h in hits] == ["带两个标签"]
@@ -102,6 +107,7 @@ def test_pagination_cursor_walks_every_record_once(kb):
     """游标翻页走完整个集合，不重不漏且按 id 升序。"""
     for i in range(5):
         kb.memories.upsert_by_judgment(judgment=f"分页记录 {i}")
+        kb.update_index()
 
     seen, cursor, pages = [], None, 0
     while True:
@@ -129,12 +135,14 @@ def test_graph_batch_traversal_aliases_and_components(kb):
             {"name": "王五", "entity_type": "person"},
         ],
     )
+    kb.update_index()
     zhang, li, wang = [e["id"] for e in batch["value"]["entities"]]
 
     kb.graph.apply_batch(relations=[
         {"subject_id": zhang, "predicate": "同事", "object_id": li},
         {"subject_id": li, "predicate": "同事", "object_id": wang},
     ])
+    kb.update_index()
 
     # 别名解析回同一个实体，属性与别名都在
     resolved = kb.graph.resolve("小张")
@@ -159,25 +167,30 @@ def test_graph_batch_traversal_aliases_and_components(kb):
 def test_deleting_a_referenced_entity_reports_conflict(kb):
     """被关系引用的实体不能删；解除引用后可以删。"""
     batch = kb.graph.apply_batch(entities=[{"name": "甲"}, {"name": "乙"}])
+    kb.update_index()
     jia, yi = [e["id"] for e in batch["value"]["entities"]]
     kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
+    kb.update_index()
 
     with pytest.raises(ConflictError):
-        kb.graph.delete("entity", jia)
+        kb.graph.delete("entity", [jia])
 
     standalone = kb.graph.apply_batch(entities=[{"name": "丙"}])["value"]["entities"][0]["id"]
-    assert kb.graph.delete("entity", standalone)["value"] is True
+    kb.update_index()
+    assert kb.graph.delete("entity", [standalone])["value"] == 1
     with pytest.raises(NotFoundError):
         kb.graph.get("entity", standalone)
+        kb.update_index()
 
 
 # ── 笔记 ──────────────────────────────────────────────────────────────
 
-def test_note_chunks_are_line_ranges_and_reuse_ids(kb, tmp_path):
-    """切片行号从 1 起；同一路径追加内容时复用未变切片的 id，并删掉失效切片。"""
+def test_note_chunks_are_line_ranges_and_regenerate_on_update(kb, tmp_path):
+    """切片行号从 1 起；更新是先删后加：同一路径仍是同一篇，但记录与切片全部换代。"""
     path = tmp_path / "a.md"
     path.write_text("A段\n\nB段\n\nC段", encoding="utf-8", newline="")
     first = kb.notes.upsert_file(path=str(path))
+    kb.update_index()
     note_id = first["value"]["id"]
     chunks = kb.notes.chunks(note_id)
 
@@ -187,11 +200,12 @@ def test_note_chunks_are_line_ranges_and_reuse_ids(kb, tmp_path):
 
     path.write_text("A段\n\nB段\n\nC段\n\nD段", encoding="utf-8", newline="")
     second = kb.notes.upsert_file(path=str(path))
-    assert second["value"]["id"] == note_id, "同一路径应复用同一条笔记"
+    kb.update_index()
+    assert second["value"]["id"] != note_id, "先删后加：笔记记录随更新换代"
 
-    grown = kb.notes.chunks(note_id)
+    grown = kb.notes.chunks(second["value"]["id"])
     assert [c["ordinal"] for c in grown] == [0, 1, 2, 3]
-    assert [c["id"] for c in grown][:3] == [c["id"] for c in chunks], "未变切片应复用原 id"
+    assert {c["id"] for c in grown}.isdisjoint({c["id"] for c in chunks}), "切片记录全部新开，向量由对账重算"
 
 
 def test_note_rejects_out_of_range_chunk_size(kb, tmp_path):
@@ -200,6 +214,8 @@ def test_note_rejects_out_of_range_chunk_size(kb, tmp_path):
     path.write_text("正文", encoding="utf-8", newline="")
     with pytest.raises(ValidationError):
         kb.notes.upsert_file(path=str(path), chunk_chars=5)
+        kb.update_index()
+        kb.update_index()
 
 
 def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
@@ -209,6 +225,9 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
     path.write_text(raw, encoding="utf-8", newline="")
 
     note = kb.notes.upsert_file(path=str(path))["value"]
+    kb.update_index()
+    kb.update_index()
+    kb.update_index()
     assert note["title"] == "世界观"
     assert note["source"] == str(path), "路径即身份"
     assert kb.search("独有措辞", kinds=["chunk"])["hits"], "清洗后的文本仍可检索"
@@ -216,14 +235,22 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
 
     path.write_text("改过的正文 **新词** 在这里。", encoding="utf-8", newline="")
     updated = kb.notes.upsert_file(path=str(path))["value"]
-    assert updated["id"] == note["id"], "同一路径复用同一笔记"
+    kb.update_index()
+    kb.update_index()
+    kb.update_index()
+    assert updated["id"] != note["id"], "先删后加：笔记记录随更新换代"
+    assert kb.search("新词", kinds=["chunk"])["hits"], "更新后的正文进入索引"
 
     with pytest.raises(PMemoryError):
         kb.notes.upsert_file(path=str(tmp_path / "nope.md"))
+        kb.update_index()
+        kb.update_index()
     bad = tmp_path / "bad.md"
     bad.write_bytes(b"\xff\xfe\xfd")
     with pytest.raises(PMemoryError):
         kb.notes.upsert_file(path=str(bad))
+        kb.update_index()
+        kb.update_index()
 
 
 def test_notes_get_many_batches_and_skips_missing(kb, tmp_path):
@@ -233,9 +260,12 @@ def test_notes_get_many_batches_and_skips_missing(kb, tmp_path):
     a.write_text("甲正文", encoding="utf-8", newline="")
     b.write_text("乙正文", encoding="utf-8", newline="")
     note_a = kb.notes.upsert_file(path=str(a))["value"]
+    kb.update_index()
     note_b = kb.notes.upsert_file(path=str(b))["value"]
+    kb.update_index()
 
     batch = kb.notes.get_many([note_a["id"], note_b["id"]])
+    kb.update_index()
     assert set(batch) == {note_a["id"], note_b["id"]}
     assert batch[note_a["id"]] == kb.notes.get(note_a["id"])
     assert batch[note_b["id"]] == kb.notes.get(note_b["id"])
@@ -252,12 +282,15 @@ def test_chunks_from_one_note_collapse_with_the_note_total(kb, tmp_path):
     many = tmp_path / "对话.md"
     many.write_text("派蒙" * 800, encoding="utf-8", newline="")
     many_note = kb.notes.upsert_file(path=str(many))["value"]
+    kb.update_index()
     many_chunks = kb.notes.chunks(many_note["id"])
+    kb.update_index()
     assert len(many_chunks) > 1, "这篇应当切成多片"
 
     once = tmp_path / "独白.md"
     once.write_text("派蒙", encoding="utf-8", newline="")
     once_note = kb.notes.upsert_file(path=str(once))["value"]
+    kb.update_index()
 
     hits = kb.search("派蒙", kinds=["chunk"], limit=50)["hits"]
     by_note = {hit["record"]["note_id"]: hit for hit in hits}
@@ -291,8 +324,10 @@ def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(
     kb.notes.set_root("default", root)
     assert kb.notes.root("default") == str(root).replace("\\", "/")
     note = kb.notes.upsert_file(path=str(path))["value"]
+    kb.update_index()
 
     path.unlink()
+    kb.update_index()
     chunks = kb.notes.chunks(note["id"])
     assert [c["content"] for c in chunks] == ["苹果 香蕉 橘子"], "正文在索引里，源文件没了也读得到"
     assert [c["tags"] for c in chunks] == [["绝区零", "角色", "雅"]], "路径段标签挂在切片记录上"
@@ -307,6 +342,8 @@ def test_note_body_lives_in_the_index_and_the_first_chunk_carries_the_path_tags(
     outside.write_text("根目录之外", encoding="utf-8", newline="")
     with pytest.raises(PMemoryError):
         kb.notes.upsert_file(path=str(outside))
+        kb.update_index()
+        kb.update_index()
 
 
 # ── 向量与重排 ────────────────────────────────────────────────────────
@@ -326,9 +363,11 @@ def test_embedder_registers_validates_and_search_embeds_query(kb):
 
     # 还没有模型可用：写入照样成功，一行向量都不产生。
     target = kb.memories.upsert_by_judgment(judgment="需要向量化的记忆")["value"]["id"]
+    kb.update_index()
     assert kb.embeddings.vector_ready("default", "e5", "memory") is False, "还没补过，谈不上就绪"
 
     gated = kb.search("向量化", embed_space="e5", text=False, rerank=False)
+    kb.update_index()
     assert gated["hits"] == [] and "vector_not_ready" in gated["diagnostics"]["degraded"]
 
     # 接上回调：注册只绑定模型，不会自己去补缺口。
@@ -338,6 +377,8 @@ def test_embedder_registers_validates_and_search_embeds_query(kb):
     # 模型已就位的情况下再写一条：调用方这条线程上依然一次模型都不调。
     before = len(mine)
     kb.memories.upsert_by_judgment(judgment="第二条需要向量化的记忆")
+    kb.update_index()
+    kb.update_index()
     mine = [length for name, length in calls if name == threading.current_thread().name]
     assert len(mine) == before, "写入不碰模型"
     assert sync_and_ready(kb, "default", "e5", "memory"), "使用方调 sync 之后才放行"
@@ -365,6 +406,8 @@ def test_namespace_vectorization_switch_is_per_namespace(kb):
     assert kb.embeddings.namespace_vectorization("default") is True
 
     kb.memories.upsert_by_judgment(judgment="另一个域的内容", namespace="other")
+    kb.update_index()
+    kb.update_index()
     kb.embeddings.set_namespace_vectorization("other", False)
     assert kb.embeddings.namespace_vectorization("other") is False
 
@@ -393,6 +436,8 @@ def test_vectorization_targets_are_independent(kb, tmp_path):
 
     # 关掉的那档不生成向量，也不进向量路；全文路照常给结果。
     kb.memories.upsert_by_judgment(judgment="关掉记忆档之后写入的内容")
+    kb.update_index()
+    kb.update_index()
     muted = kb.search("关掉记忆档之后写入的内容", kinds=["memory"], embed_space="v", text=False)
     assert muted["hits"] == []
     assert muted["diagnostics"]["vector_used"] is False, "该档关闭时向量路整条不走"
@@ -413,6 +458,8 @@ def test_reranker_reorders_and_reports_diagnostics(kb):
     """重排回调在两路候选合并之后生效，截断与是否重排都写进诊断；总量按过滤后统计。"""
     for i in range(4):
         kb.memories.upsert_by_judgment(judgment=f"重排对象 {i}")
+        kb.update_index()
+        kb.update_index()
 
     baseline = [h["key"]["id"] for h in kb.search("重排对象", vector=False, rerank=False)["hits"]]
     assert len(baseline) == 4
@@ -441,7 +488,9 @@ def test_reranker_reorders_and_reports_diagnostics(kb):
 def test_lifecycle_reports_candidates_without_deleting(kb):
     """衰减只产出候选，不删数据；固定保留项不进候选，强度也不变。"""
     ordinary = kb.memories.upsert_by_judgment(judgment="普通记忆")["value"]["id"]
+    kb.update_index()
     pinned = kb.memories.upsert_by_judgment(judgment="固定保留的记忆", state={"pinned": True})["value"]["id"]
+    kb.update_index()
     before = kb.health()["record_count"]
 
     far_future = 1_900_000_000_000_000  # 微秒
@@ -458,6 +507,7 @@ def test_lifecycle_reports_candidates_without_deleting(kb):
 def test_feedback_boosts_useful_recall(kb):
     """被标记为有用的召回项提升强度与计数。"""
     target = kb.memories.upsert_by_judgment(judgment="被反馈的记忆")["value"]["id"]
+    kb.update_index()
     report = kb.memories.feedback([target], [target])["value"]
 
     assert report == {"recalled": 1, "boosted": 1, "penalized": 0}
@@ -465,6 +515,7 @@ def test_feedback_boosts_useful_recall(kb):
     assert state["strength"] == 2
     assert state["useful_count"] == 1
     assert state["useful_score"] == pytest.approx(2.5)
+    kb.update_index()
 
 
 # ── 健康、备份与错误映射 ──────────────────────────────────────────────
@@ -489,12 +540,16 @@ def test_health_exposes_core_counters(kb):
 def test_backup_and_restore_roundtrip(kb, tmp_path):
     """备份出独立快照，restore 到新目录后数据与索引都可用。"""
     kb.memories.upsert_by_judgment(judgment="备份里的记忆")
+    kb.update_index()
+    kb.update_index()
     snapshot = tmp_path / "snapshot.sqlite3"
     kb.backup(str(snapshot))
     assert snapshot.exists()
 
     restored = KnowledgeBase.restore(str(snapshot), str(tmp_path / "restored"))
     try:
+        # 快照只备份 SQLite：派生索引由显式对账从权威重建出来。
+        restored.reconcile_index()
         assert [h["record"]["judgment"] for h in restored.search("备份")["hits"]] == ["备份里的记忆"]
         assert restored.health()["record_count"] == 1
     finally:
@@ -537,6 +592,7 @@ def test_async_facade_mirrors_the_sync_store(tmp_path):
     async def scenario() -> list[str]:
         async with await AsyncKnowledgeBase.open(str(tmp_path / "async")) as kb:
             await kb.memories.upsert_by_judgment(judgment="异步写入的记忆")
+            await kb.update_index()
             hits = await kb.search("异步")
             assert (await kb.health())["record_count"] == 1
             return [h["record"]["judgment"] for h in hits["hits"]]
@@ -599,6 +655,7 @@ def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
     """预设检索：记忆、图谱、笔记各占一个字段，互不混排；图谱走实体 → 关系 → 事件。"""
     created = kb.graph.apply_batch(entities=[{"name": "朱樱"}, {"name": "白露"},
                                              {"name": "青萍"}, {"name": "玄霜"}])["value"]["entities"]
+    kb.update_index()
     ids = {item["name"]: item["id"] for item in created}
     kb.graph.apply_batch(
         relations=[
@@ -611,10 +668,16 @@ def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
             {"name": "堂中自语", "participants": [ids["青萍"]]},
         ],
     )
+    kb.update_index()
+    kb.update_index()
     kb.memories.upsert({"judgment": "朱樱的同学是青萍"})
+    kb.update_index()
+    kb.update_index()
     path = tmp_path / "预设笔记.md"
     path.write_text("朱樱的同学是青萍" * 20, encoding="utf-8", newline="")
     kb.notes.upsert_file(path=str(path))
+    kb.update_index()
+    kb.update_index()
 
     rag = kb.search_preset("rag", "朱樱和白露的同学是谁")
     assert kb_judgments(kb) and [item["record"]["judgment"] for item in rag["memories"]], "记忆那一路有结果"
@@ -635,6 +698,8 @@ def test_search_preset_keeps_the_three_fields_apart(kb, tmp_path):
 def test_event_sink_receives_search_events(kb):
     """注册事件回调后，一次检索收到一条 `search` 事件；注销后不再产出。"""
     kb.memories.upsert_by_judgment(judgment="事件流 甲")
+    kb.update_index()
+    kb.update_index()
     events: list[dict] = []
     kb.register_event_sink(events.append)
     assert kb.event_sink_registered()
@@ -658,6 +723,8 @@ def test_event_sink_receives_search_events(kb):
 def test_event_sink_swallows_callback_errors(kb):
     """回调抛异常只丢这一条事件，检索照常返回同样的结果。"""
     kb.memories.upsert_by_judgment(judgment="事件抛错 甲")
+    kb.update_index()
+    kb.update_index()
     options = {"kinds": ["memory"], "vector": False, "rerank": False}
     baseline = [hit["key"]["id"] for hit in kb.search("事件抛错", **options)["hits"]]
 
@@ -677,7 +744,9 @@ def test_note_ids_limit_the_search_to_the_given_notes(kb, tmp_path):
     first.write_text("harbor的契约与地契", encoding="utf-8", newline="")
     second.write_text("harbor的商船与货单", encoding="utf-8", newline="")
     a = kb.notes.upsert_file(path=str(first))["value"]["id"]
+    kb.update_index()
     b = kb.notes.upsert_file(path=str(second))["value"]["id"]
+    kb.update_index()
 
     everything = kb.search("harbor", kinds=["chunk"], limit=50)["hits"]
     assert {hit["record"]["note_id"] for hit in everything} == {a, b}, "不限定范围时两篇都命中"
@@ -689,42 +758,53 @@ def test_note_ids_limit_the_search_to_the_given_notes(kb, tmp_path):
     assert kb.search("harbor", kinds=["chunk"], filter={"note_ids": [10**9]}, limit=50)["hits"] == [], "不存在的笔记 id 给空结果"
 
 
-# ── 按过滤批量删除 ────────────────────────────────────────────────────
+# ── 批量删除（按 id） ──────────────────────────────────────────────────
 
 def test_batch_delete_clears_a_memory_domain_in_one_call(kb):
-    """一条命令清掉整个域，返回删除条数。"""
+    """按 id 批量删，返回实际删除条数；单条也是批量的一种。"""
     kb.memories.upsert_many([{"judgment": f"待清的记忆 {i}"} for i in range(3)])
-    assert kb.memories.delete_by_filter()["value"] == 3
+    kb.update_index()
+    kb.update_index()
+    ids = [item["id"] for item in kb.memories.list()["items"]]
+    assert kb.memories.delete(ids)["value"] == 3
     assert kb.memories.list()["items"] == []
+    assert kb.memories.delete([])["value"] == 0
 
 
 def test_batch_delete_takes_graph_edges_along(kb):
-    """图谱域清空时实体与它的边一起走，不留下半截状态。"""
+    """图谱按 id 删：先删边再删点，外键不会拦。"""
     batch = kb.graph.apply_batch(entities=[{"name": "甲"}, {"name": "乙"}])
+    kb.update_index()
+    kb.update_index()
     jia, yi = [e["id"] for e in batch["value"]["entities"]]
-    kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
-    # 计数是实体加关系，边本身是级联产物。
-    assert kb.graph.delete_by_filter()["value"] == 3
+    edge = kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
+    kb.update_index()
+    kb.update_index()
+    relation_id = edge["value"]["relations"][0]["id"]
+    assert kb.graph.delete("relation", [relation_id])["value"] == 1
+    assert kb.graph.delete("entity", [jia, yi])["value"] == 2
     for kind in ("entity", "relation", "event"):
         assert kb.graph.list(kind)["items"] == []
 
 
 def test_batch_delete_of_notes_takes_chunks_along(kb, tmp_path):
-    """删笔记连同它的切片，切片不会变成孤儿。"""
+    """删笔记连同它的切片，切片不会变成孤儿；计数按删除的记录行数。"""
     path = tmp_path / "n.md"
     path.write_text("笔记正文里的独有措辞", encoding="utf-8", newline="")
     note_id = kb.notes.upsert_file(path=str(path))["value"]["id"]
+    kb.update_index()
     chunk_id = kb.notes.chunks(note_id)[0]["id"]
-    assert kb.notes.delete_by_filter()["value"] == 1
+    assert kb.notes.delete([note_id])["value"] == 2
     with pytest.raises(NotFoundError):
         kb.notes.get_chunk(chunk_id)
+        kb.update_index()
 
 
 def test_batch_delete_without_matches_returns_zero(kb):
-    """空命中不是错误。"""
-    assert kb.memories.delete_by_filter()["value"] == 0
-    assert kb.graph.delete_by_filter()["value"] == 0
-    assert kb.notes.delete_by_filter()["value"] == 0
+    """未命中的 id 静默跳过，不是错误。"""
+    assert kb.memories.delete([999_999])["value"] == 0
+    assert kb.graph.delete("entity", [999_999])["value"] == 0
+    assert kb.notes.delete([999_999])["value"] == 0
 
 
 def test_predicate_equivalents_can_be_deleted(kb):
@@ -771,10 +851,19 @@ def test_import_ledger_row_can_be_removed(open_kb, tmp_path):
 def test_record_scope_can_change(kb):
     """作用域可以改；图里被关系引用的实体不能直接换域。"""
     id_ = kb.memories.upsert({"judgment": "换作用域"})["value"]["id"]
+    kb.update_index()
     kb.memories.upsert({"id": id_, "judgment": "换作用域", "scope": "private"})
+    kb.update_index()
+    kb.update_index()
     assert kb.memories.get(id_, filter={"scopes": ["private"]})["scope"] == "private"
     batch = kb.graph.apply_batch(entities=[{"name": "甲"}, {"name": "乙"}])
+    kb.update_index()
+    kb.update_index()
     jia, yi = [e["id"] for e in batch["value"]["entities"]]
     kb.graph.apply_batch(relations=[{"subject_id": jia, "predicate": "同事", "object_id": yi}])
+    kb.update_index()
+    kb.update_index()
     with pytest.raises(ConflictError):
         kb.graph.apply_batch(entities=[{"id": jia, "name": "甲", "scope": "private"}])
+        kb.update_index()
+        kb.update_index()

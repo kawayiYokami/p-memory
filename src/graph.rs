@@ -230,7 +230,8 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<crat
                 .map(|list| list.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default();
             let fingerprint = storage::record_fingerprint(&body, &tags);
             let revision = storage::next_revision(conn, key.id)?;
-            conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5) WHERE id=?1",
+            // 正文与向量都改了；标上「正在写入」，停电后按主库现状把这条的索引文档重折一遍。
+            conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5),status=1 WHERE id=?1",
                 params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
             conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1", [key.id])?;
             // 正文与向量都改了，这个领域的向量分区跟着变。
@@ -243,14 +244,7 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<crat
 
 impl GraphStore {
     pub fn apply_batch(&self, batch: &GraphBatch) -> Result<WriteReceipt<GraphBatchResult>> {
-        let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
-        let receipt = self.0.mutate(|tx| {
-            let (result, staged) = apply_batch(tx, batch)?;
-            documents = staged;
-            Ok(result)
-        })?;
-        self.0.index_documents(&documents)?;
-        Ok(receipt)
+        self.0.mutate(|tx| apply_batch(tx, batch))
     }
     pub fn get(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<serde_json::Value> {
         if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
@@ -385,29 +379,17 @@ impl GraphStore {
         }
         Ok(events)
     }
-    pub fn delete(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>> {
-        if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
-        self.0.mutate(|tx| {
-            let key = RecordKey { id };
-            if !storage::matches_filter(tx, &key, filter)? { return Err(Error::NotFound(id.to_string())); }
-            storage::delete_record(tx, &key)
-        })
-    }
-    /// 删除过滤条件命中的全部图记录（实体、关系、事件），返回删除条数。
-    ///
-    /// 顺序固定为**关系 → 事件 → 实体**：关系与事件的参与行都以 RESTRICT 引用实体，
-    /// 先删边再删点，级联顺序由这里保证，调用方不必知道外键怎么连。
-    /// 若某个待删实体仍被过滤条件之外的关系或事件引用，删除会被外键拦下并返回 `Conflict`，
-    /// 整个事务回滚，不做部分删除。
-    pub fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
-        self.0.mutate(|tx| {
-            let mut removed = 0;
-            for kind in [RecordKind::Relation, RecordKind::Event, RecordKind::Entity] {
-                for id in storage::select_ids(tx, filter, &[kind])? {
-                    if storage::delete_record(tx, &RecordKey { id })? { removed += 1; }
-                }
-            }
-            Ok(removed)
-        })
+    /// 批量删除图记录：主库查 id，命中才继续；单条也是批量的一种。
+    /// 主库标记先行 → 删向量行与主库行（权威落）→ 出写锁摘索引词条；
+    /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
+    /// 实体仍被关系或事件引用时，删除被外键拦下返回 `Conflict`：
+    /// 标记留在主库，引用清掉之后的下次开机会把这条删除自动做完。
+    pub fn delete(&self, kind: RecordKind, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
+        if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) {
+            return Err(Error::Validation("expected a graph record kind".into()));
+        }
+        let removed = self.0.delete_flow(ids, filter, kind, |_, _| Ok(Vec::new()))?;
+        let revision = storage::current_revision(self.0.read()?.conn())?;
+        Ok(WriteReceipt { value: removed, revision })
     }
 }

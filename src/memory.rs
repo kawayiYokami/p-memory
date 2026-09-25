@@ -116,22 +116,18 @@ pub(crate) fn as_input(memory: &Memory, at: i64) -> MemoryInput {
 
 impl MemoryStore {
     pub fn upsert(&self, input: MemoryInput) -> Result<WriteReceipt<Memory>> {
-        let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
-        let WriteReceipt { value: (memory, document), revision } = receipt;
-        // 写入只做两件事：入库（上面的 mutate）与把索引文档交给 writer。
+        // 入库走一次写锁（见 `mutate`）；索引文档在写锁外交给索引 writer。
         // 索引提交交给 `update_index`，向量化交给使用方调 `embeddings().sync`。
-        self.0.index_documents(&[document])?;
-        Ok(WriteReceipt { value: memory, revision })
+        self.0.mutate(|tx| upsert(tx, &input).map(|(memory, document)| (memory, vec![document])))
     }
     pub fn upsert_many(&self, inputs: &[MemoryInput]) -> Result<WriteReceipt<Vec<Memory>>> {
-        let receipt = self.0.mutate(|tx| inputs.iter().map(|input| upsert(tx, input)).collect::<Result<Vec<_>>>())?;
-        let WriteReceipt { value, revision } = receipt;
-        let (memories, documents): (Vec<Memory>, Vec<crate::index::IndexDocument>) = value.into_iter().unzip();
-        self.0.index_documents(&documents)?;
-        Ok(WriteReceipt { value: memories, revision })
+        self.0.mutate(|tx| {
+            let pairs = inputs.iter().map(|input| upsert(tx, input)).collect::<Result<Vec<_>>>()?;
+            Ok(pairs.into_iter().unzip())
+        })
     }
     pub fn upsert_by_judgment(&self, mut input: MemoryInput) -> Result<WriteReceipt<Memory>> {
-        let receipt = self.0.mutate(|tx| {
+        self.0.mutate(|tx| {
             let mut stmt = tx.prepare("SELECT id FROM records WHERE namespace_id=(SELECT id FROM strings WHERE text=?1)
                 AND scope_id=(SELECT id FROM strings WHERE text=?2) AND kind=?3 AND json_extract(payload_json,'$.judgment_key')=?4 ORDER BY id LIMIT 2")?;
             let ids = stmt.query_map(params![text::normalized_tag(&input.record.namespace), text::normalized_tag(&input.record.scope),
@@ -147,11 +143,8 @@ impl MemoryStore {
                 input.record.metadata = metadata;
                 if input.record.evidence.is_empty() { input.record.evidence = existing.header.evidence; }
             }
-            upsert(tx, &input)
-        })?;
-        let WriteReceipt { value: (memory, document), revision } = receipt;
-        self.0.index_documents(&[document])?;
-        Ok(WriteReceipt { value: memory, revision })
+            upsert(tx, &input).map(|(memory, document)| (memory, vec![document]))
+        })
     }
     pub fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory> {
         let state = self.0.read()?;
@@ -160,30 +153,20 @@ impl MemoryStore {
     pub fn list(&self, request: &PageRequest) -> Result<Page<Memory>> {
         storage::list(self.0.read()?.conn(), RecordKind::Memory, request)
     }
-    pub fn delete(&self, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>> {
-        self.0.mutate(|tx| {
-            let key = RecordKey { id };
-            if !storage::matches_filter(tx, &key, filter)? { return Err(Error::NotFound(id.to_string())); }
-            storage::delete_record(tx, &key)
-        })
-    }
-    /// 删除过滤条件命中的全部记忆，返回删除条数。空命中返回 0。
-    /// 记忆没有子表，删一条与删一批走的是同一个 `delete_record`。
-    pub fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
-        self.0.mutate(|tx| {
-            let mut removed = 0;
-            for id in storage::select_ids(tx, filter, &[RecordKind::Memory])? {
-                if storage::delete_record(tx, &RecordKey { id })? { removed += 1; }
-            }
-            Ok(removed)
-        })
+    /// 批量删除记忆：主库查 id，命中才继续；单条也是批量的一种。
+    /// 写锁内落主库标记、删向量行与主库行，出锁后摘索引词条；
+    /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
+    pub fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
+        let removed = self.0.delete_flow(ids, filter, RecordKind::Memory, |_, _| Ok(Vec::new()))?;
+        let revision = storage::current_revision(self.0.read()?.conn())?;
+        Ok(WriteReceipt { value: removed, revision })
     }
     pub fn feedback(&self, request: &FeedbackRequest) -> Result<WriteReceipt<FeedbackReport>> {
         request.policy.validate()?;
         let recalled: BTreeSet<_> = request.recalled_ids.iter().copied().collect();
         let useful: BTreeSet<_> = request.useful_ids.iter().copied().collect();
         if !useful.is_subset(&recalled) { return Err(Error::Validation("useful_ids must be a subset of recalled_ids".into())); }
-        let receipt = self.0.mutate(|tx| {
+        self.0.mutate(|tx| {
             let mut report = FeedbackReport { recalled: recalled.len(), ..Default::default() };
             let mut documents = Vec::new();
             let at = request.now_us.unwrap_or_else(storage::now_us);
@@ -204,14 +187,11 @@ impl MemoryStore {
                 documents.push(document);
             }
             Ok((report, documents))
-        })?;
-        let WriteReceipt { value: (report, documents), revision } = receipt;
-        self.0.index_documents(&documents)?;
-        Ok(WriteReceipt { value: report, revision })
+        })
     }
     pub fn decay(&self, filter: &ReadFilter, policy: &DecayPolicy, at: Option<i64>) -> Result<WriteReceipt<DecayReport>> {
         policy.validate()?;
-        let receipt = self.0.mutate(|tx| {
+        self.0.mutate(|tx| {
             let at = at.unwrap_or_else(storage::now_us);
             let keys = storage::select_keys(tx, filter, &[RecordKind::Memory], usize::MAX, None)?;
             let cycle = i128::from(policy.tier0_cycle_days) * 86_400_000_000;
@@ -234,9 +214,6 @@ impl MemoryStore {
                 if memory.state.strength == 0 && policy.tier(memory.state.useful_score) < 2 { report.retirement_candidates.push(key); }
             }
             Ok((report, documents))
-        })?;
-        let WriteReceipt { value: (report, documents), revision } = receipt;
-        self.0.index_documents(&documents)?;
-        Ok(WriteReceipt { value: report, revision })
+        })
     }
 }

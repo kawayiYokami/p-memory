@@ -388,8 +388,12 @@ fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut
         conn.execute("INSERT INTO namespace_roots(namespace_id,root) VALUES (?1,?2) ON CONFLICT(namespace_id) DO UPDATE SET root=excluded.root",
             params![namespace_id, root])?;
     }
-    for draft in &plan.notes { let (note,staged)=notes::sync_file(conn,&draft.input)?; documents.extend(staged);
-        mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id}); }
+    for draft in &plan.notes {
+        let split=notes::chunk_text(&std::fs::read_to_string(&draft.input.path)?,draft.input.chunk_chars)?;
+        let prepared=notes::prepare_note(conn,&draft.input,split)?;
+        let (note,staged)=notes::add_note(conn,&prepared)?; documents.extend(staged);
+        mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id});
+    }
     Ok(())
 }
 /// Dry run validates in an in-memory database without creating the destination.
@@ -434,10 +438,9 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
         if count!=0{return Err(Error::Conflict("destination became nonempty during import".into()))}
         let mut mappings=Vec::new();report.conflicts.clear();apply(tx,&plan,&mut mappings,&mut report.conflicts,&mut documents)?;report.id_map=mappings;report.applied=true;
         tx.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES (?1,?2,?3)",params![req.source_id,fingerprint,serde_json::to_string(&report)?])?;
-        Ok(())
+        Ok(((), std::mem::take(&mut documents)))
     })?;
-    // 导入只写数据，不逐条索引；导入时切好的正文在这里一次性交给索引，收尾显式提交并对账一次。
-    kb.index_documents(&documents)?;
+    // 导入只写数据、不逐条索引；导入时切好的正文由 `mutate` 在写锁外交给索引，收尾显式提交一次。
     match kb.update_index() { Ok(_) => {}, Err(error) => report.index_error = Some(error.to_string()) }
     report.index_ready = report.index_error.is_none();
     kb.write(|writer| Ok(writer.conn.execute("UPDATE import_runs SET report_json=?2 WHERE source_id=?1",params![req.source_id,serde_json::to_string(&report)?])?))?;

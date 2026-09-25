@@ -2,7 +2,7 @@ use crate::{storage::{self, KnowledgeBase}, text, types::*, Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn default_chunk_chars() -> usize { 220 }
@@ -117,96 +117,67 @@ pub fn chunk_text(content: &str, target: usize) -> Result<Vec<TextChunk>> {
     Ok(chunks)
 }
 
-pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Note, Vec<crate::index::IndexDocument>)> {
-    let content = std::fs::read_to_string(&input.path)?;
+/// 一篇笔记写入前的就绪形态：正文已读、切片已切、路径与标签已按库内规则解析。
+/// 组合写流程（先删后加）在动任何派生数据之前把它备齐，删除落地之后的新增不再有失败窗口。
+pub(crate) struct PreparedNote {
+    pub record: RecordInput,
+    pub namespace_id: i64, pub scope_id: i64, pub source: String,
+    pub given: String, pub title: String, pub split: Vec<TextChunk>,
+    pub chunk_chars: usize,
+}
+
+/// 读文件、切切片、解析领域与路径。term_id 的字典登记随调用方的事务提交。
+pub(crate) fn prepare_note(conn: &Connection, input: &NoteFileInput, split: Vec<TextChunk>) -> Result<PreparedNote> {
     let given = input.path.to_string_lossy().into_owned();
-    let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     storage::validate_identity("source", &given)?;
-    let split = chunk_text(&content, input.chunk_chars)?;
-    let mut record = input.record.clone();
-    let namespace_id = storage::term_id(conn, &record.namespace)?;
-    let scope_id = storage::term_id(conn, &record.scope)?;
+    let namespace_id = storage::term_id(conn, &input.record.namespace)?;
+    let scope_id = storage::term_id(conn, &input.record.scope)?;
     // 领域必须登记根目录：写入路径与它比对前缀，不重合直接拒绝、重合的部分裁掉。
     // 库里存的永远是相对路径——项目从头到尾不知道前面的绝对路径是什么。
     let root = storage::namespace_root(conn, namespace_id)?.ok_or_else(|| Error::Validation(
-        format!("namespace {} has no registered domain root; call notes.set_root before upserting notes", record.namespace)))?;
+        format!("namespace {} has no registered domain root; call notes.set_root before upserting notes", input.record.namespace)))?;
     let source = relative_note_path(&root, &given)?;
+    let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     let (dirs, split_stem) = storage::split_note_path(&source);
     // 文件名以写入时取好的 `title`（`file_stem`）为准，与落库的 `notes.name` 同源；
     // `split_note_path` 只用来取目录段。
     let stem = if title.is_empty() { split_stem } else { title.clone() };
     // 这一份标签挂到这篇的每一条切片上：调用方给的 + 路径拆出来的。
-    let mut merged = record.tags.clone();
-    merged.extend(dirs.iter().cloned());
-    if !stem.is_empty() { merged.push(stem.clone()); }
-    record.tags = merged;
-    let existing: Option<i64> = conn.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
-        params![namespace_id, scope_id, source], |r| r.get(0)).optional()?;
-    if let Some(id) = existing {
-        if record.id.is_some_and(|given| given != id) { return Err(Error::Conflict("source already belongs to another note ID".into())); }
-        record.id = Some(id);
-    }
-    // 笔记这条记录自己不承载正文，也不占索引文档：路径信息以标签形态挂在它的每个切片上，
-    // 要文件列表就按库里的标签翻笔记。
-    let (header, _) = storage::put_record(conn, RecordKind::Note, &record,
-        &json!({"chunk_chars":input.chunk_chars}), "")?;
-    let mut documents = Vec::new();
+    let mut record = input.record.clone();
+    // 笔记的身份就是 `(namespace, scope, path)`，下游给的 id 一律忽略：
+    // 记录 id 由库自己分配，下游不能凭一个 id 凭空插一条笔记（那会让「笔记属于哪条路径」失守）。
+    record.id = None;
+    let mut tags = record.tags.clone();
+    tags.extend(dirs.iter().cloned());
+    if !stem.is_empty() { tags.push(stem.clone()); }
+    record.tags = tags.clone();
+    Ok(PreparedNote { record, namespace_id, scope_id, source, given, title, split, chunk_chars: input.chunk_chars })
+}
+
+/// 新增路径（内部方法）：笔记与切片连同「正在写入」标记一次落主库，索引文档就地折好交回。
+/// 身份是 `(namespace, scope, path)`；调用方保证同一位要么是空的、要么刚被删除流程腾空。
+/// 切片记录全部新开——旧切片的向量已随删除流程作废，由向量对账照主库重算。
+pub(crate) fn add_note(conn: &Connection, note: &PreparedNote) -> Result<(Note, Vec<crate::index::IndexDocument>)> {
+    let (header, _) = storage::put_record(conn, RecordKind::Note, &note.record,
+        &json!({"chunk_chars": note.chunk_chars}), "")?;
     // 文件名在写入这一刻就从路径取好（`file_stem` 认平台分隔符），随笔记落库：
     // 索引那一列直接读它，索引侧补文档时也不必再拆一次路径。
     conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path,name) VALUES (?1,?2,?3,?4,?5)
         ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path,name=excluded.name",
-        params![header.id, namespace_id, scope_id, source, title])?;
-    // Reuse the record ID of any slice whose ordinal和内容都未变，让它的向量继续有效。
-    let mut old = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT record_id,ordinal,fingerprint FROM chunks WHERE note_id=?1")?;
-        for row in stmt.query_map([header.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))? {
-            old.push(row?);
-        }
-    }
-    let reuse: HashMap<(i64, String), i64> = old.iter().map(|(id, ordinal, fp)| ((*ordinal, fp.clone()), *id)).collect();
-    // Ordinals may be reshuffled between revisions, so clear the projection first
-    // and rebuild it; slices whose ordinal and content are unchanged keep their
-    // record ID (and therefore their embedding).
-    conn.execute("DELETE FROM chunks WHERE note_id=?1", [header.id])?;
-    let mut used = BTreeSet::new();
-    for chunk in &split {
+        params![header.id, note.namespace_id, note.scope_id, note.source, note.title])?;
+    let mut documents = Vec::new();
+    for chunk in &note.split {
         let content_digest = text::digest(&chunk.content);
         let payload = json!({"note_id":header.id,"ordinal":chunk.ordinal,"offset":chunk.offset,"limit":chunk.limit});
-        let (id, document) = match reuse.get(&(chunk.ordinal as i64, content_digest.clone())) {
-            Some(&id) => {
-                used.insert(id);
-                conn.execute("UPDATE records SET payload_json=?2 WHERE id=?1", params![id, serde_json::to_string(&payload)?])?;
-                // 内容没变，但标签是这篇当前这一份：标签换了指纹跟着换，旧向量就地作废。
-                let tag_ids = storage::set_record_tags(conn, id, &header.tags)?;
-                let fingerprint = storage::record_fingerprint(&chunk.content, &header.tags);
-                conn.execute("UPDATE records SET fingerprint=?2,updated_at_us=MAX(updated_at_us,?3) WHERE id=?1",
-                    params![id, fingerprint, header.updated_at_us])?;
-                conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
-                // 标签与指纹都动过，这个领域的向量分区跟着变。
-                storage::touch_namespace(&header.namespace);
-                let (name, path, exclude) = storage::index_columns(conn, RecordKind::Chunk, &payload);
-                (id, crate::index::IndexDocument { id, namespace_id, scope_id, kind: RecordKind::Chunk,
-                    text: chunk.content.clone(),
-                    name, path,
-                    note_id: header.id,
-                    tags_prefix: storage::tags_prefix(RecordKind::Chunk, &header.tags, &exclude, &payload),
-                    tag_ids })
-            }
-            None => {
-                let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(), tags: header.tags.clone(),
-                    evidence: vec![], metadata: header.metadata.clone(), created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
-                let (chunk_header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content)?;
-                (chunk_header.id, document)
-            }
-        };
+        let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(),
+            tags: header.tags.clone(), evidence: vec![], metadata: header.metadata.clone(),
+            created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
+        let (chunk_header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content)?;
         conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\",fingerprint) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, content_digest])?;
+            params![chunk_header.id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, content_digest])?;
         documents.push(document);
     }
-    // Delete obsolete records (and their embeddings), not just projection rows.
-    for (id, _, _) in old { if !used.contains(&id) { storage::delete_record(conn, &RecordKey { id })?; } }
-    Ok((Note { header, source: given, title, chunk_chars: input.chunk_chars }, documents))
+    Ok((Note { header, source: note.given.clone(), title: note.title.clone(), chunk_chars: note.chunk_chars }, documents))
 }
 
 /// 减掉领域根目录得到库里存的那条相对路径；不在根目录之内直接报错，不做猜测。
@@ -226,25 +197,65 @@ fn relative_note_path(root: &str, given: &str) -> Result<String> {
 pub struct NoteStore(pub(crate) KnowledgeBase);
 
 impl NoteStore {
-    /// 从索引取一批记录的正文。有取不到的记录说明索引还没覆盖这批写入，就提交一次再取；
-    /// 索引已对齐时这条读路径一次都不碰写锁。
-    fn bodies(&self, conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
-        if ids.is_empty() { return Ok(BTreeMap::new()); }
-        let mut bodies = self.0.index()?.bodies(ids)?;
-        if ids.iter().any(|id| !bodies.contains_key(id)) {
-            self.0.sync_index_if_behind(conn)?;
-            bodies = self.0.index()?.bodies(ids)?;
-        }
-        Ok(bodies)
-    }
-    /// 读文件后同步一篇笔记：正文取文件原文，标题取文件名（去扩展名），路径即身份。
-    /// 监听与对账在使用方；库只按给定路径处理这一个文件。
+    /// 按文件路径同步一篇笔记。更新就是「先删后加」：同路径已有笔记，先把旧笔记连同
+    /// 它的切片整条删掉（写锁内落主库标记、删向量行与主库行，出锁后摘索引词条），
+    /// 再当新笔记写入；没有就直接新增。切片记录全部新开，向量由向量对账照主库重算。
     pub fn upsert_file(&self, input: NoteFileInput) -> Result<WriteReceipt<Note>> {
-        let receipt = self.0.mutate(|tx| sync_file(tx, &input))?;
-        let WriteReceipt { value: (note, documents), revision } = receipt;
-        // 切片正文在写入时就地切好、一路带到索引，索引阶段不再回读文件。
+        let mut receipts = self.upsert_files(&[input])?;
+        let value = receipts.value.pop().ok_or_else(|| Error::Validation("empty upsert batch".into()))?;
+        Ok(WriteReceipt { value, revision: receipts.revision })
+    }
+
+    /// 批量版：一次写锁包住整批的 SQL，每篇各自完整地先删后加。
+    /// 索引操作（摘词条、交文档）在写锁外，由 Tantivy 自己的锁管。
+    /// 文件在动库之前全部读好切好——任何一处读取失败，整批原样拒绝，库一个字节都没动。
+    pub fn upsert_files(&self, inputs: &[NoteFileInput]) -> Result<WriteReceipt<Vec<Note>>> {
+        let split = inputs.iter().map(|input| -> Result<Vec<TextChunk>> {
+            let content = std::fs::read_to_string(&input.path)?;
+            chunk_text(&content, input.chunk_chars)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut notes: Vec<Note> = Vec::new();
+        let (stale, documents) = self.0.with_writer_lock(|writer| {
+            let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
+            let mut stale: Vec<i64> = Vec::new();
+            for (input, split) in inputs.iter().zip(split) {
+                // 解析与定位在标记事务里做：term_id 的字典登记随事务提交。
+                let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let prepared = prepare_note(&tx, input, split)?;
+                let by_path: Option<i64> = tx.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
+                    params![prepared.namespace_id, prepared.scope_id, prepared.source], |r| r.get(0)).optional()?;
+                // 笔记只按 (namespace, scope, path) 定位：同路径就是同一篇，先删后加。
+                let mut removed: Vec<i64> = Vec::new();
+                if let Some(id) = by_path {
+                    // 切片排在笔记前面：删除按这个次序落库，RESTRICT 引用不会拦。
+                    let mut stmt = tx.prepare("SELECT record_id FROM chunks WHERE note_id=?1")?;
+                    for row in stmt.query_map([id], |r| r.get::<_, i64>(0))? { removed.push(row?); }
+                    removed.push(id);
+                    // 标记先行：主库上先把「正在删除」落定，派生动作排在它后面。
+                    storage::mark_records(&tx, &removed, storage::MARK_DELETING)?;
+                }
+                tx.commit()?;
+                if !removed.is_empty() {
+                    // 权威落：删向量行 + 删主库行（切片先于笔记）。
+                    let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    for id in &removed { storage::delete_record(&tx, &RecordKey { id: *id })?; }
+                    tx.commit()?;
+                    stale.extend(removed);
+                }
+                // 新增：记录连同「正在写入」标记一次落主库，索引文档就地折好带回。
+                let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let (note, docs) = add_note(&tx, &prepared)?;
+                tx.commit()?;
+                documents.extend(docs);
+                notes.push(note);
+            }
+            Ok((stale, documents))
+        })?;
+        // 索引操作在写锁外：先摘旧词条、再交新文档，各自走 Tantivy 的内部锁。
+        if !stale.is_empty() { self.0.index()?.stage_deletions(&stale)?; }
         self.0.index_documents(&documents)?;
-        Ok(WriteReceipt { value: note, revision })
+        let revision = storage::current_revision(self.0.read()?.conn())?;
+        Ok(WriteReceipt { value: notes, revision })
     }
     /// 登记该知识领域的笔记根目录。登记之后写入的笔记路径必须是它的子路径：
     /// 库里存相对路径，相对路径按段拆出的标签挂到这篇的每一条切片上。
@@ -295,7 +306,7 @@ impl NoteStore {
         let state = self.0.read()?;
         let conn = state.conn();
         let mut chunk: Chunk = storage::get(conn, &RecordKey { id }, filter)?;
-        chunk.content = self.bodies(conn, &[id])?.remove(&id).unwrap_or_default();
+        chunk.content = self.0.index()?.bodies(&[id])?.remove(&id).unwrap_or_default();
         Ok(chunk)
     }
     pub fn chunks(&self, note_id: i64, filter: &ReadFilter) -> Result<Vec<Chunk>> {
@@ -312,34 +323,24 @@ impl NoteStore {
         let mut chunks: Vec<Chunk> = ids.iter().filter_map(|id| loaded.remove(id)).collect();
         // 一批切片一次取回正文：正文只存在索引里，逐条回库或回源文件都没有意义。
         let ids: Vec<i64> = chunks.iter().map(|chunk| chunk.header.id).collect();
-        let mut bodies = self.bodies(conn, &ids)?;
+        let mut bodies = self.0.index()?.bodies(&ids)?;
         for chunk in &mut chunks { chunk.content = bodies.remove(&chunk.header.id).unwrap_or_default(); }
         Ok(chunks)
     }
-    pub fn delete(&self, id: i64, filter: &ReadFilter) -> Result<WriteReceipt<bool>> {
-        self.0.mutate(|tx| delete_note(tx, id, filter))
+    /// 批量删除笔记：主库查 id，命中才继续；单条也是批量的一种。
+    /// 每篇连同它的切片一起删（`chunks.note_id` 是 RESTRICT 引用）：
+    /// 写锁内落主库标记、删向量行与主库行，出锁后摘索引词条。
+    /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
+    pub fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
+        let removed = self.0.delete_flow(ids, filter, RecordKind::Note, |tx, id| {
+            let mut out = Vec::new();
+            let mut stmt = tx.prepare("SELECT record_id FROM chunks WHERE note_id=?1")?;
+            for row in stmt.query_map([id], |r| r.get::<_, i64>(0))? { out.push(row?); }
+            Ok(out)
+        })?;
+        let revision = storage::current_revision(self.0.read()?.conn())?;
+        Ok(WriteReceipt { value: removed, revision })
     }
-    /// 删除过滤条件命中的全部笔记，返回删除条数。空命中返回 0。
-    /// 每篇都连同它的切片一起删：`chunks.note_id` 是 RESTRICT 引用，先切片后笔记。
-    pub fn delete_by_filter(&self, filter: &ReadFilter) -> Result<WriteReceipt<usize>> {
-        self.0.mutate(|tx| {
-            let mut removed = 0;
-            for id in storage::select_ids(tx, filter, &[RecordKind::Note])? {
-                if delete_note(tx, id, filter)? { removed += 1; }
-            }
-            Ok(removed)
-        })
-    }
-}
-
-/// 删一篇笔记：先删它的切片，再删笔记本身。
-fn delete_note(conn: &Connection, id: i64, filter: &ReadFilter) -> Result<bool> {
-    let key = RecordKey { id };
-    let _: Note = storage::get(conn, &key, filter)?;
-    let mut stmt = conn.prepare("SELECT record_id FROM chunks WHERE note_id=?1")?;
-    let ids = stmt.query_map([id], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-    for child in ids { storage::delete_record(conn, &RecordKey { id: child })?; }
-    storage::delete_record(conn, &key)
 }
 
 #[cfg(test)]

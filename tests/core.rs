@@ -96,9 +96,12 @@ fn transactions_scopes_pagination_and_persistence() {
     let mut first = memory("上海 茶 Rust ＡＰＩ", "public");
     first.record.tags = vec![" RUST ".into(), "rust".into()];
     let receipt = kb.memories().upsert(first.clone()).unwrap();
+    kb.update_index().unwrap();
     let a = receipt.value.header.id;
     let b = kb.memories().upsert(memory("其他内容", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let c = kb.memories().upsert(memory("上海 茶", "private")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let mut page = PageRequest { limit: 1, ..Default::default() };
     let result = kb.memories().list(&page).unwrap();
     assert_eq!(result.items[0].header.id, a); page.after = result.next_cursor;
@@ -106,15 +109,19 @@ fn transactions_scopes_pagination_and_persistence() {
     assert!(matches!(kb.memories().get(c, &ReadFilter::default()), Err(Error::NotFound(_))));
     let mut moved = memory("moved", "private"); moved.record.id = Some(a);
     kb.memories().upsert(moved).unwrap();
+    kb.update_index().unwrap();
     let private = ReadFilter { namespace: "default".into(), scopes: vec!["private".into()], ..Default::default() };
     assert_eq!(kb.memories().get(a, &private).unwrap().header.scope, "private", "作用域可以改");
     let mut restored = first.clone(); restored.record.id = Some(a);
     kb.memories().upsert(restored).unwrap();
+    kb.update_index().unwrap();
     let revision = kb.health().unwrap().revision;
     assert!(kb.memories().upsert_many(&[memory("valid", "public"), MemoryInput::new(" ")]).is_err());
+    kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().revision, revision);
     first.record.expected_revision = Some(0); first.record.id = Some(a);
     assert!(matches!(kb.memories().upsert(first), Err(Error::StaleRevision(_))));
+    kb.update_index().unwrap();
     let req = SearchRequest { query: "api".into(), filter: ReadFilter { tags: vec!["rust".into()], ..Default::default() }, ..Default::default() };
     assert_eq!(kb.search(&req).unwrap().hits[0].key.id, a);
     let clone = kb.clone(); kb.close().unwrap();
@@ -156,6 +163,7 @@ fn registration_binds_validates_and_unbinds() {
 fn sync_fills_missing_vectors_incrementally_and_aborts_on_failure() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..5 { kb.memories().upsert(memory(&format!("待向量化 {i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
     // 没有注册回调时 sync 是配置错误。
     assert!(matches!(kb.embeddings().sync("v", 4), Err(Error::Validation(_))));
@@ -181,8 +189,11 @@ fn sync_stops_after_the_first_failing_batch() {
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
     // 先把记录留下待补（此刻还没回调），再注册；这样 sync 才能逐批推进并卡在第二批。
     kb.memories().upsert(memory("第一批 甲", "public")).unwrap();
+    kb.update_index().unwrap();
     kb.memories().upsert(memory("第一批 乙", "public")).unwrap();
+    kb.update_index().unwrap();
     kb.memories().upsert(memory("第二批 丙", "public")).unwrap();
+    kb.update_index().unwrap();
     // 样本能过、真实语料会挂：注册成功，但「第二批 丙」永远补不上。
     kb.embeddings().register_embedder_with("v", |texts: &[String]| {
         if texts.iter().any(|text| text.contains("第二批")) { return Err(attempt_error()); }
@@ -214,6 +225,7 @@ fn writes_stay_clean_and_the_batch_end_sync_fills_vectors() {
     let mut tagged = memory("记住她喜欢苹果", "public");
     tagged.record.tags = vec!["偏好".into()];
     let id = kb.memories().upsert(tagged).unwrap().value.header.id;
+    kb.update_index().unwrap();
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap(), "还没补过，谈不上就绪");
     let gated = kb.search(&vector_query("v", "记住她喜欢苹果", vec![RecordKind::Memory])).unwrap();
     assert!(gated.hits.is_empty() && gated.diagnostics.degraded.contains(&Degrade::VectorNotReady),
@@ -226,6 +238,7 @@ fn writes_stay_clean_and_the_batch_end_sync_fills_vectors() {
     // 模型已就位的情况下再写一条：调用方这条线程上依然一次模型都不调。
     let after_registration = calls_from(&calls, &me);
     kb.memories().upsert(memory("第二条 也喜欢梨", "public")).unwrap();
+    kb.update_index().unwrap();
     assert_eq!(calls_from(&calls, &me), after_registration, "写入不许碰模型");
     assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "补完记忆档才放行向量路");
     let hits = kb.search(&vector_query("v", "记住她喜欢苹果", vec![RecordKind::Memory])).unwrap().hits;
@@ -255,12 +268,13 @@ fn namespace_switch_disables_vectorization_and_degrades() {
     space(&kb, "v", 4);
     let mut other = memory("另一个知识域的内容", "public"); other.record.namespace = "other".into();
     let other_id = kb.memories().upsert(other).unwrap().value.header.id;
+    kb.update_index().unwrap();
     // 另一个 namespace 先关掉向量化，再写入：不生成向量，但全文照常命中。
     kb.embeddings().set_namespace_vectorization("other", false).unwrap();
     let mut muted = memory("被关闭向量化的内容", "public"); muted.record.namespace = "other".into();
     kb.memories().upsert(muted).unwrap();
-    // 索引提交由使用方择时做：这里显式提交并对账，不依赖读者自愈撞上写锁空窗的时机。
     kb.update_index().unwrap();
+    // 索引提交由使用方择时做：这里显式提交并对账，不依赖读者自愈撞上写锁空窗的时机。
     let request = SearchRequest { query: "被关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
         embed_space: Some("v".into()), ..Default::default() };
     let result = kb.search(&request).unwrap();
@@ -295,8 +309,10 @@ fn vectorization_targets_are_independent_per_namespace() {
     assert!(!kb.embeddings().vectorization("default", "notes").unwrap());
 
     let muted = kb.memories().upsert(memory("记忆档关闭时的措辞", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let entity_id = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("记忆档关闭时写入的实体")], ..Default::default() })
         .unwrap().value.entities[0].header.id;
+        kb.update_index().unwrap();
     fill(&kb, "v");
     // 记忆不生成向量；同一时刻写的实体照旧生成，两档互不牵连。
     assert!(kb.search(&vector_query("v", "记忆档关闭时的措辞", vec![RecordKind::Memory])).unwrap().hits.is_empty());
@@ -346,6 +362,7 @@ fn namespace_master_switch_overrides_every_target() {
     for target in ["memory", "graph", "notes"] { kb.embeddings().set_vectorization("other", target, true).unwrap(); }
     let mut muted = memory("总闸关闭时的措辞", "public"); muted.record.namespace = "other".into();
     kb.memories().upsert(muted).unwrap();
+    kb.update_index().unwrap();
     assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0);
     let request = SearchRequest { query: "总闸关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
         embed_space: Some("v".into()), ..Default::default() };
@@ -370,6 +387,7 @@ fn vectorization_switches_survive_reopen() {
     assert!(kb.embeddings().vectorization("default", "notes").unwrap());
     assert!(kb.embeddings().vectorization("default", "graph").unwrap(), "没设过的档位仍取内置默认");
     kb.memories().upsert(memory("重开之后写入的记忆", "public")).unwrap();
+    kb.update_index().unwrap();
     std::fs::write(dir.path().join("n.md"), "重开之后写入的切片").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(dir.path().join("n.md"))).unwrap();
     kb.update_index().unwrap();
@@ -383,11 +401,12 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let id = kb.memories().upsert(memory("待删除的记忆措辞", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     fill(&kb, "v");
     assert_eq!(kb.search(&vector_query("v", "待删除的记忆措辞", vec![RecordKind::Memory])).unwrap().hits[0].key.id, id);
     // 关闭状态下删除：向量随记录一起消失。
     kb.embeddings().set_vectorization("default", "memory", false).unwrap();
-    kb.memories().delete(id, &ReadFilter::default()).unwrap();
+    kb.memories().delete(&[id], &ReadFilter::default()).unwrap();
     assert!(kb.search(&vector_query("v", "待删除的记忆措辞", vec![RecordKind::Memory])).unwrap().hits.is_empty());
     // 关闭状态下改笔记正文：旧切片的向量照旧随记录作废，也不生成新的。
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
@@ -401,10 +420,11 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     // 关闭状态下改正文：旧切片的向量照旧随记录作废，也不生成新的。
     kb.embeddings().set_vectorization("default", "notes", false).unwrap();
     std::fs::write(&path, "第二版切片措辞").unwrap();
-    kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+    let note2 = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
     kb.update_index().unwrap();
-    let second = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
-    assert_ne!(second, first);
+    let second = kb.notes().chunks(note2.header.id, &ReadFilter::default()).unwrap()[0].header.id;
+    assert_ne!(second, first, "先删后加：切片记录随更新换代");
+    assert_ne!(note2.header.id, note.header.id, "笔记记录同样换代");
     assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的笔记档不补新向量");
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
     assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000), "只有新切片需要补向量");
@@ -419,6 +439,7 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
 fn deleting_a_space_removes_its_vectors_and_readiness() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
     kb.memories().upsert(memory("会被忘掉的一条", "public")).unwrap();
+    kb.update_index().unwrap();
     fill(&kb, "v");
     assert!(kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     // 向量真的写进了外挂库。
@@ -445,6 +466,7 @@ fn caller_syncs_after_the_batch_ends() {
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     // 写入的时候还没有模型可用：缺口留着，谁都不许拿半个领域去走向量路。
     kb.memories().upsert(memory("等模型上线的记忆", "public")).unwrap();
+    kb.update_index().unwrap();
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     // 注册模型不会自己补：库内没有任何线程替使用方干活。
     space(&kb, "v", 4);
@@ -460,6 +482,7 @@ fn caller_syncs_after_the_batch_ends() {
     let reopened = KnowledgeBase::open(dir.path()).unwrap();
     space(&reopened, "v", 4);
     let fresh = reopened.memories().upsert(memory("重开之后写入的记忆", "public")).unwrap().value.header.id;
+    reopened.update_index().unwrap();
     // 写入不会自己补：还是得使用方调 sync。
     assert!(sync_and_ready(&reopened, "default", "v", "memory", 15_000), "使用方调 sync 之后才补上");
     let hits = reopened.search(&vector_query("v", "重开之后写入的记忆", vec![RecordKind::Memory])).unwrap().hits;
@@ -475,6 +498,7 @@ fn chunk_vectors_come_from_the_real_body_not_an_empty_one() {
     let path = dir.path().join("n.md");
     std::fs::write(&path, "切片正文独有措辞").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     // 读 chunks 会顺带读到切片正文（索引未提交时先提交一次），因此这里不再断言「未提交前未就绪」。
     let chunk = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
     // 使用方显式调一次同步：切片正文只在索引里，同步据此算出向量、标成就绪。
@@ -510,6 +534,7 @@ fn callback_failures_still_commit_and_degrade_to_text() {
     kb.embeddings().register_embedder("v", FakeEmbedder::new(4)).unwrap();
     // 记录本身能嵌入：这一批补完，记忆档就绪，向量路放行——下面才测得到「查询词嵌入失败」这一档。
     let id = kb.memories().upsert(memory("平铺直叙的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000));
     assert!(kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     // 检索侧：查询词嵌入失败就退纯全文，不报错、不返回空。
@@ -532,6 +557,7 @@ fn an_interrupted_fill_leaves_the_domain_unready() {
     space(&kb, "v", 4);
     // 有一条记录的回调会挂：补齐反复中断，记录照常在库里，但记忆档不许标成就绪。
     let id = kb.memories().upsert(memory("触发降级的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     assert!(!sync_and_ready(&kb, "default", "v", "memory", 1_000), "补不上的记录让记忆档停在未就绪");
     assert!(kb.health().unwrap().last_degraded.contains(&Degrade::EmbedFailed), "补齐失败要记一档降级");
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap());
@@ -545,7 +571,9 @@ fn search_parameters_control_paths_and_totals() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     space(&kb, "v", 4);
     for i in 0..3 { kb.memories().upsert(memory(&format!("参数 目标 {i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     kb.memories().upsert(memory("无关内容", "public")).unwrap();
+    kb.update_index().unwrap();
     let kinds = vec![RecordKind::Memory];
     fill(&kb, "v");
 
@@ -587,6 +615,7 @@ fn search_parameters_control_paths_and_totals() {
 fn reranker_reorders_candidates_and_enforces_length_limits() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for tag in ["甲", "乙", "丙", "丁", "戊"] { kb.memories().upsert(memory(&format!("重排目标 {tag}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "重排目标".into(), limit: 5, kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
     let baseline: Vec<i64> = kb.search(&request).unwrap().hits.iter().map(|hit| hit.key.id).collect();
     assert_eq!(baseline.len(), 5);
@@ -620,6 +649,7 @@ fn reranker_reorders_candidates_and_enforces_length_limits() {
 fn reranker_stops_at_the_candidate_cap() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for tag in ["甲", "乙", "丙", "丁", "戊"] { kb.memories().upsert(memory(&format!("条数上限 {tag}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "条数上限".into(), limit: 5, kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
 
     // token 预算装得下全部 5 条短候选，能截到 2 条的只有条数上限。
@@ -650,6 +680,7 @@ fn rerank_consumes_the_merged_paths_before_fusion() {
     let mut id_to_text: BTreeMap<i64, String> = BTreeMap::new();
     for text in texts {
         let id = kb.memories().upsert(memory(text, "public")).unwrap().value.header.id;
+        kb.update_index().unwrap();
         id_to_text.insert(id, text.to_string());
     }
     fill(&kb, "v");
@@ -693,6 +724,7 @@ fn rerank_consumes_the_merged_paths_before_fusion() {
 fn rerank_failure_falls_back_to_the_full_candidate_set() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for tag in ["甲", "乙", "丙", "丁", "戊"] { kb.memories().upsert(memory(&format!("兜底目标 {tag}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "兜底目标".into(), kinds: vec![RecordKind::Memory], vector: false, limit: 5, ..Default::default() };
     let baseline: Vec<i64> = kb.search(&SearchRequest { rerank: false, ..request.clone() }).unwrap().hits.iter().map(|hit| hit.key.id).collect();
     assert_eq!(baseline.len(), 5);
@@ -712,6 +744,7 @@ fn rerank_failure_falls_back_to_the_full_candidate_set() {
 fn rerank_is_not_called_when_there_are_no_candidates() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("无关内容", "public")).unwrap();
+    kb.update_index().unwrap();
     // 候选为空时不该调模型：空文档列表对多数重排服务是无效请求，会误标降级。
     let calls = Arc::new(Mutex::new(0usize));
     let recorder = calls.clone();
@@ -730,6 +763,7 @@ fn rerank_is_not_called_when_there_are_no_candidates() {
 fn reranker_registration_validates_and_failures_degrade() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..3 { kb.memories().upsert(memory(&format!("降级目标 {i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     // 返回条数与输入不符、分数非有限值都拒绝绑定。
     assert!(kb.register_reranker(|_: &str, _: &[String]| Ok(vec![1.0f32])).is_err());
     assert!(kb.register_reranker(|_: &str, documents: &[String]| Ok(vec![f32::NAN; documents.len()])).is_err());
@@ -748,6 +782,7 @@ fn oversized_batches_shrink_to_fit() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.embeddings().register_space(EmbeddingSpace { id: "v".into(), model: "fixture/v1".into(), dimension: 4, text_version: 1, encoding: "f32".into() }).unwrap();
     for i in 0..8 { kb.memories().upsert(memory(&format!("批次 {i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     let lengths: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = lengths.clone();
     // 声明 8 条，但真实模型只吃 4 条：库应当自己减半并沿用。
@@ -768,6 +803,7 @@ fn oversized_batches_shrink_to_fit() {
 fn swapping_models_keeps_the_old_space_usable() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..3 { kb.memories().upsert(memory(&format!("换模型 {i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     space(&kb, "old", 4);
     kb.embeddings().sync("old", 32).unwrap();
     // 换模型：新建空间 + 新回调 + sync；旧空间不动，退回只是检索改回旧空间。
@@ -802,7 +838,9 @@ fn vector_partitions_are_isolated_by_scope() {
         ("probe", vec![1.0, 0.0]),
     ])).unwrap();
     let public_id = kb.memories().upsert(memory("public vector", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let private_id = kb.memories().upsert(memory("private vector", "private")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     fill(&kb, "v");
     let query = |scope: &str| SearchRequest {
         query: "probe".into(), text: false, embed_space: Some("v".into()),
@@ -822,6 +860,7 @@ fn vector_partitions_are_isolated_by_scope() {
 fn packed_and_precise_spaces_rank_the_same_vectors_together() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..8 { kb.memories().upsert(memory(&format!("记录{i}"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     for (id, encoding) in [("precise", "f32"), ("packed", "sq8")] {
         kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension: 8, text_version: 1, encoding: encoding.into() }).unwrap();
         kb.embeddings().register_embedder(id, FakeEmbedder::new(8)).unwrap();
@@ -851,6 +890,7 @@ fn concurrent_reads_are_isolated_and_agree_with_serial_results() {
         let mut value = memory(&format!("内容 {i} 独有"), &scope);
         value.record.tags = vec![format!("tag{i}")];
         kb.memories().upsert(value).unwrap();
+        kb.update_index().unwrap();
     }
     let expected: Vec<usize> = (0..8).map(|i| {
         kb.search(&SearchRequest { query: format!("内容 {i}"), filter: ReadFilter { scopes: vec![format!("scope{i}")], ..Default::default() },
@@ -877,6 +917,7 @@ fn concurrent_reads_are_isolated_and_agree_with_serial_results() {
     for handle in handles { handle.join().unwrap(); }
     // 读线程全部结束后仍然可以正常写入。
     kb.memories().upsert(memory("收尾", "scope0")).unwrap();
+    kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().record_count, 9);
 }
 
@@ -899,8 +940,8 @@ fn read_rounds(kb: &KnowledgeBase, request: &SearchRequest, threads: usize, roun
 fn concurrent_readers_are_not_blocked_by_a_writer() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("初始内容", "public")).unwrap();
-    // 写入不再就地索引：先把基线追平，之后写者攒下的索引增删由读者自愈或被忽略都不影响这条。
     kb.update_index().unwrap();
+    // 写入不再就地索引：先把基线追平，之后写者攒下的索引增删由读者自愈或被忽略都不影响这条。
     let request = SearchRequest { query: "初始内容".into(), limit: 5, ..Default::default() };
     // 读路径曾经这样退化成串行：索引标脏时读者去抢写锁，而写者每次索引提交要二十毫秒量级，
     // 于是读者全排到写者后面，吞吐掉到基线的百分之七。这里用同一个读者组在写者存在前后各跑一遍，
@@ -933,17 +974,20 @@ fn graph_integrity_aliases_and_rename_propagation() {
     let mut alice = entity("Alice"); alice.aliases = vec!["小艾".into()];
     let mut bob = entity("Bob"); bob.aliases = vec!["小艾".into()];
     let entities = kb.graph().apply_batch(&GraphBatch { entities: vec![alice, bob], ..Default::default() }).unwrap().value.entities;
+    kb.update_index().unwrap();
     let a = entities[0].header.id; let b = entities[1].header.id;
     let relation = RelationInput { record: RecordInput::default(), subject_id: a, predicate: "knows".into(), object_id: b, confidence: 0.8, reason: String::new() };
     let event = EventInput { record: RecordInput::default(), name: "meeting".into(), summary: String::new(), participants: vec![a, b], confidence: 0.9, reason: String::new() };
     kb.graph().apply_batch(&GraphBatch { entities: vec![], relations: vec![relation.clone()], events: vec![event] }).unwrap();
+    kb.update_index().unwrap();
     assert_eq!(kb.graph().resolve("小艾", &ReadFilter::default(), 10).unwrap().len(), 2);
     assert_eq!(kb.graph().neighbors(a, &ReadFilter::default(), 10).unwrap().entities[0].name, "Bob");
     assert_eq!(kb.graph().events_for_entity(a, &ReadFilter::default(), 10).unwrap().len(), 1);
-    assert!(matches!(kb.graph().delete(RecordKind::Entity, a, &ReadFilter::default()), Err(Error::Conflict(_))));
+    assert!(matches!(kb.graph().delete(RecordKind::Entity, &[a], &ReadFilter::default()), Err(Error::Conflict(_))));
     // 改名会改写引用它的关系与事件正文，这些记录必须重新生成向量（旧向量已随指纹作废）。
     let mut renamed = entity("Carol"); renamed.record.id = Some(a);
     kb.graph().apply_batch(&GraphBatch { entities: vec![renamed], ..Default::default() }).unwrap();
+    kb.update_index().unwrap();
     fill(&kb, "v");
     let mut request = vector_query("v", "Carol", vec![RecordKind::Relation, RecordKind::Event]);
     request.limit = 10;
@@ -953,6 +997,7 @@ fn graph_integrity_aliases_and_rename_propagation() {
     assert_eq!(kb.search(&search).unwrap().hits.len(), 2);
     let bad = RelationInput { object_id: 9_999_999, ..relation };
     assert!(kb.graph().apply_batch(&GraphBatch { entities: vec![], relations: vec![bad], events: vec![] }).is_err());
+    kb.update_index().unwrap();
 }
 
 #[test]
@@ -962,6 +1007,7 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     let tea_path = dir.path().join("tea.md");
     std::fs::write(&tea_path, "# 茶\n\n上海喝茶\n\n```rust\nlet x = 1;\n```\n\n最后一段").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&tea_path)).unwrap().value;
+    kb.update_index().unwrap();
     let note_id = note.header.id;
     let chunks = kb.notes().chunks(note_id, &ReadFilter::default()).unwrap();
     let tea = chunks.iter().find(|c| c.content == "上海喝茶").unwrap();
@@ -970,12 +1016,14 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     let evidence = Evidence { source: "docs/tea.md".into(), offset: Some(3), limit: Some(1), quote: "上海喝茶".into(), ..Default::default() };
     let mut m = memory("source fact", "public"); m.record.evidence = vec![evidence];
     let memory_id = kb.memories().upsert(m).unwrap().value.header.id;
+    kb.update_index().unwrap();
     std::fs::write(&tea_path, "replacement").unwrap();
     let new = kb.notes().upsert_file(NoteFileInput::new(&tea_path)).unwrap().value;
-    assert_eq!(new.header.id, note_id);
+    kb.update_index().unwrap();
+    assert_ne!(new.header.id, note_id, "先删后加：笔记记录换代");
     assert!(kb.notes().get_chunk(tea.header.id, &ReadFilter::default()).is_err());
     assert_eq!(kb.memories().get(memory_id, &ReadFilter::default()).unwrap().header.evidence[0].quote, "上海喝茶");
-    kb.notes().delete(note_id, &ReadFilter::default()).unwrap();
+    kb.notes().delete(&[new.header.id], &ReadFilter::default()).unwrap();
     assert_eq!(kb.health().unwrap().record_count, 1);
     assert_eq!(kb.health().unwrap().foreign_key_errors, 0);
     let long = chunk_text(&"一".repeat(500), 220).unwrap();
@@ -987,26 +1035,37 @@ fn explicit_lifecycle_has_no_hidden_deletion() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     let mut weak = memory("weak", "public"); weak.record.created_at_us = Some(0); weak.record.updated_at_us = Some(0);
     let weak_id = kb.memories().upsert(weak).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let mut pinned = memory("pinned", "public"); pinned.state = Some(MemoryState { pinned: true, ..Default::default() });
     kb.memories().upsert(pinned).unwrap();
+    kb.update_index().unwrap();
     let result = kb.memories().decay(&ReadFilter::default(), &DecayPolicy::default(), Some(4*86_400_000_000)).unwrap().value;
+    kb.update_index().unwrap();
     assert_eq!(result.decayed,1); assert_eq!(result.retirement_candidates[0].id, weak_id); assert_eq!(kb.health().unwrap().record_count,2);
     let feedback = FeedbackRequest {recalled_ids:vec![weak_id],useful_ids:vec![weak_id],now_us:Some(5*86_400_000_000),..Default::default()};
     kb.memories().feedback(&feedback).unwrap(); assert_eq!(kb.memories().get(weak_id, &ReadFilter::default()).unwrap().state.strength,1);
+    kb.update_index().unwrap();
     let bad = FeedbackRequest {useful_ids:vec![9_999_999],..Default::default()}; assert!(kb.memories().feedback(&bad).is_err());
+    kb.update_index().unwrap();
     let second = kb.memories().decay(&ReadFilter::default(), &DecayPolicy::default(), Some(5*86_400_000_000)).unwrap(); assert_eq!(second.value.decayed,0);
+    kb.update_index().unwrap();
 }
 
 #[test]
 fn backup_restore_and_derived_index_recovery() {
     let root=tempfile::tempdir().unwrap();let data=root.path().join("data");let kb=KnowledgeBase::open(&data).unwrap();
     kb.memories().upsert(memory("recoverable","public")).unwrap();space(&kb,"v",2);
+    kb.update_index().unwrap();
     let vector_id = kb.memories().upsert(memory("带向量的记录","public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     fill(&kb,"v");
     assert_eq!(kb.search(&vector_query("v", "带向量的记录", vec![RecordKind::Memory])).unwrap().hits[0].key.id, vector_id);
     let backup=root.path().join("backup.sqlite3");kb.backup(&backup).unwrap();assert!(kb.backup(&backup).is_err());kb.close().unwrap();
     std::fs::write(data.join("text-v2/meta.json"),b"broken index metadata").unwrap();
-    let reopened=KnowledgeBase::open(&data).unwrap();assert_eq!(reopened.search(&SearchRequest {query:"recoverable".into(),..Default::default()}).unwrap().hits.len(),1);
+    let reopened=KnowledgeBase::open(&data).unwrap();
+    // 开库不自动对账：派生索引的恢复由下游显式对账完成。
+    reopened.reconcile_index().unwrap();
+    assert_eq!(reopened.search(&SearchRequest {query:"recoverable".into(),..Default::default()}).unwrap().hits.len(),1);
     let restored=KnowledgeBase::restore(&backup,root.path().join("restored")).unwrap();
     assert_eq!(restored.health().unwrap().record_count,2);
     // 快照里带着 embeddings：恢复后重新注册同一回调，向量路立刻可用。
@@ -1020,6 +1079,7 @@ fn backup_restore_and_derived_index_recovery() {
 fn ties_and_chinese_queries_are_deterministic_across_reopens() {
     let dir=tempfile::tempdir().unwrap();let kb=KnowledgeBase::open(dir.path()).unwrap();
     let values:Vec<_>=(0..140).map(|_| memory("上海 茶 相同", "public")).collect();kb.memories().upsert_many(&values).unwrap();
+    kb.update_index().unwrap();
     let q=SearchRequest {query:"上海 茶".into(),limit:3,candidate_limit:Some(3),..Default::default()};
     let ids=|kb:&KnowledgeBase|kb.search(&q).unwrap().hits.into_iter().map(|h|h.key.id).collect::<Vec<_>>();
     let first=ids(&kb);assert_eq!(first.len(),3);assert!(first.windows(2).all(|w|w[0]<w[1]));
@@ -1037,6 +1097,7 @@ fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() 
     let mut m = memory("她喜欢苹果", "public");
     m.record.tags = vec!["星见雅".into()];
     let id = kb.memories().upsert(m).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let hits = kb.search(&SearchRequest { query: "星见雅".into(), ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, id);
@@ -1047,6 +1108,7 @@ fn the_tag_set_rides_on_the_owning_record_and_carries_queries_the_body_cannot() 
     let note_path = note_dir.join("雅.md");
     std::fs::write(&note_path, "这是一段无关内容").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&note_path)).unwrap().value;
+    kb.update_index().unwrap();
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     assert_eq!(chunks.len(), 1);
     // 目录段降为纯过滤器：常规检索搜不到它们。
@@ -1080,6 +1142,7 @@ fn sq8_encoding_roundtrips_through_storage() {
         ("probe", vec![0.6, 0.8, 0.0, 0.0]),
     ])).unwrap();
     let id = kb.memories().upsert(memory("quantized target", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     fill(&kb, "q");
     let hits = kb.search(&vector_query("q", "probe", vec![RecordKind::Memory])).unwrap().hits;
     assert_eq!(hits.len(), 1);
@@ -1141,8 +1204,10 @@ fn search_with_context_attaches_entity_neighborhood() {
     let mut note = memory("深夜的会面记录", "public");
     note.record.tags = vec!["嫌疑人".into()];
     let linked_id = kb.memories().upsert(note).unwrap().value.header.id;
+    kb.update_index().unwrap();
     // 另一条没有挂载任何实体
     let plain_id = kb.memories().upsert(memory("深夜的另一次会面", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
 
     let request = SearchRequest { query: "深夜 会面".into(), kinds: vec![RecordKind::Memory], ..Default::default() };
     let hits = kb.search_with_context(&request, 10).unwrap();
@@ -1169,16 +1234,20 @@ fn batched_context_matches_per_hit_expansion() {
     shadow.aliases = vec!["甲".into()];
     shadow.record.scope = "private".into();
     let ents = kb.graph().apply_batch(&GraphBatch { entities: vec![a, b, c, shadow], ..Default::default() }).unwrap().value.entities;
+    kb.update_index().unwrap();
     let (a_id, b_id, c_id, shadow_id) = (ents[0].header.id, ents[1].header.id, ents[2].header.id, ents[3].header.id);
     let relation = |subject_id: i64, object_id: i64, predicate: &str| RelationInput {
         record: RecordInput::default(), subject_id, object_id, predicate: predicate.into(), confidence: 1.0, reason: String::new(),
     };
     kb.graph().apply_batch(&GraphBatch { relations: vec![relation(a_id, b_id, "认识"), relation(a_id, c_id, "同伙")], ..Default::default() }).unwrap();
+    kb.update_index().unwrap();
 
     let mut first = memory("共同出现的甲", "public"); first.record.tags = vec!["甲".into()];
     let first_id = kb.memories().upsert(first).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let mut second = memory("共同出现的乙", "public"); second.record.tags = vec!["乙".into()];
     let second_id = kb.memories().upsert(second).unwrap().value.header.id;
+    kb.update_index().unwrap();
 
     let request = SearchRequest { query: "共同出现".into(), kinds: vec![RecordKind::Memory], ..Default::default() };
     let hits = kb.search_with_context(&request, 1).unwrap();
@@ -1208,6 +1277,7 @@ fn text_gate_excludes_records_that_do_not_match_the_query() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     for i in 0..20 { kb.memories().upsert(memory(&format!("记忆 {i} 独有措辞"), "public")).unwrap(); }
+    kb.update_index().unwrap();
     // 过滤条件命中全部 20 条。正文条件必须独立生效：正文里根本不存在的词一律零命中。
     // 曾经正文子句与过滤子句同层，同层存在 Must 时 Should 降级为可选，于是一次「查不到的词」
     // 会返回该过滤域下的任意记录，检索退化成「只按过滤条件取记录」。
@@ -1215,6 +1285,7 @@ fn text_gate_excludes_records_that_do_not_match_the_query() {
     assert!(missing.is_empty(), "正文条件失效：过滤域内的 {} 条记录被当成了命中", missing.len());
     // 只存在于一条记录里的词，必须只把那条取回来。
     let target = kb.memories().upsert(memory("全息投影仪维修记录", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let hits = kb.search(&SearchRequest { query: "全息投影仪".into(), limit: 10, ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].key.id, target);
@@ -1229,6 +1300,7 @@ fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
     std::fs::write(&path, raw).unwrap();
 
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     assert_eq!(note.title, "世界观", "标题取文件名");
     assert_eq!(note.source, *path.to_string_lossy(), "路径即身份");
     // 正文不落库：切片正文读时由文件原文派生。
@@ -1242,15 +1314,18 @@ fn note_upsert_file_reads_path_uses_stem_and_keeps_raw_text() {
     // 同一路径重新同步：定位到同一笔记、更新正文、重建切片。
     std::fs::write(&path, "改过的正文 **新词** 在这里。").unwrap();
     let updated = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
-    assert_eq!(updated.header.id, note.header.id, "同一路径复用同一笔记");
+    kb.update_index().unwrap();
+    assert_ne!(updated.header.id, note.header.id, "同一路径仍是同一篇，但记录随先删后加换代");
     let hits = kb.search(&SearchRequest { query: "新词".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
     assert!(!hits.is_empty(), "更新后的正文进入索引");
 
     // 文件不存在与非 UTF-8 都直接报错，不落库。
     assert!(kb.notes().upsert_file(NoteFileInput::new(dir.path().join("nope.md"))).is_err());
+    kb.update_index().unwrap();
     let bad = dir.path().join("bad.md");
     std::fs::write(&bad, [0xffu8, 0xfe, 0xfd]).unwrap();
     assert!(kb.notes().upsert_file(NoteFileInput::new(&bad)).is_err());
+    kb.update_index().unwrap();
 }
 
 /// 正文唯一副本在索引里：库内任何文本列都不留，切片正文按 ID 从索引取回（必要时先提交一次）。
@@ -1262,6 +1337,7 @@ fn note_body_lives_only_in_the_index_not_in_sqlite() {
     let path = dir.path().join("note.md");
     std::fs::write(&path, "ZZBODYMARK 独有正文标记").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
 
     // 显式读切片正文：写入时切好、随文档进了索引，这里按 ID 取回。
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
@@ -1296,12 +1372,14 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     std::fs::write(&bare_path, "苹果 香蕉 橘子").unwrap();
     assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&bare_path)), Err(Error::Validation(_))),
         "没登记根目录就拒绝写入");
+        kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().record_count, 0, "被拒的笔记一条都不落库");
     // 登记根目录后写入这一篇：文件名进名字列、目录段进目录列，都只挂第一片。
     kb.notes().set_root("default", &root).unwrap();
     let short_path = note_dir.join("雅.md");
     std::fs::write(&short_path, "苹果 香蕉 橘子").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&short_path)).unwrap().value;
+    kb.update_index().unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
     let stored: String = conn.query_row("SELECT path FROM notes WHERE record_id=?1", [note.header.id], |r| r.get(0)).unwrap();
     assert_eq!(stored, "绝区零/角色/雅.md", "库里存的是减掉根目录的相对路径");
@@ -1320,6 +1398,7 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     let long_path = note_dir.join("长文.md");
     std::fs::write(&long_path, "青提".repeat(400)).unwrap();
     let long_note = kb.notes().upsert_file(NoteFileInput::new(&long_path)).unwrap().value;
+    kb.update_index().unwrap();
     let long_chunks = kb.notes().chunks(long_note.header.id, &ReadFilter::default()).unwrap();
     assert!(long_chunks.len() > 1, "长正文应当切成多片");
     for chunk in &long_chunks { assert!(!chunk.content.contains("长文"), "切片正文不携带文件名"); }
@@ -1387,9 +1466,11 @@ fn memory_and_chunk_score_the_same_text_identically() {
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let text = "青提苹果";
     kb.memories().upsert(memory(text, "public")).unwrap();
+    kb.update_index().unwrap();
     let path = dir.path().join("同文本.md");
     std::fs::write(&path, text).unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+    kb.update_index().unwrap();
 
     let score = |kinds: Vec<RecordKind>| {
         let request = SearchRequest { query: text.into(), kinds, vector: false, rerank: false, ..Default::default() };
@@ -1415,11 +1496,13 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let outside = dir.path().join("outside.md");
     std::fs::write(&outside, "根目录之外的正文").unwrap();
     assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&outside)), Err(Error::Validation(_))));
+    kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().record_count, 0, "越界路径一条记录都不许落库");
     // 正文里不出现路径词：它们只以拼在第一片前面的标签形态存在。
     let mut input = NoteFileInput::new(&note_path);
     input.record.tags = vec!["人物".into()];
     let note = kb.notes().upsert_file(input).unwrap().value;
+    kb.update_index().unwrap();
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     assert!(chunks.len() > 1, "长正文应当切成多片");
     for chunk in &chunks {
@@ -1454,7 +1537,6 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     let before = kb.health().unwrap();
     assert_eq!(before.index_document_count, before.record_count - 1);
     // 索引与主库对账之后同一批查询结果一致。
-    kb.update_index().unwrap();
     let again = kb.search(&SearchRequest { query: "overview".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(again.len(), hits.len(), "对账后命中条数一致");
     assert_eq!(again[0].key.id, hits[0].key.id, "对账后名次一致");
@@ -1472,12 +1554,14 @@ fn chunks_from_one_note_collapse_to_one_hit_with_the_note_total() {
     let many_path = dir.path().join("对话.md");
     std::fs::write(&many_path, "派蒙".repeat(800)).unwrap();
     let many = kb.notes().upsert_file(NoteFileInput::new(&many_path)).unwrap().value;
+    kb.update_index().unwrap();
     let many_chunks = kb.notes().chunks(many.header.id, &ReadFilter::default()).unwrap();
     assert!(many_chunks.len() > 1, "这篇应当切成多片");
     // 另一篇：只命中一片。
     let once_path = dir.path().join("独白.md");
     std::fs::write(&once_path, "派蒙").unwrap();
     let once = kb.notes().upsert_file(NoteFileInput::new(&once_path)).unwrap().value;
+    kb.update_index().unwrap();
 
     let hits = kb.search(&SearchRequest { query: "派蒙".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(hits.len(), 2, "两篇各出且只出一条，多片段那篇不许刷屏");
@@ -1534,6 +1618,7 @@ fn rerank_receives_one_candidate_per_note() {
     let path = dir.path().join("对话.md");
     std::fs::write(&path, "派蒙".repeat(800)).unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     assert!(kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap().len() > 1, "这篇应当切成多片");
 
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1571,6 +1656,7 @@ fn preset_graph_walks_entities_then_relations_then_events() {
     let created = kb.graph().apply_batch(&GraphBatch {
         entities: vec![hua, entity("白露"), entity("青萍"), entity("玄霜"), entity("长夜堂")], ..Default::default()
     }).unwrap().value;
+    kb.update_index().unwrap();
     let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
     kb.graph().apply_batch(&GraphBatch {
         relations: vec![
@@ -1586,7 +1672,9 @@ fn preset_graph_walks_entities_then_relations_then_events() {
         ],
         ..Default::default()
     }).unwrap();
+    kb.update_index().unwrap();
     kb.memories().upsert(memory("朱樱的同学是青萍", "public")).unwrap();
+    kb.update_index().unwrap();
 
     let result = kb.search_preset(&PresetRequest {
         preset: SearchPreset::Rag, query: "朱樱和白露的同学是谁".into(), ..Default::default()
@@ -1630,6 +1718,7 @@ fn preset_graph_event_route_stops_at_the_character_budget() {
     let created = kb.graph().apply_batch(&GraphBatch {
         entities: vec![entity("甲"), entity("乙"), entity("丙"), entity("丁")], ..Default::default()
     }).unwrap().value;
+    kb.update_index().unwrap();
     let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
     kb.graph().apply_batch(&GraphBatch {
         relations: vec![
@@ -1643,11 +1732,13 @@ fn preset_graph_event_route_stops_at_the_character_budget() {
             event_of("事件三", vec![id("甲"), id("丁")]),
         ], ..Default::default()
     }).unwrap();
+    kb.update_index().unwrap();
     // 先造一条「别处事件」（参与者一样），随后把它挪到另一个可见范围：写入 API 不允许跨范围
     // 参与者，只能建完再改库。它若没被领域过滤掉，会因为 id 最小而排在结果最前面。
     let elsewhere = kb.graph().apply_batch(&GraphBatch {
         events: vec![event_of("别处事件", vec![id("甲"), id("乙")])], ..Default::default()
     }).unwrap().value;
+    kb.update_index().unwrap();
     {
         let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
         conn.execute("INSERT OR IGNORE INTO strings(text) VALUES('private')", []).unwrap();
@@ -1676,6 +1767,7 @@ fn preset_graph_keeps_all_incident_relations_for_a_pure_name_query() {
     let created = kb.graph().apply_batch(&GraphBatch {
         entities: vec![entity("墨团"), entity("派罗"), entity("月裔")], ..Default::default()
     }).unwrap().value;
+    kb.update_index().unwrap();
     let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
     kb.graph().apply_batch(&GraphBatch {
         relations: vec![
@@ -1683,6 +1775,7 @@ fn preset_graph_keeps_all_incident_relations_for_a_pure_name_query() {
             relation_of(id("墨团"), "隶属于", id("月裔")),
         ], ..Default::default()
     }).unwrap();
+    kb.update_index().unwrap();
 
     let result = kb.search_preset(&PresetRequest {
         preset: SearchPreset::Graph, query: "墨团".into(), ..Default::default()
@@ -1700,10 +1793,12 @@ fn preset_graph_step2_expands_the_remainder_with_predicate_synonyms() {
     let created = kb.graph().apply_batch(&GraphBatch {
         entities: vec![entity("alice"), entity("bob")], ..Default::default()
     }).unwrap().value;
+    kb.update_index().unwrap();
     let id = |name: &str| created.entities.iter().find(|entity| entity.name == name).unwrap().header.id;
     kb.graph().apply_batch(&GraphBatch {
         relations: vec![relation_of(id("bob"), "alpha", id("alice"))], ..Default::default()
     }).unwrap();
+    kb.update_index().unwrap();
 
     // 没登记等价词：剩余词「beta」敲不到正文里的「alpha」。
     let before = kb.search_preset(&PresetRequest {
@@ -1745,6 +1840,7 @@ fn preset_notes_split_titles_contents_and_path_fallback() {
     let a_path = a_dir.join("city.md");
     std::fs::write(&a_path, "岩王帝君坐镇此地").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&a_path)).unwrap();
+    kb.update_index().unwrap();
 
     // B：正文里出现「city」，文件名无关 -> 靠内容命中。
     let b_dir = dir.path().join("杂记");
@@ -1752,6 +1848,7 @@ fn preset_notes_split_titles_contents_and_path_fallback() {
     let b_path = b_dir.join("港口见闻.md");
     std::fs::write(&b_path, "city 港口 今日格外热闹").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&b_path)).unwrap();
+    kb.update_index().unwrap();
 
     // C：只有目录段带「沧浪」，文件名与正文都没有 -> 只能靠目录兜底。
     let c_dir = dir.path().join("沧浪");
@@ -1759,6 +1856,7 @@ fn preset_notes_split_titles_contents_and_path_fallback() {
     let c_path = c_dir.join("寒天之钉.md");
     std::fs::write(&c_path, "封冻的极北之地一览无余").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&c_path)).unwrap();
+    kb.update_index().unwrap();
 
     // 搜「city」：A 进书名块，B 进内容块，两块同时出；B 不再被目录兜底重复一次。
     let by_title = notes_section(&kb, "city");
@@ -1777,7 +1875,6 @@ fn preset_notes_split_titles_contents_and_path_fallback() {
     assert!(!by_path.paths.is_empty(), "书名块不足时由目录兜底补足");
 
     // 索引与主库对账之后同一批查询结果一致。
-    kb.update_index().unwrap();
     let after = notes_section(&kb, "city");
     assert_eq!(after.titles.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), title_ids, "对账后书名块一致");
     assert_eq!(after.contents.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), content_ids, "对账后内容块一致");
@@ -1790,11 +1887,14 @@ fn preset_fields_stay_separate() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("预设字段分离用的记忆", "public")).unwrap();
+    kb.update_index().unwrap();
     kb.graph().apply_batch(&GraphBatch { entities: vec![entity("预设字段分离用的实体")], ..Default::default() }).unwrap();
+    kb.update_index().unwrap();
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let path = dir.path().join("预设字段分离用的笔记.md");
     std::fs::write(&path, "预设字段分离用的正文".repeat(20)).unwrap();
     kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap();
+    kb.update_index().unwrap();
 
     let query = "预设字段分离用";
     let of = |preset| kb.search_preset(&PresetRequest { preset, query: query.into(), ..Default::default() }).unwrap();
@@ -1822,6 +1922,7 @@ fn preset_budgets_cap_by_characters_not_counts() {
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     for index in 0..5 {
         kb.memories().upsert(memory(&format!("字符封顶样例 {index} {}", "长".repeat(300)), "public")).unwrap();
+        kb.update_index().unwrap();
     }
     let request = |chars| PresetRequest { preset: SearchPreset::Memory, query: "字符封顶样例".into(),
         budget: PresetBudget { memory_chars: chars, ..Default::default() }, ..Default::default() };
@@ -1837,6 +1938,7 @@ fn preset_without_seed_entities_keeps_other_routes() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("只写在记忆里的独有措辞", "public")).unwrap();
+    kb.update_index().unwrap();
 
     let result = kb.search_preset(&PresetRequest {
         preset: SearchPreset::Rag, query: "只写在记忆里的独有措辞".into(), ..Default::default()
@@ -1854,6 +1956,7 @@ fn entity_name_column_outweighs_long_body() {
     // 正主：规范名就是查询词，正文只有名字本身。
     let target = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("苹果")], ..Default::default() })
         .unwrap().value.entities[0].header.id;
+        kb.update_index().unwrap();
     // 干扰：规范名与查询无关，但别名与属性里反复出现查询词——纯 BM25 下它靠词频与短正文领先。
     let mut noisy = entity("香蕉");
     noisy.aliases = vec!["苹果".into()];
@@ -1862,6 +1965,7 @@ fn entity_name_column_outweighs_long_body() {
     }
     let noise = kb.graph().apply_batch(&GraphBatch { entities: vec![noisy], ..Default::default() })
         .unwrap().value.entities[0].header.id;
+        kb.update_index().unwrap();
 
     let req = SearchRequest { query: "苹果".into(), kinds: vec![RecordKind::Entity],
         text: true, vector: false, rerank: false, ..Default::default() };
@@ -1878,6 +1982,7 @@ fn entity_name_reaches_the_rerank_document() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.graph().apply_batch(&GraphBatch { entities: vec![entity("孤名实体")], ..Default::default() }).unwrap();
+    kb.update_index().unwrap();
 
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
@@ -1923,12 +2028,14 @@ fn predicate_equivalents_expand_search_without_rewriting_storage() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let made = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("bob"), entity("alice")], ..Default::default() }).unwrap();
+    kb.update_index().unwrap();
     let subject = made.value.entities[0].header.id;
     let object = made.value.entities[1].header.id;
     let relation = kb.graph().apply_batch(&GraphBatch { relations: vec![RelationInput {
         record: RecordInput::default(), subject_id: subject, predicate: "delta".into(),
         object_id: object, confidence: 0.9, reason: String::new(),
     }], ..Default::default() }).unwrap().value.relations[0].header.id;
+    kb.update_index().unwrap();
 
     let request = SearchRequest { query: "epsilon".into(), kinds: vec![RecordKind::Relation],
         text: true, vector: false, rerank: false, ..Default::default() };
@@ -1952,6 +2059,7 @@ fn predicate_equivalents_expand_search_without_rewriting_storage() {
 fn event_sink_receives_one_search_event_with_stages() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for text in ["事件流 甲", "事件流 乙", "事件流 丙"] { kb.memories().upsert(memory(text, "public")).unwrap(); }
+    kb.update_index().unwrap();
     let events: Arc<Mutex<Vec<LogEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = events.clone();
     kb.register_event_sink(move |event: &LogEvent| recorder.lock().unwrap().push(event.clone()));
@@ -1983,6 +2091,7 @@ fn event_sink_receives_one_search_event_with_stages() {
 fn event_sink_reports_the_rerank_stage() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for text in ["事件重排 甲", "事件重排 乙", "事件重排 丙"] { kb.memories().upsert(memory(text, "public")).unwrap(); }
+    kb.update_index().unwrap();
     let received: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let recorder = received.clone();
     kb.register_reranker_with(move |_: &str, documents: &[String]| {
@@ -2011,6 +2120,7 @@ fn event_sink_reports_the_rerank_stage() {
 fn event_sink_panic_does_not_break_search() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for text in ["事件抛错 甲", "事件抛错 乙"] { kb.memories().upsert(memory(text, "public")).unwrap(); }
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "事件抛错".into(), limit: 2, kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
     let baseline: Vec<i64> = kb.search(&request).unwrap().hits.iter().map(|hit| hit.key.id).collect();
     kb.register_event_sink(|_: &LogEvent| panic!("sink 自己炸了"));
@@ -2023,6 +2133,7 @@ fn event_sink_panic_does_not_break_search() {
 fn event_sink_does_not_change_results() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     for text in ["事件中立 甲", "事件中立 乙"] { kb.memories().upsert(memory(text, "public")).unwrap(); }
+    kb.update_index().unwrap();
     let request = SearchRequest { query: "事件中立".into(), limit: 2, kinds: vec![RecordKind::Memory], vector: false, ..Default::default() };
     let before = kb.search(&request).unwrap();
     let events: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -2045,13 +2156,14 @@ fn deleted_records_leave_the_index() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let doomed = kb.memories().upsert(memory("删档独有词", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     kb.memories().upsert(memory("保留记录", "public")).unwrap();
     kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().index_document_count, 2, "两条都进了索引");
     let hits = |query: &str| kb.search(&SearchRequest { query: query.into(), limit: 10, ..Default::default() }).unwrap().hits.len();
     assert_eq!(hits("删档独有词"), 1);
 
-    kb.memories().delete(doomed, &ReadFilter::default()).unwrap();
+    kb.memories().delete(&[doomed], &ReadFilter::default()).unwrap();
     kb.update_index().unwrap();
     assert_eq!(kb.health().unwrap().index_document_count, 1, "删掉的记录要从索引里摘掉");
     assert_eq!(hits("删档独有词"), 0, "删掉的记录不能再被搜到");
@@ -2068,6 +2180,7 @@ fn rewritten_note_drops_its_obsolete_chunks_from_the_index() {
     let path = dir.path().join("长文.md");
     std::fs::write(&path, "overview".repeat(800)).unwrap();
     let wide = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     let chunks = kb.notes().chunks(wide.header.id, &ReadFilter::default()).unwrap().len();
     assert!(chunks > 1, "这篇应当切成多片");
     kb.update_index().unwrap();
@@ -2096,6 +2209,7 @@ fn two_notes(kb: &KnowledgeBase, dir: &std::path::Path) -> (i64, i64) {
     std::fs::write(dir.join("a.md"), "harbor的契约与地契").unwrap();
     std::fs::write(dir.join("b.md"), "harbor的商船与货单").unwrap();
     let a = kb.notes().upsert_file(first).unwrap().value;
+    kb.update_index().unwrap();
     let b = kb.notes().upsert_file(second).unwrap().value;
     kb.update_index().unwrap();
     (a.header.id, b.header.id)
@@ -2186,7 +2300,7 @@ fn the_vector_path_honours_the_note_limit() {
     assert!(scoped.iter().all(|hit| in_a.contains(&hit.key.id)), "向量候选也必须来自被限定的笔记");
 }
 
-// ── 按过滤批量删除 ────────────────────────────────────────────────────
+// ── 批量删除（按 id） ──────────────────────────────────────────────────
 
 fn tagged_entity(name: &str, tags: &[&str]) -> EntityInput {
     let mut value = entity(name);
@@ -2199,75 +2313,82 @@ fn write_entity(kb: &KnowledgeBase, input: EntityInput) -> i64 {
     kb.graph().apply_batch(&GraphBatch { entities: vec![input], ..Default::default() }).unwrap().value.entities[0].header.id
 }
 
-fn write_relation(kb: &KnowledgeBase, subject: i64, predicate: &str, object: i64) {
+fn write_relation(kb: &KnowledgeBase, subject: i64, predicate: &str, object: i64) -> i64 {
     let relation = RelationInput { record: RecordInput::default(), subject_id: subject,
         predicate: predicate.into(), object_id: object, confidence: 0.8, reason: String::new() };
-    kb.graph().apply_batch(&GraphBatch { relations: vec![relation], ..Default::default() }).unwrap();
+    kb.graph().apply_batch(&GraphBatch { relations: vec![relation], ..Default::default() }).unwrap().value.relations[0].header.id
 }
 
-/// 记忆域：按域一次清空，返回条数，列表随之变空。
+/// 记忆域：按 id 批量删，返回实际删除条数，列表随之变空。
 #[test]
 fn a_batch_delete_clears_the_whole_memory_domain() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let inputs: Vec<MemoryInput> = (1..=3).map(|i| memory(&format!("待清的记忆 {i}"), "public")).collect();
     kb.memories().upsert_many(&inputs).unwrap();
-    assert_eq!(kb.memories().delete_by_filter(&ReadFilter::default()).unwrap().value, 3);
+    kb.update_index().unwrap();
+    let ids: Vec<i64> = kb.memories().list(&PageRequest { limit: 10, ..Default::default() }).unwrap().items.iter().map(|m| m.header.id).collect();
+    assert_eq!(kb.memories().delete(&ids, &ReadFilter::default()).unwrap().value, 3);
     assert!(kb.memories().list(&PageRequest::default()).unwrap().items.is_empty(), "清空之后一条都不剩");
 }
 
-/// 标签收窄时只删命中的那些，没带标签的记录原样留下。
+/// 未命中的 id 静默跳过：一批里混进不存在的 id，命中的照删，返回实际条数。空批删零条。
 #[test]
-fn a_tag_narrows_the_batch_delete() {
+fn unknown_ids_are_skipped_by_a_batch_delete() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
-    let mut tagged = memory("带标签的记忆", "public");
-    tagged.record.tags = vec!["draft".into()];
-    kb.memories().upsert_many(&[tagged, memory("留下的记忆", "public")]).unwrap();
-    let filter = ReadFilter { tags: vec!["draft".into()], ..Default::default() };
-    assert_eq!(kb.memories().delete_by_filter(&filter).unwrap().value, 1);
+    let kept = kb.memories().upsert(memory("留下的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    let doomed = kb.memories().upsert(memory("待删的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    assert_eq!(kb.memories().delete(&[doomed, 999_999], &ReadFilter::default()).unwrap().value, 1);
     let left = kb.memories().list(&PageRequest::default()).unwrap().items;
     assert_eq!(left.len(), 1);
-    assert_eq!(left[0].judgment, "留下的记忆");
+    assert_eq!(left[0].header.id, kept);
+    assert_eq!(kb.memories().delete(&[], &ReadFilter::default()).unwrap().value, 0, "空批删零条");
+    assert_eq!(kb.notes().delete(&[], &ReadFilter::default()).unwrap().value, 0);
+    assert_eq!(kb.graph().delete(RecordKind::Entity, &[], &ReadFilter::default()).unwrap().value, 0);
 }
 
-/// 空命中不是错误：没有匹配就返回 0。
-#[test]
-fn an_empty_match_deletes_nothing_and_returns_zero() {
-    let dir = tempfile::tempdir().unwrap();
-    let kb = KnowledgeBase::open(dir.path()).unwrap();
-    assert_eq!(kb.memories().delete_by_filter(&ReadFilter::default()).unwrap().value, 0);
-    assert_eq!(kb.graph().delete_by_filter(&ReadFilter::default()).unwrap().value, 0);
-    assert_eq!(kb.notes().delete_by_filter(&ReadFilter::default()).unwrap().value, 0);
-}
-
-/// 图谱域：清一个域时实体与它的边一起走，不留下半截状态。
+/// 图谱：先把边删掉，实体那批才能落——外键的先后由调用方的批来保证。
 #[test]
 fn clearing_a_graph_domain_takes_its_edges_along() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let subject = write_entity(&kb, entity("甲"));
     let object = write_entity(&kb, entity("乙"));
-    write_relation(&kb, subject, "创造", object);
-    // 计数是实体加关系，参与行与边本身是级联产物。
-    assert_eq!(kb.graph().delete_by_filter(&ReadFilter::default()).unwrap().value, 3);
+    let relation_id = write_relation(&kb, subject, "创造", object);
+    assert_eq!(kb.graph().delete(RecordKind::Relation, &[relation_id], &ReadFilter::default()).unwrap().value, 1);
+    assert_eq!(kb.graph().delete(RecordKind::Entity, &[subject, object], &ReadFilter::default()).unwrap().value, 2);
     for kind in [RecordKind::Entity, RecordKind::Relation, RecordKind::Event] {
         assert!(kb.graph().list(kind, &PageRequest::default()).unwrap().items.is_empty(), "域清空后 {kind:?} 一条不剩");
     }
 }
 
-/// 过滤条件之外的边还指着待删实体时，删除被外键拦下，整个事务回滚。
+/// 实体仍被关系引用时删除被外键拦下返回 Conflict：实体仍在、索引词条也在（不许出现
+/// 「记录还在、词条没了」），主库留着「正在删除」标记，引用清掉之后的下次开机把这条删除做完。
 #[test]
-fn a_batch_delete_is_refused_when_an_out_of_scope_edge_still_points_at_the_entity() {
+fn a_batch_delete_is_refused_while_an_edge_still_points_at_the_entity() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let subject = write_entity(&kb, tagged_entity("甲", &["keep"]));
     let object = write_entity(&kb, entity("乙"));
     write_relation(&kb, subject, "创造", object);
-    // 只有实体带标签，过滤条件命中的实体、不命中它那条边。
-    let filter = ReadFilter { tags: vec!["keep".into()], ..Default::default() };
-    assert!(matches!(kb.graph().delete_by_filter(&filter), Err(Error::Conflict(_))), "边还在，删实体必须被拦下");
-    assert!(kb.graph().get(RecordKind::Entity, subject, &ReadFilter::default()).is_ok(), "事务回滚，实体仍在");
+    kb.update_index().unwrap();
+    let query = SearchRequest { query: "甲".into(), ..Default::default() };
+    assert!(!kb.search(&query).unwrap().hits.is_empty(), "删之前实体可检索");
+    assert!(matches!(kb.graph().delete(RecordKind::Entity, &[subject], &ReadFilter::default()), Err(Error::Conflict(_))),
+        "边还在，删实体必须被拦下");
+    assert!(kb.graph().get(RecordKind::Entity, subject, &ReadFilter::default()).is_ok(), "实体仍在");
+    assert!(!kb.search(&query).unwrap().hits.is_empty(), "被拦下的删除不许摘掉它的索引词条");
+    kb.close().unwrap();
+    drop(kb);
+    // 关库重开后：词条仍在，标记留着等引用清掉后再删完。
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    assert!(!kb.search(&query).unwrap().hits.is_empty(), "重开后实体仍可检索");
+    let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+    let status: i64 = conn.query_row("SELECT status FROM records WHERE id=?1", [subject], |r| r.get(0)).unwrap();
+    assert_eq!(status, 2, "主库上留着「正在删除」标记（2），引用清掉后下次开机会把删除做完");
 }
 
 /// 笔记域：删笔记连同它的切片，切片不会变成孤儿。
@@ -2279,25 +2400,158 @@ fn clearing_a_note_domain_takes_its_chunks_along() {
     std::fs::write(&path, "笔记正文里的独有措辞").unwrap();
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
     let chunk = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
-    // 计数只算笔记本身，切片是级联产物。
-    assert_eq!(kb.notes().delete_by_filter(&ReadFilter::default()).unwrap().value, 1);
+    // 计数按删除的记录行数：一篇笔记连带它的切片。
+    assert_eq!(kb.notes().delete(&[note.header.id], &ReadFilter::default()).unwrap().value, 2);
     assert!(kb.notes().list(&PageRequest::default()).unwrap().items.is_empty());
     assert!(kb.notes().get_chunk(chunk, &ReadFilter::default()).is_err(), "切片随笔记一起删掉");
 }
 
-/// 批量删除同样要进索引对账：删掉的记录不能再被检索到。
+/// 删掉的记录提交之后不能再被检索到。
 #[test]
 fn the_index_forgets_batch_deleted_records() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
-    kb.memories().upsert(memory("批量删除后不该被检索到的措辞", "public")).unwrap();
+    let doomed = kb.memories().upsert(memory("批量删除后不该被检索到的措辞", "public")).unwrap().value.header.id;
     kb.update_index().unwrap();
     let query = SearchRequest { query: "批量删除后".into(), ..Default::default() };
     assert!(!kb.search(&query).unwrap().hits.is_empty(), "删之前检索得到");
-    kb.memories().delete_by_filter(&ReadFilter::default()).unwrap();
+    kb.memories().delete(&[doomed], &ReadFilter::default()).unwrap();
     kb.update_index().unwrap();
     assert!(kb.search(&query).unwrap().hits.is_empty(), "删之后索引里也没有了");
+}
+
+// ── 停电恢复与显式对账 ────────────────────────────────────────────────
+
+/// 停电恢复·写入侧：主库已写、索引没提交（进程未收尾，攒着的文档随进程消失），
+/// 重开库按主库标记把缺的文档按主库现状重新折出来，不需要调用方 update_index。
+#[test]
+fn crash_recovery_reindexes_records_marked_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let id = kb.memories().upsert(memory("断电前写入的记忆", "public")).unwrap().value.header.id;
+    // 不调 update_index 直接丢弃句柄：攒着的文档随进程消失，主库留着「正在写入」标记。
+    drop(kb);
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    assert_eq!(kb.health().unwrap().index_document_count, 1, "开库恢复把缺的文档补齐");
+    let query = SearchRequest { query: "断电前写入的记忆".into(), ..Default::default() };
+    let hits = kb.search(&query).unwrap().hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key.id, id);
+    let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+    let marked: i64 = conn.query_row("SELECT COUNT(*) FROM records WHERE status<>0", [], |r| r.get(0)).unwrap();
+    assert_eq!(marked, 0, "恢复过的标记就地清零");
+}
+
+/// 停电恢复·删除侧：删到一半断电（主库标记在、行还在），重开库把这条删除做完；
+/// 没标记的一条不受牵连。
+#[test]
+fn crash_recovery_completes_deletes_marked_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let doomed = kb.memories().upsert(memory("删一半断电的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    let kept = kb.memories().upsert(memory("留下的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    kb.close().unwrap();
+    // 模拟「标记已落、派生还没删」的断电窗口：人为把标记写回。
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        conn.execute("UPDATE records SET status=2 WHERE id=?1", [doomed]).unwrap();
+    }
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    assert_eq!(kb.health().unwrap().index_document_count, 1, "恢复把标记那条的词条摘掉");
+    assert!(kb.memories().get(doomed, &ReadFilter::default()).is_err(), "标记那条已按删除流程走完");
+    assert!(kb.memories().get(kept, &ReadFilter::default()).is_ok(), "没标记的一条不受牵连");
+}
+
+/// 停电恢复·删除侧（被引用）：遗留 status=2 的记录若仍被关系引用，恢复不许摘它的索引词条、
+/// 标记保留等下次；否则会留下「记录还在、词条没了」的永久不一致。
+#[test]
+fn crash_recovery_keeps_a_blocked_delete_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let subject = write_entity(&kb, tagged_entity("甲", &["keep"]));
+    let object = write_entity(&kb, entity("乙"));
+    write_relation(&kb, subject, "创造", object);
+    kb.update_index().unwrap();
+    kb.close().unwrap();
+    // 模拟「标记已落、删除还没做」的断电窗口：实体仍被关系引用，删除注定失败。
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        conn.execute("UPDATE records SET status=2 WHERE id=?1", [subject]).unwrap();
+    }
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let query = SearchRequest { query: "甲".into(), ..Default::default() };
+    assert!(!kb.search(&query).unwrap().hits.is_empty(), "删不掉的记录，恢复不许碰它的索引词条");
+    let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+    let status: i64 = conn.query_row("SELECT status FROM records WHERE id=?1", [subject], |r| r.get(0)).unwrap();
+    assert_eq!(status, 2, "删除失败的标记保留，引用清掉后的下次开机再删");
+}
+
+/// 下游带一个不存在的 id 写记录：必须按「更新既有记录」语义报 NotFound，不许静默新建。
+#[test]
+fn upsert_with_an_unknown_id_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let mut input = MemoryInput::new("凭空插入的记忆");
+    input.record.id = Some(999_999);
+    assert!(matches!(kb.memories().upsert(input), Err(Error::NotFound(_))), "id 不存在必须报 NotFound");
+    assert_eq!(kb.health().unwrap().record_count, 0, "不许凭一个 id 凭空建出记录");
+}
+
+/// 稳态不做任何全库对账：绕过 API 直改主库造成的索引孤儿，开库与读取都不清理，
+/// 只在下游显式对账时摘掉。读路径的点查兜底让孤儿在结果里不可见。
+#[test]
+fn stale_index_entries_wait_for_an_explicit_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let doomed = kb.memories().upsert(memory("绕过API被删的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    kb.close().unwrap();
+    // 绕过 API 直改主库：标记随行消失，派生库里剩下孤儿词条，标记恢复无从知晓。
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        conn.execute("DELETE FROM records WHERE id=?1", [doomed]).unwrap();
+    }
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    assert_eq!(kb.health().unwrap().index_document_count, 1, "开库不做自动对账");
+    let query = SearchRequest { query: "绕过API被删的记忆".into(), ..Default::default() };
+    assert!(kb.search(&query).unwrap().hits.is_empty(), "孤儿词条被读路径点查拦住，不进结果");
+    kb.reconcile_index().unwrap();
+    assert_eq!(kb.health().unwrap().index_document_count, 0, "显式对账把孤儿词条摘掉");
+}
+
+/// 向量对账：向量库里记录已消失的孤儿行按「需要删的」清掉，缺的照常补齐。
+#[test]
+fn vector_reconcile_deletes_orphans_and_fills_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 4);
+    let id = kb.memories().upsert(memory("向量对账的记忆", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    fill(&kb, "v");
+    {
+        let vconn = rusqlite::Connection::open(dir.path().join("vectors.sqlite3")).unwrap();
+        let count: i64 = vconn.query_row("SELECT COUNT(*) FROM embeddings WHERE space_id='v'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "补齐后向量库里有一条向量");
+    }
+    kb.close().unwrap();
+    // 绕过 API 把记录行删掉：向量库里留下孤儿向量。
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        conn.execute("DELETE FROM records WHERE id=?1", [id]).unwrap();
+    }
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    space(&kb, "v", 4);
+    let report = kb.embeddings().sync("v", 32).unwrap().value;
+    assert_eq!(report.deleted, 1, "孤儿向量被对账清掉");
+    {
+        let vconn = rusqlite::Connection::open(dir.path().join("vectors.sqlite3")).unwrap();
+        let count: i64 = vconn.query_row("SELECT COUNT(*) FROM embeddings WHERE space_id='v'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "向量库里不再留孤儿");
+    }
 }
 
 /// 谓词等价登记要能撤：按词删只动它自己，清整域一次清空。
@@ -2356,20 +2610,25 @@ fn a_record_can_change_scope() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     let id = kb.memories().upsert(memory("换作用域", "public")).unwrap().value.header.id;
+    kb.update_index().unwrap();
     let mut moved = memory("换作用域", "private");
     moved.record.id = Some(id);
     kb.memories().upsert(moved).unwrap();
+    kb.update_index().unwrap();
     let private = ReadFilter { namespace: "default".into(), scopes: vec!["private".into()], ..Default::default() };
     assert_eq!(kb.memories().get(id, &private).unwrap().header.scope, "private");
 
     let entities = kb.graph().apply_batch(&GraphBatch { entities: vec![entity("alice"), entity("bob")], ..Default::default() })
         .unwrap().value.entities;
+        kb.update_index().unwrap();
     kb.graph().apply_batch(&GraphBatch { relations: vec![RelationInput { record: RecordInput::default(),
         subject_id: entities[0].header.id, predicate: "knows".into(), object_id: entities[1].header.id,
         confidence: 1.0, reason: String::new() }], ..Default::default() }).unwrap();
+        kb.update_index().unwrap();
     let mut linked = entity("alice");
     linked.record.id = Some(entities[0].header.id);
     linked.record.scope = "private".into();
     assert!(kb.graph().apply_batch(&GraphBatch { entities: vec![linked], ..Default::default() }).is_err(),
         "被关系引用的实体不能直接换域");
+        kb.update_index().unwrap();
 }

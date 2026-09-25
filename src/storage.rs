@@ -7,12 +7,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
-/// 读路径自愈索引时最多试几次拿写锁（每次退避 1ms，合计约 1s）。
-/// 只在库内补向量那条线程正在补齐时才试：它提交的正是读者要看的索引增删，
-/// 而那份提交一落地索引就干净了，循环随即结束。别的时候（例如批量导入的写者占着写锁）
-/// 一律不试，读路径绝不为索引排队——那正是当初吞吐塌方的成因。
-
-
 /// 写者：独占的写连接 + 跨进程文件锁。只挡其他写者，不挡读。
 pub(crate) struct Writer { pub conn: Connection, _file_lock: File }
 
@@ -175,18 +169,14 @@ impl KnowledgeBase {
         if !file_lock.try_lock_exclusive()? { return Err(Error::Locked(root.display().to_string())); }
         let mut write_conn = Connection::open(root.join("store.sqlite3"))?;
         schema::initialize(&mut write_conn)?;
-        // 向量外挂库：主库有 embeddings 表说明是旧库，先把它整表搬进 vectors.sqlite3。
-        // 搬迁在主库写连接上做，搬完再 ATTACH，避免挂一个还不存在的文件。
-        let needs_vector_migration: bool = write_conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embeddings'", [], |r| r.get::<_, i64>(0)).map(|n| n > 0)?;
-        if needs_vector_migration { crate::embeddings::migrate_vectors(&root, &mut write_conn)?; }
-        // 向量库文件此刻必须已存在（迁移会建，新库也要建）：否则 ATTACH 查不到表。
+        // 向量外挂库：独立文件，建表后 ATTACH，写路径的删除与指纹核对都要看得见它。
         let vector_writer = open_vector_writer(&root)?;
         // 向量库外挂：写路径的删除与指纹核对也要看得见它。
         write_conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
         let index = Arc::new(TextIndex::open(&root)?);
-        // 打开即对账：索引与主库对齐，缺的补、多的删。没有「重建」这条路。
-        index.reconcile(&write_conn)?;
+        // 停电恢复：读主库标记，把上次没删完的删完、没同步完的按主库现状重新同步。
+        // 开库不做全库对账——派生与权威的对齐由写路径当场保证，残余走显式 `reconcile_index`。
+        recover_marks(&write_conn, &index)?;
         // 只读连接在 schema 建好之后再开，保证它看到的是完整结构。
         let reader = open_reader(&root)?;
         let vector_reader = open_vector_reader(&root)?;
@@ -222,7 +212,8 @@ impl KnowledgeBase {
     pub fn close(&self) -> Result<()> {
         let mut guard = self.engine.writer.lock();
         let result = match guard.as_ref() {
-            Some(writer) => self.index()?.sync(&writer.conn),
+            // 收尾只做提交：攒下的增删落盘，已提交的「正在写入」标记就地清干净。
+            Some(writer) => self.index()?.sync(&writer.conn).and_then(|()| clear_writing_marks(&writer.conn)),
             None => Ok(()),
         };
         *guard = None;
@@ -280,45 +271,30 @@ impl KnowledgeBase {
         Ok(loaded)
     }
 
-    /// 索引可能落后时（写路径攒了增删、或删过记录）才尝试对齐。
-    /// 干净时这次预检让读完全不碰写锁；需要对齐时也**只尝试、不等待**——
-    /// 抢不到写锁说明写者正在提交，读路径绝不为它排队，等下一次读取再补平。
-    /// `conn` 只用于判定，不写任何东西；真正对齐走写连接。
-    pub(crate) fn sync_index_if_behind(&self, _conn: &Connection) -> Result<()> {
-        let index = self.index()?;
-        if !index.is_dirty() { return Ok(()); }
-        if let Some(mut guard) = self.engine.writer.try_lock() {
-            if let Some(writer) = guard.as_mut() { index.sync(&writer.conn)?; }
-        }
-        Ok(())
-    }
-
-    /// 业务写入：改记录、改向量。提交后按领域精准失效向量分区缓存。
-    pub(crate) fn mutate<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<WriteReceipt<T>> {
-        let mut guard = self.engine.writer.lock();
-        let writer = guard.as_mut().ok_or(Error::Closed)?;
-        let changed_before = writer.conn.total_changes();
-        let log = TouchLog::install();
-        let tx = writer.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&tx)?;
-        let revision = current_revision(&tx)?;
-        tx.commit()?;
-        let touched = log.take();
-        drop(log);
-        // 索引不在写入路径上提交——写入只把文档/删除攒在 writer 里，
-        // 由使用方稍后调用 `update_index` 一趟对齐（提交 + 对账）。
-        let rows_changed = writer.conn.total_changes() > changed_before;
+    /// 业务写入：一条事务。写锁只覆盖这条事务本身——事务提交即放锁，临界区贴着写。
+    /// 索引文档只是攒着、不提交，在写锁**外**交给索引 writer（它有自己的内部锁）；
+    /// 提交仍由使用方调 `update_index`（或关闭收尾）一次做完。
+    /// 并发的写与 `update_index` 由下游自行串行：库不为下游的并发负责。
+    pub(crate) fn mutate<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<(T, Vec<crate::index::IndexDocument>)>) -> Result<WriteReceipt<T>> {
+        let (value, documents, revision, touched, rows_changed) = {
+            let mut guard = self.engine.writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            let changed_before = writer.conn.total_changes();
+            let log = TouchLog::install();
+            let tx = writer.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (value, documents) = f(&tx)?;
+            let revision = current_revision(&tx)?;
+            tx.commit()?;
+            let touched = log.take();
+            drop(log);
+            (value, documents, revision, touched, writer.conn.total_changes() > changed_before)
+        };
+        if !documents.is_empty() { self.index()?.stage(&documents)?; }
         if rows_changed {
-            // 索引可能已落后主库（有记录增删）：标脏，等 `update_index` 或读取侧自愈时对账。
-            self.index()?.mark_dirty();
             // 向量缓存按领域失效：动过的领域就地清掉，没动过的照旧留着。
             if touched.is_empty() { self.engine.vectors.invalidate(); }
             else { self.engine.vectors.invalidate_namespaces(&touched); }
-            // 记录一变，「应向量化集合」就变了：受影响领域的就绪标记就地作废，
-            // 等补齐核对过再重新标。这样检索侧读到的永远是「核对过的那一份」。
-            self.invalidate_readiness(&touched);
         }
-        drop(guard);
         Ok(WriteReceipt { value, revision })
     }
 
@@ -334,17 +310,6 @@ impl KnowledgeBase {
         Ok(WriteReceipt { value, revision })
     }
 
-    /// 作废这些领域（本次事务实际动过的）的向量就绪标记。
-    /// 领域集合由写路径就地登记，不再依赖任何待办表推算。
-    fn invalidate_readiness(&self, namespaces: &HashSet<String>) {
-        if namespaces.is_empty() { return; }
-        let mut guard = self.engine.vector_writer.lock();
-        let Some(vector_writer) = guard.as_mut() else { return; };
-        for namespace in namespaces {
-            let _ = crate::embeddings::clear_vector_ready(&vector_writer.conn, namespace);
-        }
-    }
-
     pub fn memories(&self) -> crate::memory::MemoryStore { crate::memory::MemoryStore(self.clone()) }
     pub fn graph(&self) -> crate::graph::GraphStore { crate::graph::GraphStore(self.clone()) }
     pub fn notes(&self) -> crate::notes::NoteStore { crate::notes::NoteStore(self.clone()) }
@@ -356,9 +321,26 @@ impl KnowledgeBase {
         let mut guard = self.engine.writer.lock();
         let value = f(guard.as_mut().ok_or(Error::Closed)?)?;
         self.engine.vectors.invalidate();
-        // 这条路径可能改了记录（例如导入进度回写），保守地把索引标脏，等下一次对账。
-        let _ = self.index().map(|index| index.mark_dirty());
         Ok(value)
+    }
+
+    /// 一次写锁包住整段组合写（「先删后加」这类由多条事务拼成的流程）。
+    /// 锁内事务各自提交；结束后按登记的领域精准失效向量分区缓存，
+    /// 中途出错则整体失效——已提交的那部分事务动过向量行，缓存不能带着旧账。
+    pub(crate) fn with_writer_lock<T>(&self, f: impl FnOnce(&mut Writer) -> Result<T>) -> Result<T> {
+        let mut guard = self.engine.writer.lock();
+        let log = TouchLog::install();
+        let outcome = f(guard.as_mut().ok_or(Error::Closed)?);
+        let touched = log.take();
+        drop(log);
+        match outcome {
+            Ok(value) => {
+                if touched.is_empty() { self.engine.vectors.invalidate(); }
+                else { self.engine.vectors.invalidate_namespaces(&touched); }
+                Ok(value)
+            }
+            Err(error) => { self.engine.vectors.invalidate(); Err(error) }
+        }
     }
 
     /// 记下一个降级档位，去重保留少量，供健康检查读出。
@@ -370,21 +352,78 @@ impl KnowledgeBase {
         }
     }
 
-    /// 收敛索引：把写入攒下的增删提交一次，再对主库算差集对齐、只提交一次。
-    /// 写入不再就地索引，使用方（尤其批量导入）在合适时机调用本方法即可；
-    /// 期间读取走 `sync_index_if_behind` 自愈兜底。
-    pub fn update_index(&self) -> Result<HealthReport> {
-        self.catch_up_index()?;
+    /// 批量删除：主库查 id，命中才继续。标记先行，随后在事务里删向量行与主库行（权威最后落），
+    /// 只有确实删掉的记录才摘索引词条——外键拦下的删除整体回滚，索引词条一个不动，
+    /// 主库上的「正在删除」标记留待下次开机或人工清掉引用后再删完。
+    /// 非目标类型或过滤条件不命中的 id 按未命中处理，不算错误。返回实际删除条数。
+    /// `children` 展开随行删除的子记录（笔记展开它的切片，其余域为空）。
+    pub(crate) fn delete_flow(&self, ids: &[i64], filter: &ReadFilter, kind: RecordKind,
+        children: impl Fn(&Connection, i64) -> Result<Vec<i64>>) -> Result<usize> {
+        // 锁外查命中：一个读连接上逐个点查，没命中的直接落掉。
+        let mut hits = Vec::new();
+        {
+            let state = self.read()?;
+            let conn = state.conn();
+            for id in ids {
+                let hit: Option<i64> = conn.query_row("SELECT id FROM records WHERE id=?1 AND kind=?2",
+                    params![id, kind.code()], |r| r.get(0)).optional()?;
+                if hit.is_some() && matches_filter(conn, &RecordKey { id: *id }, filter)? { hits.push(*id); }
+            }
+        }
+        if hits.is_empty() { return Ok(0); }
+        let mut removed = 0usize;
+        let marked_ids = self.with_writer_lock(|writer| {
+            // 标记先行：要删的记录连同子记录一起标成「正在删除」，先于一切派生动作落主库。
+            let mut marked: Vec<(i64, i64)> = Vec::new();
+            let tx = writer.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &hits {
+                for child in children(&tx, *id)? { marked.push((child, RecordKind::Chunk.code())); }
+                marked.push((*id, kind.code()));
+            }
+            // 删除次序按 kind 降序：切片先于笔记、边先于点，引用方先退场，RESTRICT 不会拦。
+            marked.sort_by(|a, b| b.1.cmp(&a.1));
+            let marked_ids: Vec<i64> = marked.iter().map(|(id, _)| *id).collect();
+            mark_records(&tx, &marked_ids, MARK_DELETING)?;
+            tx.commit()?;
+            // 权威落：删向量行 + 删主库行。外键拦下（例如实体仍被关系引用）就整体回滚返回 Conflict，
+            // 此时索引词条尚未摘、标记仍在主库，没有「记录还在、词条没了」这种半截状态。
+            let tx = writer.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &marked_ids {
+                if delete_record(&tx, &RecordKey { id: *id })? { removed += 1; }
+            }
+            tx.commit()?;
+            Ok(marked_ids)
+        })?;
+        // 派生退在写锁外：只摘确实删掉的记录，提交交给 update_index / 关闭收尾。
+        self.index()?.stage_deletions(&marked_ids)?;
+        Ok(removed)
+    }
+
+    /// 显式对账：把索引里实际存在的记录 id 与主库现存的记录 id 求差集对齐——
+    /// 索引里多出来的按 key 摘掉，缺的就地补上。只由下游主动调用：停电标记恢复
+    /// 覆盖不了的残余（例如绕过 API 直改主库）由这里一次收敛。稳态下差集为空，
+    /// 连一次提交都不发生。
+    pub fn reconcile_index(&self) -> Result<HealthReport> {
+        {
+            let mut guard = self.engine.writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            self.index()?.reconcile(&writer.conn)?;
+        }
         self.health()
     }
 
-    /// 收敛索引：提交写入攒下的增删、再对主库算差集对齐，全程在写连接上一次做完。
-    /// 只由写入侧（`update_index`）触发——索引提交是写入路径的职责，
-    /// 读取侧的自愈走 `sync_index_if_behind`，向量化则完全不碰这里。
-    fn catch_up_index(&self) -> Result<()> {
-        let mut guard = self.engine.writer.lock();
-        let Some(writer) = guard.as_mut() else { return Ok(()) };
-        self.index()?.sync(&writer.conn)
+    /// 提交写入攒下的增删（索引提交是写入路径的职责），并把已提交的「正在写入」标记清干净。
+    /// 只清写入标记：删除标记（`status=2`）代表「删除没做完」，得留给下次开机或人工处理，
+    /// 在这里抹掉就等于把恢复线索删了。没有对账、没有自愈——派生与权威的对齐由写路径当场保证，
+    /// 差集对齐只留给显式调用。
+    pub fn update_index(&self) -> Result<HealthReport> {
+        {
+            let mut guard = self.engine.writer.lock();
+            let writer = guard.as_mut().ok_or(Error::Closed)?;
+            self.index()?.sync(&writer.conn)?;
+            clear_writing_marks(&writer.conn)?;
+        }
+        self.health()
     }
 
     /// 注册事件接收回调。库在检索线程里同步调用它，所以回调必须非阻塞——
@@ -623,7 +662,7 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
         Some(id) => {
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET namespace_id=?2,kind=?3,scope_id=?4,updated_at_us=?5,revision=?6,metadata_json=?7,
-                evidence_json=?8,fingerprint=?9,payload_json=?10 WHERE id=?1",
+                evidence_json=?8,fingerprint=?9,payload_json=?10,status=1 WHERE id=?1",
                 params![id, namespace_id, kind.code(), scope_id, updated, revision, metadata_json, evidence_json,
                     fingerprint, payload_json])?;
             // Updating text invalidates every space's embedding in the same transaction.
@@ -631,10 +670,8 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
             (id, revision)
         }
         None => {
-            conn.execute("INSERT INTO records(namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,
-                fingerprint,payload_json) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9)",
-                params![namespace_id, kind.code(), scope_id, created, updated, metadata_json, evidence_json,
-                    fingerprint, payload_json])?;
+            conn.execute("INSERT INTO records(namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,fingerprint,payload_json,status) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,1)",
+                params![namespace_id, kind.code(), scope_id, created, updated, metadata_json, evidence_json, fingerprint, payload_json])?;
             let id = conn.last_insert_rowid();
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET revision=?2 WHERE id=?1", params![id, revision])?;
@@ -853,16 +890,6 @@ pub(crate) fn filter_sql(filter: &ReadFilter, kinds: &[RecordKind], by_ids: bool
     Ok((query, values))
 }
 
-/// 按过滤条件选出记录 id（升序），供批量写入路径使用。
-/// 与翻页查询不同，这里要的是全量命中，所以不带 limit。
-pub(crate) fn select_ids(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<Vec<i64>> {
-    let (condition, values) = filter_sql(filter, kinds, false)?;
-    let mut stmt = conn.prepare(&format!("SELECT r.id FROM records r WHERE {condition} ORDER BY r.id"))?;
-    let ids = stmt.query_map(params_from_iter(values), |r| r.get::<_, i64>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(ids)
-}
-
 /// 过滤条件下的匹配总数（截断之前）。`with_total` 打开时才调用。
 pub(crate) fn count_matches(conn: &Connection, filter: &ReadFilter, kinds: &[RecordKind]) -> Result<usize> {
     let (condition, values) = filter_sql(filter, kinds, false)?;
@@ -1000,6 +1027,59 @@ pub(crate) fn delete_record(conn: &Connection, key: &RecordKey) -> Result<bool> 
         if let Some(namespace) = namespace { touch_namespace(&namespace); }
     }
     Ok(changed > 0)
+}
+
+/// 写路径在主库记录上留的状态标记：1=正在写入，2=正在删除。
+/// 它只回答「哪几条没弄完」，不回答「该写什么内容」；标记残留最多换来一次幂等的重算。
+pub(crate) const MARK_WRITING: i64 = 1;
+pub(crate) const MARK_DELETING: i64 = 2;
+
+/// 给一批记录打上写路径标记。标记先行落主库，派生动作（索引/向量）排在它后面：
+/// 中途断电，下次开机按标记把这些记录按主库现状重新处理一遍。
+pub(crate) fn mark_records(tx: &Transaction, ids: &[i64], status: i64) -> Result<()> {
+    if ids.is_empty() { return Ok(()); }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let values: Vec<SqlValue> = std::iter::once(SqlValue::Integer(status))
+        .chain(ids.iter().map(|id| SqlValue::Integer(*id))).collect();
+    tx.execute(&format!("UPDATE records SET status=?1 WHERE id IN ({placeholders})"), params_from_iter(values))?;
+    Ok(())
+}
+
+/// 清掉「正在写入」标记。只在一次成功的索引提交之后调用：这些记录的文档已落盘，
+/// 它们许诺的「没弄完」已经弄完。删除标记（`status=2`）不清——它代表删除没做完，
+/// 清掉就等于抹掉恢复线索；那些记录要么已被删掉（行随之消失），要么仍在等下次开机补完。
+pub(crate) fn clear_writing_marks(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE records SET status=0 WHERE status=1", [])?;
+    Ok(())
+}
+
+/// 开库时的标记恢复：找出所有「正在写入 / 正在删除」的记录，按主库现状重新处理。
+/// 绝不重放当时想写的输入——正在写入的按主库现状重新折成索引文档，正在删除的把删除做完
+/// （向量行 + 主库行）。删除先于摘词条：只有确实删掉的记录才摘索引词条，被外键拦下的
+/// 保留标记、词条不动，等引用清掉后的下次开机再删。全部处理完提交一次索引；
+/// 写入的标记随之清掉，删除失败的标记留给下一轮，多试一次只是幂等的廉价重算。
+fn recover_marks(conn: &Connection, index: &crate::index::TextIndex) -> Result<()> {
+    let marked: Vec<(i64, i64, i64)> = {
+        let mut stmt = conn.prepare("SELECT id,kind,status FROM records WHERE status<>0")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if marked.is_empty() { return Ok(()); }
+    // 正在删除：按 kind 降序删（切片先于笔记、边先于点），确实删掉的才摘词条。
+    let mut deleting: Vec<(i64, i64)> = marked.iter().filter(|(_, _, s)| *s == MARK_DELETING)
+        .map(|(id, kind, _)| (*id, *kind)).collect();
+    deleting.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut dropped: Vec<i64> = Vec::new();
+    for (id, _) in &deleting {
+        if delete_record(conn, &RecordKey { id: *id }).is_ok() { dropped.push(*id); }
+    }
+    index.stage_deletions(&dropped)?;
+    // 正在写入：按主库现状重新同步到索引。笔记自己不占文档，它的切片各自是一行、各自进索引。
+    let writing: Vec<i64> = marked.iter().filter(|(_, _, s)| *s == MARK_WRITING).map(|(id, _, _)| *id).collect();
+    index.stage_records(conn, &writing)?;
+    // 恢复攒下的文档与词条在这里一次落盘，然后把「正在写入」标记清干净。
+    index.sync(conn)?;
+    clear_writing_marks(conn)
 }
 
 #[cfg(test)]
@@ -1152,7 +1232,7 @@ mod tests {
 
         let space = fixture_space();
         for namespace in ["a", "b"] { cache_partition(&kb, &space, namespace); }
-        kb.memories().delete(id, &namespace_filter("a")).unwrap();
+        kb.memories().delete(&[id], &namespace_filter("a")).unwrap();
 
         assert_eq!(cached_namespaces(&kb), BTreeSet::from(["b".to_string()]), "删掉的领域要清，别的领域留着");
     }
@@ -1187,8 +1267,8 @@ mod tests {
         for namespace in ["a", "b"] { cache_partition(&kb, &space, namespace); }
 
         // 直接改一行、不登记领域：模拟一条没接上登记的写路径。
-        kb.mutate(|tx| Ok(tx.execute("INSERT INTO meta(key,value) VALUES ('cache_probe',1)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?)).unwrap();
+        kb.mutate(|tx| Ok((tx.execute("INSERT INTO meta(key,value) VALUES ('cache_probe',1)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?, Vec::new()))).unwrap();
 
         assert!(cached_namespaces(&kb).is_empty(), "登记为空却改过行时必须整体失效");
     }

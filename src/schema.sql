@@ -6,6 +6,8 @@ INSERT INTO meta VALUES ('revision', 0), ('indexed_revision', 0);
 CREATE TABLE strings (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE);
 
 -- 记录宽表。id 为内部自增主键，与任何外部 ID 无关；kind 为固定枚举整数编码。
+-- status 是写路径的停电恢复标记：0=干净，1=正在写入，2=正在删除。它只回答
+-- 「哪几条没弄完」，不回答「该写什么内容」；恢复一律以主库现状重算，绝不重放输入。
 CREATE TABLE records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
@@ -13,7 +15,8 @@ CREATE TABLE records (
     scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
     created_at_us INTEGER NOT NULL, updated_at_us INTEGER NOT NULL, revision INTEGER NOT NULL,
     metadata_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
-    fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL
+    fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL,
+    status INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX records_kind ON records(kind, id);
 CREATE INDEX records_scope ON records(namespace_id, kind, scope_id, id);
