@@ -578,16 +578,16 @@ def test_backup_and_restore_roundtrip(kb, tmp_path):
 
 
 def test_note_with_many_chunks_deletes_in_one_batch(kb, tmp_path):
-    """一篇切片数超过单条 SQL 语句批量上限的笔记：读取与删除整批走完，不报 too many SQL variables。"""
+    """一篇切片数超过内部切批粒度（SQL_BATCH）的笔记：读取与删除整批走完，不报 too many SQL variables。"""
     kb.notes.set_root("default", str(tmp_path))
     path = tmp_path / "big.md"
-    # 每段独立成块，切出来的片数远超单条语句的批量上限（内部按 SQL_BATCH 分片）。
-    path.write_text("\n".join(f"段落{i} " + "甲" * 240 for i in range(260)), encoding="utf-8")
+    # 每段独立成块，切出来的片数远超内部切批粒度（内部按 SQL_BATCH 分片）。
+    path.write_text("\n".join(f"段落{i} " + "甲" * 240 for i in range(1100)), encoding="utf-8")
     note = kb.notes.upsert_file({"path": str(path)})["value"]
     kb.update_index()
     kb.update_index()
     chunks = kb.notes.chunks(note["id"])
-    assert len(chunks) > 200, f"切片数应超过单条语句的批量上限，实际 {len(chunks)}"
+    assert len(chunks) > 999, f"切片数应超过内部切批粒度，实际 {len(chunks)}"
     removed = kb.notes.delete(note["id"])["value"]
     assert removed == len(chunks) + 1, "笔记连同全部切片一次删净"
 

@@ -595,10 +595,11 @@ pub(crate) fn validate_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// 单条 SQL 语句最多绑定多少个变量。SQLite 的变量上限随构建而异（常见 999 / 32766），
-/// 批内元素一旦超过它，`IN (...)` 会直接报 `too many SQL variables`；一篇切片极多的笔记
-/// 展开后更是单条语句塞不下。批量操作内部统一按这个粒度分片：下游一次传多少条都不会撞上限。
-pub(crate) const SQL_BATCH: usize = 200;
+/// 批量操作的内部切批粒度，不是 SQLite 的硬上限。SQLite 对单条语句能绑定的参数个数另有硬上限
+/// `SQLITE_MAX_VARIABLE_NUMBER`（本项目走 bundled、固定为 32766）；批量语句在 `IN (...)` 之外
+/// 还夹着少量参数，贴着上限用会越界。这里取 999，与 Django / Rails 同量级，远低于上限、留足余量：
+/// 下游一次传多少条，库内部都会自动切批，不会撞上限。
+pub(crate) const SQL_BATCH: usize = 999;
 
 /// 归一化、去重后的标签文本（排序）。标签字符串统一落在 strings 表。
 pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
