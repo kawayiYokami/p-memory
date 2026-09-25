@@ -388,6 +388,7 @@ impl GraphStore {
     /// 批量删除图记录：主库查 id，命中才继续；单条也是批量的一种。
     /// 主库标记先行 → 删向量行与主库行（权威落）→ 出写锁摘索引词条；
     /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
+    /// 删除按 id 直删，不受调用方所在领域限制；`filter` 仅其 `tags` 参与附加筛选。
     /// 实体仍被关系或事件引用时，删除被外键拦下返回 `Conflict`：
     /// 标记留在主库，引用清掉之后的下次开机会把这条删除自动做完。
     pub fn delete(&self, kind: RecordKind, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>> {

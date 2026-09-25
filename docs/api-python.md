@@ -39,6 +39,8 @@ kb.graph.delete("entity", [jia, yi])   # 一批图记录（kind 指明实体/关
 kb.notes.delete([note_id])             # 一批笔记，切片随笔记一起删
 ```
 
+删除**按 id 直删，不受实例 `namespace` / `scopes` 限制**——id 是全局主键，一条记录归哪个领域由它自己决定，不该被「调用方当前在哪个领域」拦住。可选 `filter` 在删除里**只有 `tags` 生效**（附加筛选），`namespace` / `scopes` 不参与。所以「`ids()` 按某领域取 id、再 `delete(ids)`」是闭环的，不必让两边的 filter 对齐。
+
 要按条件先挑一批 id，用各域的 `ids(filter=..., limit=..., after=...)`——`list` 的轻量版，同样分页，`items` 是纯 id 而非整条记录，拿到的 id 直接交给 `delete`：
 
 ```python

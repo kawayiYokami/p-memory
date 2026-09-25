@@ -2423,6 +2423,22 @@ fn a_batch_delete_clears_the_whole_memory_domain() {
     assert!(kb.memories().list(&PageRequest::default()).unwrap().items.is_empty(), "清空之后一条都不剩");
 }
 
+/// 删除按 id 直删，不受调用方所在领域限制：`ids()` 按某领域取回的 id，在按另一领域过滤的
+/// 上下文里也能删掉——这正是「取 id → delete(ids)」闭环成立的前提。
+#[test]
+fn delete_reaches_records_outside_the_callers_namespace_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let mut input = MemoryInput::new("gi 领域里要被删掉的一条");
+    input.record.namespace = "gi".into();
+    let id = kb.memories().upsert(input).unwrap().value.header.id;
+    kb.update_index().unwrap();
+    // 调用方带的是默认领域（default）的 filter，仍能按 id 删掉 gi 领域这条。
+    assert_eq!(kb.memories().delete(&[id], &ReadFilter::default()).unwrap().value, 1);
+    let gi = ReadFilter { namespace: "gi".into(), ..Default::default() };
+    assert!(kb.memories().get(id, &gi).is_err(), "gi 领域这条已按 id 删掉");
+}
+
 /// 未命中的 id 静默跳过：一批里混进不存在的 id，命中的照删，返回实际条数。空批删零条。
 #[test]
 fn unknown_ids_are_skipped_by_a_batch_delete() {

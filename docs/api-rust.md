@@ -154,7 +154,7 @@ impl MemoryStore {
 - `upsert`：按 `id` 更新；未给 `id` 则新建。`state = None` 时保留既有状态。
 - `upsert_many`：批内**全成功或全回滚**。
 - `upsert_by_judgment`：在同一 `namespace`+`scope` 内按归一化论断去重。命中多条同一论断时报 `conflict`（要求改用按 ID 更新）；命中唯一记录时合并 metadata 与 evidence。
-- `delete`：按 id 批量删除记忆，返回实际删除条数。主库查 id，命中才继续；不存在的 id 静默跳过，空批返回 0。
+- `delete`：按 id 批量删除记忆，返回实际删除条数。主库查 id，命中才继续；不存在的 id 静默跳过，空批返回 0。删除按 id 直删，不受 `filter` 的 `namespace` / `scopes` 限制（id 全局唯一，记录归属由记录自己决定）；`filter` 仅其 `tags` 参与附加筛选。
 - `feedback`：`useful_ids` 必须是 `recalled_ids` 的子集。有用项提升强度/计数/有用分；**非固定保留且处于 T1（`tier0 <= score < tier1`）的未命中项减 1 强度**。返回 `FeedbackReport { recalled, boosted, penalized }`。
 - `decay`：对命中的记忆按策略衰减，返回 `DecayReport { decayed, retirement_candidates }`。固定保留的记忆不衰减。详见 [lifecycle](lifecycle.md)。
 
@@ -181,7 +181,7 @@ impl GraphStore {
 - `neighbors` 返回一跳关系与对端实体；标签过滤只约束关系，作用域同时约束端点。
 - `get`/`list`/`delete` 只接受 `Entity`/`Relation`/`Event`，其他类型报 `validation`。
 - 删除被引用的实体或事件参与者关系，由外键 `RESTRICT` 报 `conflict`；调用方须先解除引用。
-- `delete`：按 id 批量删除图记录（`kind` 指明实体/关系/事件），返回实际删除条数。主库查 id，命中才继续。若待删实体仍被关系或事件引用，删除被外键拦下、报 `conflict`：主库上的「正在删除」标记保留，引用清掉之后的下次开机把这条删除自动做完。
+- `delete`：按 id 批量删除图记录（`kind` 指明实体/关系/事件），返回实际删除条数。主库查 id，命中才继续。删除按 id 直删，不受 `filter` 的 `namespace` / `scopes` 限制；`filter` 仅其 `tags` 参与附加筛选。若待删实体仍被关系或事件引用，删除被外键拦下、报 `conflict`：主库上的「正在删除」标记保留，引用清掉之后的下次开机把这条删除自动做完。
 
 ## 图搜索
 
@@ -247,7 +247,7 @@ impl NoteStore {
 - **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。**笔记记录不进索引**，要文件列表按库里的标签翻笔记。
 - 更新后切片记录全部换代：旧切片连同向量在删除阶段消失，新切片以新记录 id 落库。
 - 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引没提交就取不到，写入侧 `update_index` 之后再来）。写入时文件缺失直接报错；停电恢复重折切片文档时文件缺失折叠出空正文的文档，标记照样清掉。
-- `delete`：按 id 批量删除笔记，返回实际删除的记录行数（一篇笔记连带它的切片逐行计）。每篇都先删切片再删笔记。
+- `delete`：按 id 批量删除笔记，返回实际删除的记录行数（一篇笔记连带它的切片逐行计）。每篇都先删切片再删笔记。删除按 id 直删，不受 `filter` 的 `namespace` / `scopes` 限制；`filter` 仅其 `tags` 参与附加筛选。
 - `chunk_text(content, target)` 是公开辅助函数，可脱离数据库单独调用。
 
 ## EmbeddingStore

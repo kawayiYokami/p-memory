@@ -221,6 +221,8 @@ class _Store:
 
     def delete(self, ids: int | str | Sequence[int | str], *, filter: ReadFilter | None = None) -> WriteReceipt:
         """批量删除：`ids` 是一批记录 id（单个 id 也是批量的一种）。
+        按 id 直删，不受实例 `namespace` / `scopes` 限制——所以 `ids()` 取回的 id 可直接删，
+        两边 filter 不必对齐。`filter` 在删除里只有 `tags` 生效，`namespace` / `scopes` 不参与。
         主库查 id，命中才继续；未命中的 id 静默跳过，返回实际删除条数（`value`）。
         主库标记先行、索引词条派生先行退、向量与主库行最后落；断电留下的
         「正在删除」标记会在下次开机把没删完的做完。"""
@@ -273,7 +275,8 @@ class GraphStore(_Store):
 
     def delete(self, kind: RecordKind, ids: int | str | Sequence[int | str], *,
                filter: ReadFilter | None = None) -> WriteReceipt:
-        """批量删除图记录：`ids` 是一批记录 id（单个 id 也是批量的一种）。"""
+        """批量删除图记录：`ids` 是一批记录 id（单个 id 也是批量的一种）。
+        按 id 直删，不受实例领域限制；`filter` 仅 `tags` 生效。"""
         if isinstance(ids, (int, str)):
             ids = [ids]
         return self._call("delete", {"kind": kind, "ids": [int(i) for i in ids], "filter": self._kb._filter(filter)})

@@ -606,6 +606,16 @@ def test_ids_pages_by_filter_and_feeds_delete(kb):
     assert kb.memories.ids()["items"] == []
 
 
+def test_delete_by_id_reaches_across_domains(kb):
+    """删除按 id 直删，不受实例领域限制：ids() 按某领域取回的 id，在默认领域实例上也能删掉。"""
+    other = kb.memories.upsert_by_judgment(judgment="gi 域里的一条", namespace="gi")["value"]["id"]
+    kb.update_index()
+    got = kb.memories.ids(filter={"namespace": "gi"}, limit=100)["items"]
+    assert got == [other]
+    assert kb.memories.delete(got)["value"] == 1, "按 id 直删，不受调用方当前领域限制"
+    assert kb.memories.ids(filter={"namespace": "gi"}, limit=100)["items"] == []
+
+
 def test_namespaces_and_predicate_rules_are_readable(kb):
     """无害读取：领域清单、导入登记、谓词规则都能直接读，不需要任何登记。"""
     kb.memories.upsert_by_judgment(judgment="本域的一条")

@@ -159,6 +159,8 @@ impl MemoryStore {
         storage::ids(self.0.read()?.conn(), RecordKind::Memory, request)
     }
     /// 批量删除记忆：主库查 id，命中才继续；单条也是批量的一种。
+    /// 删除按 id 直删，不受调用方所在领域限制（id 是全局主键，记录归属由它自己决定）；
+    /// `filter` 仅其 `tags` 参与附加筛选，namespace / scopes 不参与。
     /// 写锁内落主库标记、删向量行与主库行，出锁后摘索引词条；
     /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
     pub fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>> {

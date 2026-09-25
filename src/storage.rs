@@ -372,6 +372,9 @@ impl KnowledgeBase {
     pub(crate) fn delete_flow(&self, ids: &[i64], filter: &ReadFilter, kind: RecordKind,
         children: impl Fn(&Connection, i64) -> Result<Vec<i64>>) -> Result<usize> {
         // 锁外查命中：一个读连接上逐个点查，没命中的直接落掉。
+        // 命中只认 id + kind：id 是全局主键，一条记录属于哪个领域由它自己决定，不再拿调用方
+        // 所在领域去拦——否则「`ids()` 按某领域取 id、`delete()` 在另一领域调用」会静默删 0。
+        // 因此 `filter` 在删除里只保留 `tags` 这一层附加筛选，namespace / scopes 不参与。
         let mut hits = Vec::new();
         {
             let state = self.read()?;
@@ -379,7 +382,7 @@ impl KnowledgeBase {
             for id in ids {
                 let hit: Option<i64> = conn.query_row("SELECT id FROM records WHERE id=?1 AND kind=?2",
                     params![id, kind.code()], |r| r.get(0)).optional()?;
-                if hit.is_some() && matches_filter(conn, &RecordKey { id: *id }, filter)? { hits.push(*id); }
+                if hit.is_some() && matches_tags(conn, *id, &filter.tags)? { hits.push(*id); }
             }
         }
         if hits.is_empty() { return Ok(0); }
@@ -881,9 +884,15 @@ pub(crate) fn matches_filter(conn: &Connection, key: &RecordKey, filter: &ReadFi
     if term_text(conn, namespace_id)? != text::normalized_tag(&filter.namespace) { return Ok(false); }
     let scope = term_text(conn, scope_id)?;
     if !filter.scopes.iter().any(|s| text::normalized_tag(s) == scope) { return Ok(false); }
-    for tag in &filter.tags {
+    if !matches_tags(conn, key.id, &filter.tags)? { return Ok(false); }
+    Ok(true)
+}
+
+/// 这批 tag 是否都挂在记录 `id` 上。读取过滤与删除的附加筛选共用这一层判断。
+pub(crate) fn matches_tags(conn: &Connection, id: i64, tags: &[String]) -> Result<bool> {
+    for tag in tags {
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM record_tags rt JOIN strings t ON t.id=rt.tag_id WHERE rt.record_id=?1 AND t.text=?2)",
-            params![key.id, text::normalized_tag(tag)], |r| r.get(0))?;
+            params![id, text::normalized_tag(tag)], |r| r.get(0))?;
         if !exists { return Ok(false); }
     }
     Ok(true)
