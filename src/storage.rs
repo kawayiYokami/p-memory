@@ -556,6 +556,11 @@ pub(crate) fn validate_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// 单条 SQL 语句最多绑定多少个变量。SQLite 的变量上限随构建而异（常见 999 / 32766），
+/// 批内元素一旦超过它，`IN (...)` 会直接报 `too many SQL variables`；一篇切片极多的笔记
+/// 展开后更是单条语句塞不下。批量操作内部统一按这个粒度分片：下游一次传多少条都不会撞上限。
+pub(crate) const SQL_BATCH: usize = 200;
+
 /// 归一化、去重后的标签文本（排序）。标签字符串统一落在 strings 表。
 pub(crate) fn normalize_tags(tags: &[String]) -> Vec<String> {
     tags.iter().map(|label| text::normalized_tag(label)).filter(|tag| !tag.is_empty()).collect::<BTreeSet<_>>().into_iter().collect()
@@ -736,12 +741,13 @@ pub(crate) fn index_document(conn: &Connection, id: i64, kind: RecordKind, text:
 /// 两件事靠的都是这层「切片 → 笔记」的归属。
 pub(crate) fn chunk_notes(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, (i64, usize)>> {
     let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let mut stmt = conn.prepare(&format!("SELECT record_id,note_id,\"offset\" FROM chunks WHERE record_id IN ({placeholders})"))?;
-    for row in stmt.query_map(params_from_iter(ids.iter().copied()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
-        let (id, note_id, offset) = row?;
-        out.insert(id, (note_id, offset.max(0) as usize));
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT record_id,note_id,\"offset\" FROM chunks WHERE record_id IN ({placeholders})"))?;
+        for row in stmt.query_map(params_from_iter(chunk.iter().copied()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+            let (id, note_id, offset) = row?;
+            out.insert(id, (note_id, offset.max(0) as usize));
+        }
     }
     Ok(out)
 }
@@ -767,29 +773,33 @@ pub(crate) fn record_value(conn: &Connection, key: &RecordKey) -> Result<Option<
 /// 语义等同于对每个 id 调用 `record_value`，只是把逐行往返压成固定两次查询。
 pub(crate) fn record_values(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, Value>> {
     let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
-    let mut stmt = conn.prepare(&format!("SELECT r.id,r.namespace_id,n.text,r.kind,s.text,r.created_at_us,r.updated_at_us,r.revision,
-        r.metadata_json,r.evidence_json,r.payload_json FROM records r
-        JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id IN ({placeholders}) ORDER BY r.id"))?;
     let mut rows: Vec<(i64, i64, String, i64, String, i64, i64, i64, String, String, String)> = Vec::new();
-    for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
-        r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?,
-        r.get::<_, i64>(7)?, r.get::<_, String>(8)?, r.get::<_, String>(9)?, r.get::<_, String>(10)?)))? {
-        rows.push(row?);
+    // 三张表各按同一粒度分片查询，再合并：整批塞进一条 `IN (...)` 会撞 SQLite 变量上限。
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let params = chunk.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&format!("SELECT r.id,r.namespace_id,n.text,r.kind,s.text,r.created_at_us,r.updated_at_us,r.revision,
+            r.metadata_json,r.evidence_json,r.payload_json FROM records r
+            JOIN strings n ON n.id=r.namespace_id JOIN strings s ON s.id=r.scope_id WHERE r.id IN ({placeholders}) ORDER BY r.id"))?;
+        for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?, r.get::<_, String>(8)?, r.get::<_, String>(9)?, r.get::<_, String>(10)?)))? {
+            rows.push(row?);
+        }
     }
-    let mut tags_stmt = conn.prepare(&format!("SELECT rt.record_id,t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id \
-        WHERE rt.record_id IN ({placeholders}) ORDER BY rt.record_id,t.text"))?;
     let mut tags: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    for row in tags_stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-        let (id, tag) = row?;
-        tags.entry(id).or_default().push(tag);
-    }
     // 笔记的路径与文件名都是它自己的列（原样）：读取时按 record_id 补回，
     // 路径不进标签字典，payload 里也不重复存。
     let mut note_meta: BTreeMap<i64, (String, String)> = BTreeMap::new();
-    {
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let params = chunk.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+        let mut tags_stmt = conn.prepare(&format!("SELECT rt.record_id,t.text FROM record_tags rt JOIN strings t ON t.id=rt.tag_id \
+            WHERE rt.record_id IN ({placeholders}) ORDER BY rt.record_id,t.text"))?;
+        for row in tags_stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, tag) = row?;
+            tags.entry(id).or_default().push(tag);
+        }
         let mut stmt = conn.prepare(&format!("SELECT n.record_id,n.path,n.name FROM notes n \
             WHERE n.record_id IN ({placeholders})"))?;
         for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
@@ -851,10 +861,15 @@ pub(crate) fn load_many<T: DeserializeOwned>(conn: &Connection, ids: &[i64], fil
     if ids.is_empty() { return Ok(out); }
     validate_filter(filter)?;
     let (condition, values) = filter_sql(filter, &[], true)?;
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let mut stmt = conn.prepare(&format!("SELECT r.id FROM records r WHERE r.id IN ({placeholders}) AND {condition} ORDER BY r.id"))?;
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).chain(values).collect::<Vec<_>>();
-    let allowed = stmt.query_map(params_from_iter(params), |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    // 分片取「满足过滤的 id」：整批塞进一条 `IN (...)` 会撞 SQLite 变量上限。
+    let mut allowed: Vec<i64> = Vec::new();
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT r.id FROM records r WHERE r.id IN ({placeholders}) AND {condition} ORDER BY r.id"))?;
+        let params = chunk.iter().map(|id| SqlValue::Integer(*id)).chain(values.iter().cloned()).collect::<Vec<_>>();
+        allowed.extend(stmt.query_map(params_from_iter(params), |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    allowed.sort_unstable();
     for (id, value) in record_values(conn, &allowed)? {
         out.insert(id, serde_json::from_value(value)?);
     }
@@ -928,9 +943,6 @@ pub(crate) fn record_name(kind: RecordKind, payload: &Value) -> String {
 /// `participant_names` 不是数组时同样按空串计。
 pub(crate) fn event_text_lengths(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, usize>> {
     let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
     let field = |name: &str| format!(
         "CASE WHEN json_type(r.payload_json,'$.{name}')='text' THEN json_extract(r.payload_json,'$.{name}') ELSE '' END");
     // 参与者名：不是数组时按空串计，是数组时只收文本元素（`j.type` 是元素的 JSON 类型名，
@@ -938,13 +950,17 @@ pub(crate) fn event_text_lengths(conn: &Connection, ids: &[i64]) -> Result<BTree
     let names = "COALESCE(CASE WHEN json_type(r.payload_json,'$.participant_names')='array' \
         THEN (SELECT group_concat(j.value,' ') FROM json_each(r.payload_json,'$.participant_names') j \
             WHERE j.type='text') ELSE '' END,'')";
-    let mut stmt = conn.prepare(&format!(
-        "SELECT r.id, LENGTH({} || ' ' || {} || ' ' || {names} || ' ' || {}) \
-         FROM records r WHERE r.id IN ({placeholders}) ORDER BY r.id",
-        field("name"), field("summary"), field("reason")))?;
-    for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-        let (id, length) = row?;
-        out.insert(id, length.max(0) as usize);
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let params = chunk.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT r.id, LENGTH({} || ' ' || {} || ' ' || {names} || ' ' || {}) \
+             FROM records r WHERE r.id IN ({placeholders}) ORDER BY r.id",
+            field("name"), field("summary"), field("reason")))?;
+        for row in stmt.query_map(params_from_iter(params.iter().cloned()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (id, length) = row?;
+            out.insert(id, length.max(0) as usize);
+        }
     }
     Ok(out)
 }
@@ -953,13 +969,14 @@ pub(crate) fn event_text_lengths(conn: &Connection, ids: &[i64]) -> Result<BTree
 /// 纯名实体（别名、摘要、属性全空）的正文是空串，得把规范名拼回去才能让重排看到名字。
 pub(crate) fn entity_names(conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
     let mut out = BTreeMap::new();
-    if ids.is_empty() { return Ok(out); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let mut stmt = conn.prepare(&format!("SELECT record_id,name FROM entities WHERE record_id IN ({placeholders})"))?;
-    let params = ids.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
-    for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-        let (id, name) = row?;
-        out.insert(id, name);
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let params = chunk.iter().map(|id| SqlValue::Integer(*id)).collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&format!("SELECT record_id,name FROM entities WHERE record_id IN ({placeholders})"))?;
+        for row in stmt.query_map(params_from_iter(params), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, name) = row?;
+            out.insert(id, name);
+        }
     }
     Ok(out)
 }
@@ -1037,11 +1054,12 @@ pub(crate) const MARK_DELETING: i64 = 2;
 /// 给一批记录打上写路径标记。标记先行落主库，派生动作（索引/向量）排在它后面：
 /// 中途断电，下次开机按标记把这些记录按主库现状重新处理一遍。
 pub(crate) fn mark_records(tx: &Transaction, ids: &[i64], status: i64) -> Result<()> {
-    if ids.is_empty() { return Ok(()); }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let values: Vec<SqlValue> = std::iter::once(SqlValue::Integer(status))
-        .chain(ids.iter().map(|id| SqlValue::Integer(*id))).collect();
-    tx.execute(&format!("UPDATE records SET status=?1 WHERE id IN ({placeholders})"), params_from_iter(values))?;
+    for chunk in ids.chunks(SQL_BATCH) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let values: Vec<SqlValue> = std::iter::once(SqlValue::Integer(status))
+            .chain(chunk.iter().map(|id| SqlValue::Integer(*id))).collect();
+        tx.execute(&format!("UPDATE records SET status=?1 WHERE id IN ({placeholders})"), params_from_iter(values))?;
+    }
     Ok(())
 }
 

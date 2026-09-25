@@ -241,22 +241,25 @@ impl TextIndex {
     /// 稳态由写路径保证对齐，没有「补不上就留标记」这回事。
     pub fn stage_records(&self, conn: &Connection, ids: &[i64]) -> Result<()> {
         if ids.is_empty() { return Ok(()); }
-        let placeholders = vec!["?"; ids.len()].join(",");
-        let sql = format!("SELECT id,namespace_id,kind,scope_id,payload_json FROM records \
-            WHERE id IN ({placeholders}) AND kind<>?");
-        let mut values: Vec<rusqlite::types::Value> = ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
-        values.push(rusqlite::types::Value::Integer(RecordKind::Note.code()));
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
         let mut documents = Vec::new();
         let mut files: HashMap<i64, Vec<String>> = HashMap::new();
         let mut paths: HashMap<i64, (Vec<String>, String)> = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let (id, namespace_id, kind_code, scope_id, payload_json) =
-                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?);
-            let Some(kind) = RecordKind::from_code(kind_code) else { continue };
-            if let Some(item) = self.document_for(&mut files, &mut paths, id, namespace_id, scope_id, kind, &payload_json, conn) {
-                documents.push(item);
+        // 分片查：整批 id 塞进一条 `IN (...)` 会撞 SQLite 变量上限。
+        for chunk in ids.chunks(storage::SQL_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id,namespace_id,kind,scope_id,payload_json FROM records \
+                WHERE id IN ({placeholders}) AND kind<>?");
+            let mut values: Vec<rusqlite::types::Value> = chunk.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+            values.push(rusqlite::types::Value::Integer(RecordKind::Note.code()));
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+            while let Some(row) = rows.next()? {
+                let (id, namespace_id, kind_code, scope_id, payload_json) =
+                    (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?);
+                let Some(kind) = RecordKind::from_code(kind_code) else { continue };
+                if let Some(item) = self.document_for(&mut files, &mut paths, id, namespace_id, scope_id, kind, &payload_json, conn) {
+                    documents.push(item);
+                }
             }
         }
         self.stage(&documents)

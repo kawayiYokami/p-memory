@@ -316,6 +316,27 @@ fn sync_scoped_to_one_namespace_leaves_the_others_untouched() {
 }
 
 #[test]
+fn a_note_with_many_chunks_reads_and_deletes_in_one_batch() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
+    let path = dir.path().join("big.md");
+    // 每段独立成块，切出来的片数远超单条语句的批量上限：整批操作必须内部分片。
+    let body = (0..260).map(|i| format!("段落{i} {}", "甲".repeat(240))).collect::<Vec<_>>().join("\n");
+    std::fs::write(&path, body).unwrap();
+    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    kb.update_index().unwrap();
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert!(chunks.len() > 200, "切片数应超过单条语句的批量上限，实际 {}", chunks.len());
+    // 上一行的 `chunks()` 本身就走 `load_many`：一次取回 200+ 条切片，分片读取已经跑通。
+    let chunk_ids: Vec<i64> = chunks.iter().map(|chunk| chunk.header.id).collect();
+    // 整批删除：内部按分片处理，不报 too many SQL variables。
+    let removed = kb.notes().delete(&[note.header.id], &ReadFilter::default()).unwrap().value;
+    assert_eq!(removed, chunk_ids.len() + 1, "笔记连同全部切片一次删净");
+    assert!(kb.notes().get(note.header.id, &ReadFilter::default()).is_err(), "笔记已删");
+    assert!(kb.notes().chunks(note.header.id, &ReadFilter::default()).is_err(), "切片随笔记一并删除");
+}
+
+#[test]
 fn vectorization_targets_are_independent_per_namespace() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap(); space(&kb, "v", 4);
     // 内置默认：记忆与图谱开、笔记关。
