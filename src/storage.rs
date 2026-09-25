@@ -1066,6 +1066,17 @@ pub(crate) fn list<T: DeserializeOwned>(conn: &Connection, kind: RecordKind, req
     Ok(Page { items, next_cursor })
 }
 
+/// 按条件翻页，只取记录 id、不装配记录本体：`list` 的轻量版。
+/// 下游常只需一批 id（拿去 `delete(ids)`、或自己做增量比对），装配整条记录是白费。
+pub(crate) fn ids(conn: &Connection, kind: RecordKind, request: &PageRequest) -> Result<Page<i64>> {
+    validate_limit(request.limit)?;
+    let mut keys = select_keys(conn, &request.filter, &[kind], request.limit + 1, request.after.as_deref())?;
+    let has_more = keys.len() > request.limit;
+    keys.truncate(request.limit);
+    let next_cursor = if has_more { keys.last().map(RecordKey::index_key) } else { None };
+    Ok(Page { items: keys.into_iter().map(|key| key.id).collect(), next_cursor })
+}
+
 pub(crate) fn delete_record(conn: &Connection, key: &RecordKey) -> Result<bool> {
     // Graph references are RESTRICT, so callers explicitly remove edges first.
     // 领域名要在删之前取：删完这条记录就查不到它属于哪个领域了。

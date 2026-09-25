@@ -143,6 +143,7 @@ impl MemoryStore {
 
     fn get(&self, id: i64, filter: &ReadFilter) -> Result<Memory>;
     fn list(&self, request: &PageRequest) -> Result<Page<Memory>>;
+    fn ids(&self, request: &PageRequest) -> Result<Page<i64>>;
     fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>>;
 
     fn feedback(&self, request: &FeedbackRequest) -> Result<WriteReceipt<FeedbackReport>>;
@@ -165,6 +166,7 @@ impl GraphStore {
 
     fn get(&self, kind: RecordKind, id: i64, filter: &ReadFilter) -> Result<Value>;
     fn list(&self, kind: RecordKind, page: &PageRequest) -> Result<Page<Value>>;
+    fn ids(&self, kind: RecordKind, page: &PageRequest) -> Result<Page<i64>>;
     fn resolve(&self, name: &str, filter: &ReadFilter, limit: usize) -> Result<Vec<Entity>>;
     fn neighbors(&self, id: i64, filter: &ReadFilter, limit: usize) -> Result<Neighborhood>;
     fn events_for_entity(&self, id: i64, filter: &ReadFilter, limit: usize) -> Result<Vec<Event>>;
@@ -232,6 +234,7 @@ impl NoteStore {
     fn root(&self, namespace: &str) -> Result<Option<String>>;
     fn get(&self, id: i64, filter: &ReadFilter) -> Result<Note>;
     fn list(&self, page: &PageRequest) -> Result<Page<Note>>;
+    fn ids(&self, page: &PageRequest) -> Result<Page<i64>>;
     fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk>;
     fn chunks(&self, note_id: i64, filter: &ReadFilter) -> Result<Vec<Chunk>>;
     fn delete(&self, ids: &[i64], filter: &ReadFilter) -> Result<WriteReceipt<usize>>;

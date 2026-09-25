@@ -213,6 +213,12 @@ class _Store:
     def list(self, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
         return self._call("list", {"filter": self._kb._filter(filter), "limit": limit, "after": after})
 
+    def ids(self, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
+        """按条件翻页只取 id（`list` 的轻量版），不装配记录本体。
+        返回 `{"items": [id, ...], "next_cursor": ...}`；拿到的 id 可直接交给 `delete(ids)`，
+        或自己拿去做增量比对。"""
+        return self._call("ids", {"filter": self._kb._filter(filter), "limit": limit, "after": after})
+
     def delete(self, ids: int | str | Sequence[int | str], *, filter: ReadFilter | None = None) -> WriteReceipt:
         """批量删除：`ids` 是一批记录 id（单个 id 也是批量的一种）。
         主库查 id，命中才继续；未命中的 id 静默跳过，返回实际删除条数（`value`）。
@@ -260,6 +266,10 @@ class GraphStore(_Store):
 
     def list(self, kind: RecordKind, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
         return self._call("list", {"kind": kind, "page": {"filter": self._kb._filter(filter), "limit": limit, "after": after}})
+
+    def ids(self, kind: RecordKind, *, filter: ReadFilter | None = None, limit: int = 50, after: str | None = None) -> Page:
+        """按条件翻页只取 id（`list` 的轻量版）。`kind` 指明实体 / 关系 / 事件。"""
+        return self._call("ids", {"kind": kind, "page": {"filter": self._kb._filter(filter), "limit": limit, "after": after}})
 
     def delete(self, kind: RecordKind, ids: int | str | Sequence[int | str], *,
                filter: ReadFilter | None = None) -> WriteReceipt:

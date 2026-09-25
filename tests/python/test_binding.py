@@ -592,6 +592,20 @@ def test_note_with_many_chunks_deletes_in_one_batch(kb, tmp_path):
     assert removed == len(chunks) + 1, "笔记连同全部切片一次删净"
 
 
+def test_ids_pages_by_filter_and_feeds_delete(kb):
+    """按条件只取 id：分页拿回本域 id，直接交给 delete 删净。"""
+    ids = [kb.memories.upsert_by_judgment(judgment=f"第{i}条")["value"]["id"] for i in range(5)]
+    kb.memories.upsert_by_judgment(judgment="别域的一条", namespace="other")
+    kb.update_index()
+    first = kb.memories.ids(limit=2)
+    assert len(first["items"]) == 2 and first["next_cursor"]
+    second = kb.memories.ids(limit=10, after=first["next_cursor"])
+    all_ids = sorted(first["items"] + second["items"])
+    assert all_ids == sorted(ids), "只取本域 id，别域不出现"
+    assert kb.memories.delete(all_ids)["value"] == 5
+    assert kb.memories.ids()["items"] == []
+
+
 def test_namespaces_and_predicate_rules_are_readable(kb):
     """无害读取：领域清单、导入登记、谓词规则都能直接读，不需要任何登记。"""
     kb.memories.upsert_by_judgment(judgment="本域的一条")

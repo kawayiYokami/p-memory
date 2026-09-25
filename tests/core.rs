@@ -316,6 +316,31 @@ fn sync_scoped_to_one_namespace_leaves_the_others_untouched() {
 }
 
 #[test]
+fn ids_pages_by_filter_without_loading_records() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        ids.push(kb.memories().upsert(memory(&format!("第{index}条"), "public")).unwrap().value.header.id);
+    }
+    let mut other = memory("别域的一条", "public"); other.record.namespace = "other".into();
+    kb.memories().upsert(other).unwrap();
+    kb.update_index().unwrap();
+    // 分页只取 id：第一页两条 + 游标，第二页接着取，拼起来正好是本域那五条。
+    let first = kb.memories().ids(&PageRequest { limit: 2, ..Default::default() }).unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first.next_cursor.is_some());
+    let second = kb.memories().ids(&PageRequest { limit: 10, after: first.next_cursor.clone(), ..Default::default() }).unwrap();
+    let mut all: Vec<i64> = first.items.clone();
+    all.extend(second.items.iter().copied());
+    all.sort_unstable();
+    assert_eq!(all, ids, "只取本域的 id，别域的不出现");
+    // 拿到的 id 直接交给 delete：整批删净。
+    let removed = kb.memories().delete(&all, &ReadFilter::default()).unwrap().value;
+    assert_eq!(removed, 5);
+    assert!(kb.memories().ids(&PageRequest::default()).unwrap().items.is_empty());
+}
+
+#[test]
 fn namespace_and_predicate_reads_reflect_stored_state() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     let mut other = memory("别域的一条", "public"); other.record.namespace = "other".into();

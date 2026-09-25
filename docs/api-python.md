@@ -39,6 +39,15 @@ kb.graph.delete("entity", [jia, yi])   # 一批图记录（kind 指明实体/关
 kb.notes.delete([note_id])             # 一批笔记，切片随笔记一起删
 ```
 
+要按条件先挑一批 id，用各域的 `ids(filter=..., limit=..., after=...)`——`list` 的轻量版，同样分页，`items` 是纯 id 而非整条记录，拿到的 id 直接交给 `delete`：
+
+```python
+page = kb.notes.ids(filter={"namespace": "gi", "scopes": ["public"]}, limit=500)
+kb.notes.delete(page["items"])         # 再翻页用 page["next_cursor"]
+```
+
+大批量也会内部分片（按 SQLite 变量上限，每批 200），一次传多少 id 都不会报 `too many SQL variables`。
+
 主库查 id，命中才继续：非目标类型或不存在的 id 静默跳过，不算错误。删除的次序是写锁内主库标记先行 → 删向量行与主库行 → 出锁后摘索引词条；中途断电，主库上的「正在删除」标记让下次开机把没删完的做完。子记录（切片）先于笔记落库，RESTRICT 引用不会拦；若待删实体仍被关系引用，抛 `ConflictError`，标记留在主库，引用清掉之后的下次开机会把这条删除自动做完。
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。

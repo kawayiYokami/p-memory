@@ -254,6 +254,12 @@ impl GraphStore {
         if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
         storage::list(self.0.read()?.conn(), kind, page)
     }
+    /// 按条件翻页只取 id（`list` 的轻量版）：下游拿去 `delete(kind, ids)` 或自己比对，
+    /// 不必装配整条记录。
+    pub fn ids(&self, kind: RecordKind, page: &PageRequest) -> Result<Page<i64>> {
+        if !matches!(kind, RecordKind::Entity | RecordKind::Relation | RecordKind::Event) { return Err(Error::Validation("expected a graph record kind".into())); }
+        storage::ids(self.0.read()?.conn(), kind, page)
+    }
     /// 登记一批谓词等价组到某个知识领域：`groups` 是一组组互等同义词，
     /// 组内第一个词当规范词（组内代表），同组词据此归并。重复登记同一个词会改写它的归属。
     /// 表由上游提供、库不内置领域数据；只影响查询期扩散，不改谓词的落盘写法。

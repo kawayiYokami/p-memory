@@ -302,6 +302,9 @@ impl NoteStore {
         storage::load_many(self.0.read()?.conn(), ids, filter)
     }
     pub fn list(&self, page: &PageRequest) -> Result<Page<Note>> { storage::list(self.0.read()?.conn(), RecordKind::Note, page) }
+    /// 按条件翻页只取 id（`list` 的轻量版）：下游拿去 `delete(ids)` 或自己比对，
+    /// 不必装配整条记录。清「旧路径残留」这类场景靠它拿到一批 id。
+    pub fn ids(&self, page: &PageRequest) -> Result<Page<i64>> { storage::ids(self.0.read()?.conn(), RecordKind::Note, page) }
     pub fn get_chunk(&self, id: i64, filter: &ReadFilter) -> Result<Chunk> {
         let state = self.0.read()?;
         let conn = state.conn();

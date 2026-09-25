@@ -153,6 +153,11 @@ impl MemoryStore {
     pub fn list(&self, request: &PageRequest) -> Result<Page<Memory>> {
         storage::list(self.0.read()?.conn(), RecordKind::Memory, request)
     }
+    /// 按条件翻页只取 id（`list` 的轻量版）：下游拿去 `delete(ids)` 或自己比对，
+    /// 不必装配整条记录。
+    pub fn ids(&self, request: &PageRequest) -> Result<Page<i64>> {
+        storage::ids(self.0.read()?.conn(), RecordKind::Memory, request)
+    }
     /// 批量删除记忆：主库查 id，命中才继续；单条也是批量的一种。
     /// 写锁内落主库标记、删向量行与主库行，出锁后摘索引词条；
     /// 断电留下「正在删除」标记的，下次开机把这条删除做完。
