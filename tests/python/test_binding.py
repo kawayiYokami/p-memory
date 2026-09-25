@@ -25,14 +25,20 @@ from p_memory import (
 )
 
 
-def wait_until_ready(kb, namespace: str, space_id: str, target: str, budget_s: float = 15.0) -> bool:
-    """等某一档补齐。补齐由库内线程按事件触发，这里只等结果，不假定是谁补的。"""
+def sync_and_ready(kb, namespace: str, space_id: str, target: str, budget_s: float = 15.0) -> bool:
+    """补齐只由使用方显式触发：每次尝试都调一次 sync，再看该档是否就绪。
+    库里已没有后台线程，「等一等它自己会补上」那条路不存在了。"""
     deadline = time.monotonic() + budget_s
-    while time.monotonic() < deadline:
+    while True:
+        try:
+            kb.embeddings.sync(space_id, batch=32)
+        except PMemoryError:
+            pass
         if kb.embeddings.vector_ready(namespace, space_id, target):
             return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.025)
-    return False
 
 
 # ── 记忆 ──────────────────────────────────────────────────────────────
@@ -325,7 +331,7 @@ def test_embedder_registers_validates_and_search_embeds_query(kb):
     gated = kb.search("向量化", embed_space="e5", text=False, rerank=False)
     assert gated["hits"] == [] and "vector_not_ready" in gated["diagnostics"]["degraded"]
 
-    # 接上回调：注册这个动作自己就触发一次补齐。
+    # 接上回调：注册只绑定模型，不会自己去补缺口。
     kb.embeddings.register_embedder("e5", embedder, max_batch=4)
     mine = [length for name, length in calls if name == threading.current_thread().name]
     assert mine and max(mine) <= 4, "注册即用样本真跑一遍校验"
@@ -334,7 +340,7 @@ def test_embedder_registers_validates_and_search_embeds_query(kb):
     kb.memories.upsert_by_judgment(judgment="第二条需要向量化的记忆")
     mine = [length for name, length in calls if name == threading.current_thread().name]
     assert len(mine) == before, "写入不碰模型"
-    assert wait_until_ready(kb, "default", "e5", "memory"), "补齐之后该放行"
+    assert sync_and_ready(kb, "default", "e5", "memory"), "使用方调 sync 之后才放行"
 
     hits = kb.search("向量化", embed_space="e5", text=False, rerank=False)["hits"]
     assert hits[0]["key"]["id"] == target
@@ -466,15 +472,14 @@ def test_feedback_boosts_useful_recall(kb):
 def test_health_exposes_core_counters(kb):
     """健康报告含库归属、修订号、索引进度与完整性检查。"""
     kb.memories.upsert_by_judgment(judgment="一条记忆")
-    # 写入只登记待办、不就地索引：显式追平之前进度是落后的。
-    assert kb.health()["pending_index_updates"] >= 1
+    # 写入只把文档攒进索引 writer、不提交：显式 update_index 之前索引进度是落后的。
+    assert kb.health()["indexed_revision"] < kb.health()["revision"]
     kb.update_index()
     report = kb.health()
 
-    assert report["schema_version"] == 12
+    assert report["schema_version"] == 14
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
-    assert report["pending_index_updates"] == 0
     assert report["record_count"] == 1
     assert report["counts"]["memory"] == 1
     assert report["sqlite_integrity"] == "ok"

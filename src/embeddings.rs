@@ -1,9 +1,8 @@
 use crate::{storage::{self, KnowledgeBase}, text, types::*, Error, Result};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
-    sync::{atomic::{AtomicBool, Ordering as AtomicOrdering}, Arc, Weak}, thread::JoinHandle};
+use std::{cmp::Ordering, collections::{BTreeMap, BinaryHeap, HashMap, HashSet}, sync::Arc};
 
 fn text_version() -> u32 { 1 }
 fn default_encoding() -> String { "sq8".into() }
@@ -20,7 +19,10 @@ pub struct EmbeddingSpace {
 /// 待嵌入文本，只在库内部流转（`sync` 三段式循环的中间产物）。
 #[derive(Debug, Clone)]
 pub(crate) struct EmbeddingInput { pub key: RecordKey, pub text: String, pub fingerprint: String,
-    pub namespace: String, pub scope: String, pub kind: RecordKind, pub tags: Vec<String>, pub note_id: i64 }
+    pub namespace: String, pub scope: String, pub kind: RecordKind, pub tags: Vec<String>, pub note_id: i64,
+    /// 正文应来自索引、但此刻索引里还没有（写入侧尚未提交这批切片）。
+    /// 它既不是「可嵌入的缺口」，也不代表这一档就绪——与「正文本就为空」必须区分开。
+    pub text_pending: bool }
 /// 一批算好的向量，只由库自己产出并写回。
 #[derive(Debug, Clone)]
 pub(crate) struct EmbeddingWrite { pub key: RecordKey, pub fingerprint: String, pub values: Vec<f32>,
@@ -388,9 +390,11 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
     for (id, kind_code, payload_json, fingerprint, namespace, scope) in candidates {
         let kind = RecordKind::from_code(kind_code).ok_or_else(|| Error::Validation("invalid stored record kind".into()))?;
         let payload: Option<serde_json::Value> = serde_json::from_str(&payload_json).ok();
-        let body = match kind {
-            RecordKind::Chunk => bodies.get(&id).cloned().unwrap_or_default(),
-            _ => payload.as_ref().map(|payload| storage::record_text(kind, payload)).unwrap_or_default(),
+        // 切片正文只存在于索引；索引里查不到这条切片，说明写入侧还没提交这批索引，
+        // 不是「它没有正文」。这个区别由 `text_pending` 带给缺口核对。
+        let (body, text_pending) = match kind {
+            RecordKind::Chunk => match bodies.get(&id) { Some(body) => (body.clone(), false), None => (String::new(), true) },
+            _ => (payload.as_ref().map(|payload| storage::record_text(kind, payload)).unwrap_or_default(), false),
         };
         // 规范名不进正文列（见 record_text），但它对实体的语义不可或缺，向量这边单独补回去。
         let name = match (kind, &payload) {
@@ -407,13 +411,14 @@ pub(crate) fn pending_candidates(conn: &Connection, index: &crate::index::TextIn
         let note_id = if kind == RecordKind::Chunk {
             conn.query_row("SELECT note_id FROM chunks WHERE record_id=?1", [id], |r| r.get(0)).optional()?.unwrap_or(0)
         } else { 0 };
-        items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint, namespace, scope, kind, tags, note_id });
+        items.push(EmbeddingInput { key: RecordKey { id }, text, fingerprint, namespace, scope, kind, tags, note_id, text_pending });
     }
     Ok(items)
 }
 
 /// 一条记录该不该送进向量：正文为空的没有可嵌入的内容，硬凑一个向量没有意义。
-/// 切片在索引追平之前取不到正文，也走这条判定被跳过——绝不用空文本凑一个向量。
+/// 切片正文还在索引里排队（`text_pending`）时也走这条判定被跳过——绝不用空文本凑一个向量；
+/// 但那种情况不算「无内容可嵌」，缺口核对仍会把它记成缺口，该档不会因此就绪。
 fn embeddable(input: &EmbeddingInput) -> bool { !input.text.trim().is_empty() }
 
 /// 缺口核对时一次取多少候选。命中缺口立刻返回，取满说明后面还有。
@@ -421,12 +426,13 @@ const GAP_PROBE: usize = 256;
 
 /// 某一档还有没有缺口：还有「该档启用、且有正文可嵌入」的记录缺当前指纹的向量。
 /// 与 `pending_candidates` 共用同一份候选判定，只是这里不调模型、不写任何东西。
+/// 正文仍在索引里排队（`text_pending`）的切片也算缺口：它这轮补不上，不代表这一档就绪。
 fn has_gap(conn: &Connection, index: &crate::index::TextIndex, space_id: &str, namespace: &str, target: VectorizeTarget) -> Result<bool> {
     let mut cursor: Option<i64> = None;
     loop {
         let candidates = pending_candidates(conn, index, space_id, Some(namespace), Some(target), GAP_PROBE, cursor, None)?;
         let Some(last) = candidates.last() else { return Ok(false) };
-        if candidates.iter().any(embeddable) { return Ok(true); }
+        if candidates.iter().any(|input| embeddable(input) || input.text_pending) { return Ok(true); }
         cursor = Some(last.key.id);
     }
 }
@@ -551,8 +557,6 @@ impl EmbeddingStore {
             .map_err(|error| Error::Validation(format!("embedder failed during registration ({}): {}", error.kind.code(), error.message)))?;
         validate_vectors(&produced, samples.len(), &space)?;
         self.0.engine.embedders.register(space_id.to_string(), entry);
-        // 多了一个可用的模型，也就多了一批可干的活：叫线程把该空间补齐。
-        if let Some(vectorizer) = self.0.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(())
     }
 
@@ -585,8 +589,6 @@ impl EmbeddingStore {
                 clear_vector_ready(&writer.conn, namespace)?;
             }
         }
-        // 总闸开了就多了一批该补的：叫线程去补。
-        if let Some(vectorizer) = self.0.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(receipt)
     }
 
@@ -615,8 +617,6 @@ impl EmbeddingStore {
                 clear_vector_ready(&writer.conn, namespace)?;
             }
         }
-        // 开了档就多了一批该补的：叫线程去补，别等谁再想起来。
-        if let Some(vectorizer) = self.0.engine.vectorizer.get() { vectorizer.notify_work(); }
         Ok(receipt)
     }
 
@@ -632,8 +632,9 @@ impl EmbeddingStore {
 
     /// 内部同步：库拿该空间注册的回调，把缺失向量的记录分批补齐。宿主不参与。
     ///
-    /// 它是四个触发时机里的「调用方主动叫一次」：先把索引追平（切片正文只存在索引里），
-    /// 再把缺口补完，最后逐档核对缺口、把补齐的档标成就绪。
+    /// 它是四个触发时机里的「调用方主动叫一次」：补完缺口，再逐档核对缺口、把补齐的档标成就绪。
+    /// 它不提交索引、不碰主库写锁：切片的正文存在索引里，索引尚未被写入侧提交时，
+    /// 这批切片这一轮取不到正文、跳过，等调用方 `update_index` 之后再被唤醒补上。
     /// 模型调用是网络往返，绝不能持有库锁，所以循环严格三段式：
     /// 读快照取一批文本（随即放锁）→ 调回调（不持任何库锁）→ 短事务写回这一批。
     /// 失败即中断：已写回的批次保留，未跑的批次不写。
@@ -642,17 +643,17 @@ impl EmbeddingStore {
         if self.0.engine.embedders.get(space_id).is_none() {
             return Err(Error::Validation(format!("no embedder registered for space {space_id}")));
         }
-        let report = self.fill(space_id, batch, true)?;
+        let report = self.fill(space_id, batch)?;
         let state = self.0.read()?;
         Ok(WriteReceipt { value: report, revision: storage::current_revision(state.conn())? })
     }
 
-    /// 一次补齐：追平索引 → 补缺口 → 核对并标记就绪。
-    /// `blocking` 为假时拿不到回调就跳过，后台线程不与调用方抢模型。
-    fn fill(&self, space_id: &str, batch: usize, blocking: bool) -> Result<SyncReport> {
+    /// 一次补齐：补缺口 → 核对并标记就绪。只由使用方显式调 `sync` 触发，库内没有任何线程替它跑。
+    /// 它不碰主库写锁、不提交索引：切片正文取不到（索引还没被写入侧提交）时这一轮跳过，
+    /// 该档停在未就绪，等使用方 `update_index` 之后再调一次 `sync`。索引提交是写入路径的事，与向量化无关。
+    fn fill(&self, space_id: &str, batch: usize) -> Result<SyncReport> {
         let Some(entry) = self.0.engine.embedders.get(space_id) else { return Ok(SyncReport::default()) };
-        self.0.catch_up_index(blocking)?;
-        let report = self.drain(space_id, &entry, batch, blocking)?;
+        let report = self.drain(space_id, &entry, batch)?;
         if report.interrupted.is_some() { self.0.note_degrade(Degrade::EmbedFailed); }
         self.verify_and_mark(space_id)?;
         Ok(report)
@@ -670,8 +671,6 @@ impl EmbeddingStore {
                 let state = self.0.read()?;
                 let index = self.0.index()?;
                 let conn = state.conn();
-                let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-                if pending > 0 { return Ok(()); }
                 let revision = storage::current_revision(conn)?;
                 let mut marks = Vec::new();
                 for namespace in storage::record_namespaces(conn)? {
@@ -687,14 +686,8 @@ impl EmbeddingStore {
             {
                 let mut guard = self.0.engine.vector_writer.lock();
                 let writer = guard.as_mut().ok_or(Error::Closed)?;
-                let (current_rev, pending) = {
-                    let state = self.0.read()?;
-                    let conn = state.conn();
-                    let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-                    let current_rev = storage::current_revision(conn)?;
-                    (current_rev, pending)
-                };
-                if pending > 0 || current_rev != revision {
+                let current_rev = { let state = self.0.read()?; storage::current_revision(state.conn())? };
+                if current_rev != revision {
                     continue;
                 }
                 for (namespace, target, ready) in &marks {
@@ -707,10 +700,9 @@ impl EmbeddingStore {
     }
 
     /// 分段补齐的实际循环。
-    fn drain(&self, space_id: &str, entry: &Arc<Mutex<EmbedderEntry>>, batch: usize, blocking: bool) -> Result<SyncReport> {
+    fn drain(&self, space_id: &str, entry: &Arc<Mutex<EmbedderEntry>>, batch: usize) -> Result<SyncReport> {
         let mut report = SyncReport::default();
-        let acquired = if blocking { Some(entry.lock()) } else { entry.try_lock() };
-        let Some(mut guard) = acquired else { return Ok(report); };
+        let mut guard = entry.lock();
         let mut cursor: Option<i64> = None;
         loop {
             let limit = batch.min(guard.effective_batch).max(1);
@@ -816,93 +808,10 @@ fn validate_vectors(produced: &[Vec<f32>], expected: usize, space: &EmbeddingSpa
     Ok(())
 }
 
-// ── 后台补齐线程 ──────────────────────────────────────────────────────
-
-/// 后台补齐的批大小。
-const SWEEP_BATCH: usize = 32;
+// ── 向量分区与就近检索 ────────────────────────────────────────────────
 
 /// 就绪核对最多重试几次：核对期间有人写就重来，几次都有人在写就先不标。
 const VERIFY_ATTEMPTS: usize = 3;
-
-/// 库内的向量化线程。它只做「补齐」一件事：读记录与索引取文本、调模型、
-/// 短事务写进 `embeddings` 表；不写业务记录、不改索引。
-///
-/// 它不轮询：平时睡在条件变量上，只在被叫的时候醒。叫它的时机有四个——
-/// 开库时、注册或切换模型时、写入提交后、以及一轮补齐跑完但仍有缺口时。
-/// 调用方在批次结束自己调 `sync` 同样有效，两者不会互相抢模型。
-pub(crate) struct Vectorizer {
-    /// 停止位。等待中的线程靠它被打断。
-    stopping: Mutex<bool>,
-    /// 唤醒信号。有活的一方 notify，线程据此醒来。
-    signal: Condvar,
-    /// 有活待补的记号。置位与唤醒必须在同一把锁里做：线程是「持锁看记号、再睡」的，
-    /// 只在锁外置位会落进这两步之间，信号丢了线程就一直睡到下一次唤醒。
-    pending: AtomicBool,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Vectorizer {
-    /// 开库时启动，并当场叫一次：库刚打开，该补的就得补。
-    /// 线程只持弱引用：库被丢掉时它自己收尾，不会被这条线程吊住不放。
-    pub(crate) fn start(engine: &Arc<crate::storage::Engine>) -> Result<Arc<Self>> {
-        let vectorizer = Arc::new(Self { stopping: Mutex::new(false), signal: Condvar::new(),
-            pending: AtomicBool::new(true), handle: Mutex::new(None) });
-        let worker = Arc::clone(&vectorizer);
-        let engine = Arc::downgrade(engine);
-        let handle = std::thread::Builder::new().name("p-memory-vectorize".into())
-            .spawn(move || work_loop(&engine, &worker))?;
-        *vectorizer.handle.lock() = Some(handle);
-        Ok(vectorizer)
-    }
-
-    /// 叫一次：有活要补。写入提交、注册模型、改档位都会说一声。
-    /// 只置记号并唤醒，不阻塞调用方，也不叫模型。
-    pub(crate) fn notify_work(&self) {
-        let _guard = self.stopping.lock();
-        self.pending.store(true, AtomicOrdering::SeqCst);
-        self.signal.notify_all();
-    }
-
-    /// 停下并等它收尾；重复调用无副作用。
-    pub(crate) fn stop(&self) {
-        {
-            let mut stopping = self.stopping.lock();
-            *stopping = true;
-            self.signal.notify_all();
-        }
-        if let Some(handle) = self.handle.lock().take() { let _ = handle.join(); }
-    }
-}
-
-/// 线程主体：睡到有人叫它，然后把每个已注册的空间补一轮。
-/// 一轮跑完若还有进展（说明补齐期间又进了新记录），就地再来一轮，
-/// 直到一轮下来一条都没补上——这就是「向量化完成，但还有漏网之鱼」那一次触发。
-fn work_loop(engine: &Weak<crate::storage::Engine>, vectorizer: &Vectorizer) {
-    loop {
-        {
-            let mut stopping = vectorizer.stopping.lock();
-            // 没被叫就一直睡；醒来后重判一次，空唤醒不至于白跑一轮全库扫描。
-            while !*stopping && !vectorizer.pending.load(AtomicOrdering::SeqCst) {
-                vectorizer.signal.wait(&mut stopping);
-            }
-            if *stopping { return; }
-        }
-        // 记号在手，先清掉再去干活：干活期间新来的写入会重新置位，不会被吞掉。
-        vectorizer.pending.store(false, AtomicOrdering::SeqCst);
-        let Some(engine) = engine.upgrade() else { return };
-        let kb = KnowledgeBase { engine };
-        loop {
-            let mut progressed = false;
-            for space_id in kb.engine.embedders.space_ids() {
-                // 兜底而已：出错（含关闭中的 Error::Closed）不抛出，留给下一轮与调用方的 sync。
-                if let Ok(report) = EmbeddingStore(kb.clone()).fill(&space_id, SWEEP_BATCH, false) {
-                    if report.written > 0 { progressed = true; }
-                }
-            }
-            if !progressed { break; }
-        }
-    }
-}
 
 /// 一行常驻向量的元信息。`note` 是它所属笔记的记录 id，只有 chunk 有归属，其余为 0。
 struct VectorRow { key: RecordKey, kind: RecordKind, tags: Vec<String>, note: i64, #[allow(dead_code)] fingerprint: String }

@@ -436,7 +436,7 @@ pub fn import_legacy(req:&ImportRequest)->Result<ImportReport>{
         tx.execute("INSERT INTO import_runs(source_id,source_fingerprint,report_json) VALUES (?1,?2,?3)",params![req.source_id,fingerprint,serde_json::to_string(&report)?])?;
         Ok(())
     })?;
-    // 导入只写数据，不逐条索引；导入时切好的正文在这里一次性交给索引，收尾显式追平一次。
+    // 导入只写数据，不逐条索引；导入时切好的正文在这里一次性交给索引，收尾显式提交并对账一次。
     kb.index_documents(&documents)?;
     match kb.update_index() { Ok(_) => {}, Err(error) => report.index_error = Some(error.to_string()) }
     report.index_ready = report.index_error.is_none();

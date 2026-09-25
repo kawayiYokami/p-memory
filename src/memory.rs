@@ -119,7 +119,7 @@ impl MemoryStore {
         let receipt = self.0.mutate(|tx| upsert(tx, &input))?;
         let WriteReceipt { value: (memory, document), revision } = receipt;
         // 写入只做两件事：入库（上面的 mutate）与把索引文档交给 writer。
-        // 索引提交交给 `update_index`，向量化交给 `embeddings().sync` 或库内线程。
+        // 索引提交交给 `update_index`，向量化交给使用方调 `embeddings().sync`。
         self.0.index_documents(&[document])?;
         Ok(WriteReceipt { value: memory, revision })
     }

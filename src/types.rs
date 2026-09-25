@@ -160,8 +160,8 @@ impl Default for PageRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> { pub items: Vec<T>, pub next_cursor: Option<String> }
 
-/// 一次已提交的写入。派生索引不在写入路径上追平——由使用方在合适时机调用
-/// `update_index` 一趟索引完；期间读取走自愈兜底，保证仍查得到。
+/// 一次已提交的写入。派生索引不在写入路径上提交——由使用方在合适时机调用
+/// `update_index` 一趟提交并对账收敛；期间读取走自愈兜底，保证仍查得到。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteReceipt<T> {
     pub value: T,
@@ -207,7 +207,6 @@ pub struct HealthReport {
     pub indexed_revision: i64,
     pub record_count: usize,
     pub index_document_count: usize,
-    pub pending_index_updates: usize,
     pub sqlite_integrity: String,
     pub foreign_key_errors: usize,
     pub counts: std::collections::BTreeMap<String, usize>,
@@ -234,11 +233,3 @@ pub enum MatchField {
     Path,
 }
 
-/// 全文索引重建的进度快照。宿主可在重建进行时从另一线程轮询：
-/// `active` 为真表示正在重建，`processed`/`total` 是已索引记录数与待索引记录总数。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct RebuildProgressReport {
-    pub active: bool,
-    pub processed: u64,
-    pub total: u64,
-}

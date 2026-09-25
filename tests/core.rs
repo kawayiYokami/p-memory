@@ -29,7 +29,7 @@ fn fallback_vector(text: &str, dimension: usize) -> Vec<f32> {
 fn attempt_error() -> EmbedCallbackError { EmbedCallbackError::other("boom") }
 
 /// 假嵌入：可以指定「文本 → 向量」表，未列出的走确定性兜底。
-/// 每批记下「调用发生在哪条线程、实收几条」——库内补齐线程与调用方线程要分得开。
+/// 每批记下「调用发生在哪条线程、实收几条」——用于确认写路径不触发任何模型调用。
 struct FakeEmbedder {
     dimension: usize,
     table: Arc<Mutex<BTreeMap<String, Vec<f32>>>>,
@@ -68,17 +68,19 @@ fn space(kb: &KnowledgeBase, id: &str, dimension: usize) {
 }
 /// 批次结束之后调用方触发的那次补齐。补完缺口，该档才会被标成就绪、向量路才放行。
 fn fill(kb: &KnowledgeBase, space_id: &str) -> SyncReport { kb.embeddings().sync(space_id, 32).unwrap().value }
-/// 等某一档补齐。补齐由库内线程主动触发，所以这里只等结果，不假定是谁补的。
-fn wait_until_ready(kb: &KnowledgeBase, namespace: &str, space_id: &str, target: &str, budget_ms: u64) -> bool {
+/// 补齐只由使用方显式触发：每次尝试都显式跑一轮 `sync`，再看该档是否就绪。
+/// 库里已没有后台线程，「等一等它自己会补上」那条路不存在了。
+fn sync_and_ready(kb: &KnowledgeBase, namespace: &str, space_id: &str, target: &str, budget_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
-    while std::time::Instant::now() < deadline {
+    loop {
+        let _ = kb.embeddings().sync(space_id, 32);
         if kb.embeddings().vector_ready(namespace, space_id, target).unwrap() { return true; }
+        if std::time::Instant::now() >= deadline { return false; }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    false
 }
-/// 假回调在某条线程上的调用次数。补齐线程与自己这条线程要分开算：
-/// 「写入不碰模型」这件事只能从调用方线程上看。
+/// 假回调在某条线程上的调用次数。「写入不碰模型」这件事只能从调用方线程上看：
+/// 写入路径若偷偷触发了一次嵌入，次数就会落到别的线程上。
 fn calls_from(calls: &Arc<Mutex<Vec<(String, usize)>>>, thread: &str) -> usize {
     calls.lock().unwrap().iter().filter(|(caller, _)| caller == thread).count()
 }
@@ -160,8 +162,8 @@ fn sync_fills_missing_vectors_incrementally_and_aborts_on_failure() {
     let embedder = FakeEmbedder::new(4);
     let lengths = embedder.lengths();
     kb.embeddings().register_embedder_with("v", embedder, EmbedderOptions { max_batch: 4, max_tokens_per_text: None }).unwrap();
-    // 注册回调这个动作自己就触发一次补齐；这里不假定是谁补的，只等它补完。
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000));
+    // 注册回调只绑定模型、不会自己补；补缺口由使用方显式调 sync。
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000));
     assert!(lengths.lock().unwrap().iter().all(|(_, length)| *length <= 4), "每批不得超过声明的 max_batch");
     // 已补齐再 sync：增量为零，回调不再被调用。
     let calls_after_fill = lengths.lock().unwrap().len();
@@ -187,7 +189,7 @@ fn sync_stops_after_the_first_failing_batch() {
         Ok(texts.iter().map(|text| fallback_vector(text, 4)).collect())
     }, EmbedderOptions { max_batch: 2, max_tokens_per_text: None }).unwrap();
     // 有补不上的记录：记忆档一直停在未就绪，它的向量不许参与打分。
-    assert!(!wait_until_ready(&kb, "default", "v", "memory", 1_000), "补不上的记录让记忆档停在未就绪");
+    assert!(!sync_and_ready(&kb, "default", "v", "memory", 1_000), "补不上的记录让记忆档停在未就绪");
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     let gated = kb.search(&vector_query("v", "甲", vec![RecordKind::Memory])).unwrap();
     assert!(gated.hits.is_empty() && gated.diagnostics.degraded.contains(&Degrade::VectorNotReady));
@@ -197,7 +199,7 @@ fn sync_stops_after_the_first_failing_batch() {
     assert!(settled.interrupted.is_some());
     // 换一条能用的回调：上次补好的向量留着不重算，补完才放行。
     kb.embeddings().register_embedder("v", FakeEmbedder::new(4)).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000), "换成能用的回调后补完即就绪");
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "换成能用的回调后补完即就绪");
     let mut requests = vector_query("v", "甲", vec![RecordKind::Memory]);
     requests.limit = 10;
     assert_eq!(kb.search(&requests).unwrap().hits.len(), 3, "三条都补上了");
@@ -216,7 +218,7 @@ fn writes_stay_clean_and_the_batch_end_sync_fills_vectors() {
     let gated = kb.search(&vector_query("v", "记住她喜欢苹果", vec![RecordKind::Memory])).unwrap();
     assert!(gated.hits.is_empty() && gated.diagnostics.degraded.contains(&Degrade::VectorNotReady),
         "记忆档还没补齐时它的向量不参与打分");
-    // 把模型接上：注册这个动作自己就触发一次补齐，不需要谁再喊一声。
+    // 把模型接上：注册只绑定模型、不会自己补，缺口要靠使用方调 sync。
     let embedder = FakeEmbedder::new(4);
     let calls = embedder.lengths();
     let me = std::thread::current().name().unwrap_or_default().to_string();
@@ -225,7 +227,7 @@ fn writes_stay_clean_and_the_batch_end_sync_fills_vectors() {
     let after_registration = calls_from(&calls, &me);
     kb.memories().upsert(memory("第二条 也喜欢梨", "public")).unwrap();
     assert_eq!(calls_from(&calls, &me), after_registration, "写入不许碰模型");
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000), "补完记忆档才放行向量路");
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "补完记忆档才放行向量路");
     let hits = kb.search(&vector_query("v", "记住她喜欢苹果", vec![RecordKind::Memory])).unwrap().hits;
     assert_eq!(hits[0].key.id, id);
     // tags 进该记录的向量文本：换一个只出现在 tags 里的词也能召回。
@@ -257,7 +259,7 @@ fn namespace_switch_disables_vectorization_and_degrades() {
     kb.embeddings().set_namespace_vectorization("other", false).unwrap();
     let mut muted = memory("被关闭向量化的内容", "public"); muted.record.namespace = "other".into();
     kb.memories().upsert(muted).unwrap();
-    // 索引提交由使用方择时做：这里显式追平，不依赖读者自愈撞上写锁空窗的时机。
+    // 索引提交由使用方择时做：这里显式提交并对账，不依赖读者自愈撞上写锁空窗的时机。
     kb.update_index().unwrap();
     let request = SearchRequest { query: "被关闭".into(), filter: ReadFilter { namespace: "other".into(), ..Default::default() },
         embed_space: Some("v".into()), ..Default::default() };
@@ -302,7 +304,7 @@ fn vectorization_targets_are_independent_per_namespace() {
     assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的档位不该被 sync 补出向量");
     // 开关只管「是否生成」：重新打开后这一条才补上向量。
     kb.embeddings().set_vectorization("default", "memory", true).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000), "重新打开后补齐缺的那一条");
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "重新打开后补齐缺的那一条");
     assert_eq!(kb.search(&vector_query("v", "记忆档关闭时的措辞", vec![RecordKind::Memory])).unwrap().hits[0].key.id, muted);
 }
 
@@ -320,7 +322,7 @@ fn notes_switch_gates_chunk_vectors_and_keeps_existing_ones() {
     assert_eq!(kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits[0].key.id, chunk);
     // 打开笔记档：补齐切片向量，向量路命中它，且向量取自切片正文本身。
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "notes", 15_000));
+    assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000));
     let hits = kb.search(&vector_query("v", "切片正文里的独有措辞", vec![RecordKind::Chunk])).unwrap().hits;
     assert_eq!(hits[0].key.id, chunk);
     assert!((hits[0].vector_scores["v"] - 1.0).abs() < 1e-6, "查询词与切片正文逐字相同，余弦应为 1");
@@ -371,7 +373,7 @@ fn vectorization_switches_survive_reopen() {
     std::fs::write(dir.path().join("n.md"), "重开之后写入的切片").unwrap();
     kb.notes().upsert_file(NoteFileInput::new(dir.path().join("n.md"))).unwrap();
     kb.update_index().unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "notes", 15_000), "只有笔记档那一条会被补上");
+    assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000), "只有笔记档那一条会被补上");
     assert!(kb.search(&vector_query("v", "重开之后写入的记忆", vec![RecordKind::Memory])).unwrap().hits.is_empty());
     assert!(!kb.search(&vector_query("v", "重开之后写入的切片", vec![RecordKind::Chunk])).unwrap().hits.is_empty());
 }
@@ -405,7 +407,7 @@ fn vector_cleanup_follows_record_lifecycle_not_the_switch() {
     assert_ne!(second, first);
     assert_eq!(kb.embeddings().sync("v", 32).unwrap().value.written, 0, "关闭的笔记档不补新向量");
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "notes", 15_000), "只有新切片需要补向量");
+    assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000), "只有新切片需要补向量");
     let mut wide = vector_query("v", "第二版切片措辞", vec![RecordKind::Chunk]); wide.limit = 10;
     let hits = kb.search(&wide).unwrap().hits;
     assert_eq!(hits[0].key.id, second);
@@ -438,26 +440,28 @@ fn deleting_a_space_removes_its_vectors_and_readiness() {
 }
 
 #[test]
-fn background_thread_backfills_after_the_batch_ends() {
+fn caller_syncs_after_the_batch_ends() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     // 写入的时候还没有模型可用：缺口留着，谁都不许拿半个领域去走向量路。
     kb.memories().upsert(memory("等模型上线的记忆", "public")).unwrap();
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap());
-    // 注册模型这个动作自己就会触发补齐，不需要谁再喊一次。
+    // 注册模型不会自己补：库内没有任何线程替使用方干活。
     space(&kb, "v", 4);
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000), "库内线程应当把缺口补上");
+    assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap(), "没人调 sync，缺口就一直留着");
+    // 使用方自己调一次同步，缺口才被补上、该档才就绪。
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000));
     let hits = kb.search(&vector_query("v", "等模型上线的记忆", vec![RecordKind::Memory])).unwrap().hits;
     assert_eq!(hits.len(), 1);
-    // 关闭库时线程收尾：关掉之后不再有任何后台写，库也拒绝再被使用。
+    // 关闭库后不再接受任何调用。
     kb.close().unwrap();
     assert!(matches!(kb.embeddings().sync("v", 32), Err(Error::Closed)));
     // 重开同一目录：上次补好的向量还在，只补这之后新出现的缺口。
     let reopened = KnowledgeBase::open(dir.path()).unwrap();
     space(&reopened, "v", 4);
     let fresh = reopened.memories().upsert(memory("重开之后写入的记忆", "public")).unwrap().value.header.id;
-    // 写入本身就会叫线程：不用谁再调 sync。
-    assert!(wait_until_ready(&reopened, "default", "v", "memory", 15_000), "写入之后线程自己会补");
+    // 写入不会自己补：还是得使用方调 sync。
+    assert!(sync_and_ready(&reopened, "default", "v", "memory", 15_000), "使用方调 sync 之后才补上");
     let hits = reopened.search(&vector_query("v", "重开之后写入的记忆", vec![RecordKind::Memory])).unwrap().hits;
     assert!(hits.iter().any(|hit| hit.key.id == fresh), "写入那条进了向量路");
     reopened.close().unwrap();
@@ -471,10 +475,10 @@ fn chunk_vectors_come_from_the_real_body_not_an_empty_one() {
     let path = dir.path().join("n.md");
     std::fs::write(&path, "切片正文独有措辞").unwrap();
     let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    // 读 chunks 会顺带读到切片正文（索引未提交时先提交一次），因此这里不再断言「未提交前未就绪」。
     let chunk = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap()[0].header.id;
-    // 故意不调 update_index：这一刻切片正文还压在索引 writer 里，没提交。
-    // 补齐自己会先把索引追平再取正文，绝不用空文本凑一个向量。
-    assert!(wait_until_ready(&kb, "default", "v", "notes", 15_000));
+    // 使用方显式调一次同步：切片正文只在索引里，同步据此算出向量、标成就绪。
+    assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000));
     let hits = kb.search(&vector_query("v", "切片正文独有措辞", vec![RecordKind::Chunk])).unwrap().hits;
     assert_eq!(hits[0].key.id, chunk);
     assert!((hits[0].vector_scores["v"] - 1.0).abs() < 1e-6, "向量取自切片正文本身，不是空文本");
@@ -494,7 +498,7 @@ fn the_gap_counts_only_enabled_targets() {
     assert!(vector_hits.is_empty(), "关掉的档位一条向量都不生成");
     // 打开笔记档：切片这才需要补，补齐之后该档才放行。
     kb.embeddings().set_vectorization("default", "notes", true).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "notes", 15_000));
+    assert!(sync_and_ready(&kb, "default", "v", "notes", 15_000));
     let hits = kb.search(&vector_query("v", "笔记正文里的措辞", vec![RecordKind::Chunk])).unwrap().hits;
     assert_eq!(hits.len(), 1, "开档后才补出切片向量");
 }
@@ -506,7 +510,7 @@ fn callback_failures_still_commit_and_degrade_to_text() {
     kb.embeddings().register_embedder("v", FakeEmbedder::new(4)).unwrap();
     // 记录本身能嵌入：这一批补完，记忆档就绪，向量路放行——下面才测得到「查询词嵌入失败」这一档。
     let id = kb.memories().upsert(memory("平铺直叙的记忆", "public")).unwrap().value.header.id;
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000));
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000));
     assert!(kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     // 检索侧：查询词嵌入失败就退纯全文，不报错、不返回空。
     let asking = SearchRequest { query: "触发降级 平铺直叙".into(), embed_space: Some("v".into()), ..Default::default() };
@@ -528,7 +532,7 @@ fn an_interrupted_fill_leaves_the_domain_unready() {
     space(&kb, "v", 4);
     // 有一条记录的回调会挂：补齐反复中断，记录照常在库里，但记忆档不许标成就绪。
     let id = kb.memories().upsert(memory("触发降级的记忆", "public")).unwrap().value.header.id;
-    assert!(!wait_until_ready(&kb, "default", "v", "memory", 1_000), "补不上的记录让记忆档停在未就绪");
+    assert!(!sync_and_ready(&kb, "default", "v", "memory", 1_000), "补不上的记录让记忆档停在未就绪");
     assert!(kb.health().unwrap().last_degraded.contains(&Degrade::EmbedFailed), "补齐失败要记一档降级");
     assert!(!kb.embeddings().vector_ready("default", "v", "memory").unwrap());
     let gated = kb.search(&SearchRequest { query: "触发降级".into(), kinds: vec![RecordKind::Memory], embed_space: Some("v".into()), ..Default::default() }).unwrap();
@@ -753,7 +757,7 @@ fn oversized_batches_shrink_to_fit() {
         Ok(texts.iter().map(|text| fallback_vector(text, 4)).collect())
     }, EmbedderOptions { max_batch: 8, max_tokens_per_text: None }).unwrap();
     kb.embeddings().sync("v", 32).unwrap();
-    assert!(wait_until_ready(&kb, "default", "v", "memory", 15_000), "八条都补上了");
+    assert!(sync_and_ready(&kb, "default", "v", "memory", 15_000), "八条都补上了");
     let calls = lengths.lock().unwrap().clone();
     let shrink_at = calls.iter().position(|len| *len == 8).expect("先按声明的 8 条试一次");
     assert_eq!(calls.iter().filter(|len| **len == 8).count(), 1, "减半后不再从 8 重试");
@@ -770,8 +774,8 @@ fn swapping_models_keeps_the_old_space_usable() {
     kb.embeddings().register_space(EmbeddingSpace { id: "new".into(), model: "fixture/v2".into(), dimension: 8, text_version: 1, encoding: "sq8".into() }).unwrap();
     kb.embeddings().register_embedder("new", FakeEmbedder::new(8)).unwrap();
     kb.embeddings().sync("new", 32).unwrap();
-    // 后台线程可能在同一时刻已经把这三条补掉，所以只断言终态，不数这一次写了多少。
-    assert!(wait_until_ready(&kb, "default", "new", "memory", 15_000), "换上新模型后补齐并标记就绪");
+    // 只断言终态，不数这一次写了多少。
+    assert!(sync_and_ready(&kb, "default", "new", "memory", 15_000), "换上新模型后补齐并标记就绪");
     let kinds = vec![RecordKind::Memory];
     let old_hits = kb.search(&vector_query("old", "换模型 1", kinds.clone())).unwrap().hits;
     let new_hits = kb.search(&vector_query("new", "换模型 1", kinds.clone())).unwrap().hits;
@@ -821,9 +825,9 @@ fn packed_and_precise_spaces_rank_the_same_vectors_together() {
     for (id, encoding) in [("precise", "f32"), ("packed", "sq8")] {
         kb.embeddings().register_space(EmbeddingSpace { id: id.into(), model: "fixture/v1".into(), dimension: 8, text_version: 1, encoding: encoding.into() }).unwrap();
         kb.embeddings().register_embedder(id, FakeEmbedder::new(8)).unwrap();
-        // 注册回调自己就触发一次补齐，谁补的不重要，只等终态。
+        // 使用方显式同步一次，补完缺口才标记就绪。
         kb.embeddings().sync(id, 50).unwrap();
-        assert!(wait_until_ready(&kb, "default", id, "memory", 15_000), "空间 {id} 补齐并标记就绪");
+        assert!(sync_and_ready(&kb, "default", id, "memory", 15_000), "空间 {id} 补齐并标记就绪");
     }
     let kinds = vec![RecordKind::Memory];
     let precise = kb.search(&vector_query("precise", "记录3", kinds.clone())).unwrap().hits;
@@ -895,10 +899,10 @@ fn read_rounds(kb: &KnowledgeBase, request: &SearchRequest, threads: usize, roun
 fn concurrent_readers_are_not_blocked_by_a_writer() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.memories().upsert(memory("初始内容", "public")).unwrap();
-    // 写入不再就地索引：先把基线追平，之后写者产生的待办由读者自愈或被忽略都不影响这条。
+    // 写入不再就地索引：先把基线追平，之后写者攒下的索引增删由读者自愈或被忽略都不影响这条。
     kb.update_index().unwrap();
     let request = SearchRequest { query: "初始内容".into(), limit: 5, ..Default::default() };
-    // 读路径曾经这样退化成串行：待索引队列非空时读者去抢写锁，而写者每次索引提交要二十毫秒量级，
+    // 读路径曾经这样退化成串行：索引标脏时读者去抢写锁，而写者每次索引提交要二十毫秒量级，
     // 于是读者全排到写者后面，吞吐掉到基线的百分之七。这里用同一个读者组在写者存在前后各跑一遍，
     // 用耗时比钉住「读者不等写者」，只断言数量级，不追求具体数值。
     let quiet = read_rounds(&kb, &request, 4, 60);
@@ -909,7 +913,7 @@ fn concurrent_readers_are_not_blocked_by_a_writer() {
         let mut n = 0usize;
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             writer_kb.memories().upsert(memory(&format!("并发写入 {n}"), "public")).unwrap();
-            // 写入只登记待办；使用方按自己的节奏追平索引，这也是读者不必替写者收尾的常态。
+            // 写入只把文档攒进索引 writer；使用方按自己的节奏调 update_index 提交，这也是读者不必替写者收尾的常态。
             if n % 16 == 15 { writer_kb.update_index().unwrap(); }
             n += 1;
         }
@@ -1013,13 +1017,14 @@ fn backup_restore_and_derived_index_recovery() {
 }
 
 #[test]
-fn ties_and_chinese_queries_are_deterministic_across_rebuilds() {
+fn ties_and_chinese_queries_are_deterministic_across_reopens() {
     let dir=tempfile::tempdir().unwrap();let kb=KnowledgeBase::open(dir.path()).unwrap();
     let values:Vec<_>=(0..140).map(|_| memory("上海 茶 相同", "public")).collect();kb.memories().upsert_many(&values).unwrap();
     let q=SearchRequest {query:"上海 茶".into(),limit:3,candidate_limit:Some(3),..Default::default()};
     let ids=|kb:&KnowledgeBase|kb.search(&q).unwrap().hits.into_iter().map(|h|h.key.id).collect::<Vec<_>>();
     let first=ids(&kb);assert_eq!(first.len(),3);assert!(first.windows(2).all(|w|w[0]<w[1]));
-    kb.rebuild_indexes().unwrap();assert_eq!(ids(&kb),first);
+    drop(kb);let kb=KnowledgeBase::open(dir.path()).unwrap();
+    assert_eq!(ids(&kb),first,"重开对账后名次仍确定");
 }
 
 /// 标签集拼在承载它的那一条正文前面：记忆是它自己，笔记是它的第一片。
@@ -1328,9 +1333,9 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
 }
 
 /// 正文只在索引里存一份，源文件在写入之后就可以消失：读切片正文不再回文件。
-/// 代价是索引全量重建必须回源——源不在时那批切片正文只能退化为空。
+/// 对账只在有缺口时才回源，已进索引的文档不受源文件消失影响。
 #[test]
-fn indexed_text_survives_the_source_file_but_a_rebuild_needs_it() {
+fn indexed_text_survives_the_source_file() {
     let dir = tempfile::tempdir().unwrap();
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
@@ -1343,9 +1348,9 @@ fn indexed_text_survives_the_source_file_but_a_rebuild_needs_it() {
 
     assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "会被删掉的正文",
         "正文随写入一起进了索引，源文件没了也读得到");
-    assert!(kb.rebuild_indexes().is_ok(), "重建遇到缺失文件不应整体失败");
-    assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "",
-        "重建要回源，源不在的那批切片正文只能为空");
+    kb.update_index().unwrap();
+    assert_eq!(kb.notes().get_chunk(chunk_id, &ReadFilter::default()).unwrap().content, "会被删掉的正文",
+        "索引进度无缺口时对账不回源，源文件不在也不动这批文档");
 }
 
 /// 重排取候选正文也走索引：源文件删掉之后，回调拿到的仍是切片原文。
@@ -1448,11 +1453,11 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     // 笔记自己不占索引文档：文档数 = 记录数 − 笔记数。
     let before = kb.health().unwrap();
     assert_eq!(before.index_document_count, before.record_count - 1);
-    // 整库重建之后同一批查询结果一致。
-    kb.rebuild_indexes().unwrap();
+    // 索引与主库对账之后同一批查询结果一致。
+    kb.update_index().unwrap();
     let again = kb.search(&SearchRequest { query: "overview".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
-    assert_eq!(again.len(), hits.len(), "重建后命中条数一致");
-    assert_eq!(again[0].key.id, hits[0].key.id, "重建后名次一致");
+    assert_eq!(again.len(), hits.len(), "对账后命中条数一致");
+    assert_eq!(again[0].key.id, hits[0].key.id, "对账后名次一致");
     assert_eq!(kb.health().unwrap().index_document_count, before.record_count - 1);
 }
 
@@ -1771,12 +1776,12 @@ fn preset_notes_split_titles_contents_and_path_fallback() {
     assert!(by_path.titles.is_empty() && by_path.contents.is_empty(), "沧浪只在目录里，书名与内容都不命中");
     assert!(!by_path.paths.is_empty(), "书名块不足时由目录兜底补足");
 
-    // 重建之后同一批查询结果一致。
-    kb.rebuild_indexes().unwrap();
+    // 索引与主库对账之后同一批查询结果一致。
+    kb.update_index().unwrap();
     let after = notes_section(&kb, "city");
-    assert_eq!(after.titles.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), title_ids, "重建后书名块一致");
-    assert_eq!(after.contents.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), content_ids, "重建后内容块一致");
-    assert!(!notes_section(&kb, "沧浪").paths.is_empty(), "重建后目录兜底仍生效");
+    assert_eq!(after.titles.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), title_ids, "对账后书名块一致");
+    assert_eq!(after.contents.iter().map(|hit| hit.key.id).collect::<Vec<_>>(), content_ids, "对账后内容块一致");
+    assert!(!notes_section(&kb, "沧浪").paths.is_empty(), "对账后目录兜底仍生效");
 }
 
 /// 单路预设只填自己那一个字段；广撒网三个字段都填。
@@ -2033,25 +2038,7 @@ fn event_sink_does_not_change_results() {
     assert_eq!(*events.lock().unwrap(), 1, "注销后不再产出");
 }
 
-/// 索引重建产出一条 `index_rebuild` 事件，带文档数与格式串。
-#[test]
-fn event_sink_receives_index_rebuild() {
-    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
-    for text in ["事件重建 甲", "事件重建 乙"] { kb.memories().upsert(memory(text, "public")).unwrap(); }
-    kb.update_index().unwrap();
-    let events: Arc<Mutex<Vec<LogEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let recorder = events.clone();
-    kb.register_event_sink(move |event: &LogEvent| recorder.lock().unwrap().push(event.clone()));
-    let report = kb.rebuild_indexes().unwrap();
-    let seen = events.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].kind, "index_rebuild");
-    assert_eq!(seen[0].documents, Some(report.index_document_count));
-    assert!(seen[0].format.as_deref().unwrap_or_default().starts_with("p-memory-text-"));
-    assert!(seen[0].stages.is_empty(), "重建事件不分阶段");
-}
-
-/// 删掉的记录必须离开索引：写入路径只按 id 覆盖，删除没有别的地方会把文档摘掉，
+/// 删掉的记录必须离开索引：删除只落主库，索引靠对账把这条 doc 摘掉，
 /// 留着就会继续参与打分、占住候选配额。
 #[test]
 fn deleted_records_leave_the_index() {
@@ -2299,7 +2286,7 @@ fn clearing_a_note_domain_takes_its_chunks_along() {
     assert!(kb.notes().get_chunk(chunk, &ReadFilter::default()).is_err(), "切片随笔记一起删掉");
 }
 
-/// 批量删除同样要进索引追平：删掉的记录不能再被检索到。
+/// 批量删除同样要进索引对账：删掉的记录不能再被检索到。
 #[test]
 fn the_index_forgets_batch_deleted_records() {
     let dir = tempfile::tempdir().unwrap();

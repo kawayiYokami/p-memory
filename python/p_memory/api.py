@@ -400,8 +400,8 @@ class EmbeddingStore:
         return self._kb.invoke("embeddings.set_vectorization", {"namespace": namespace, "target": target, "enabled": enabled})
 
     def sync(self, space_id: str, *, batch: int = 32) -> WriteReceipt:
-        """批次处理完之后触发一次补齐：先把索引追平，再把缺失向量的记录分批补齐，
-        最后核对缺口、把补齐的领域标成就绪。宿主不参与向量计算。"""
+        """批次处理完之后由使用方调一次补齐：把缺失向量的记录分批补齐，
+        最后核对缺口、把补齐的领域标成就绪。库内没有后台线程，没人调就一直缺着。"""
         return self._kb.invoke("embeddings.sync", {"space_id": space_id, "batch": batch})
 
     def vector_ready(self, namespace: str, space_id: str, target: str) -> bool:

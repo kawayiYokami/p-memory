@@ -211,7 +211,7 @@ impl KnowledgeBase {
 
     pub fn reranker_registered(&self) -> bool { self.engine.rerankers.is_registered() }
 
-    /// 全文路。派生索引查询失败时返回 `Index`，由调用方触发重建后重试。
+    /// 全文路。派生索引查询失败时返回 `Index`，由调用方隔离文本路——索引没有「重建」这条路。
     fn search_text(&self, conn: &rusqlite::Connection, query: &str, filter: &ReadFilter, kinds: &[RecordKind], limit: usize, field: MatchField) -> Result<Vec<(RecordKey, f64)>> {
         self.sync_index_if_behind(conn)?;
         let Some(index_filter) = index_filter(conn, filter, kinds)? else { return Ok(Vec::new()) };
@@ -300,15 +300,9 @@ impl KnowledgeBase {
         if request.text {
             let text_hits = match self.search_text(conn, query, &request.filter, &request.kinds, limit, request.match_field) {
                 Ok(hits) => Some(hits),
-                // 派生索引查询失败：当场从权威数据重建一次再重试。恢复得了就照常给结果；
-                // 连重建都失败才隔离文本路。不静默退回空文本——那等于把 BM25 地板也丢掉。
-                Err(Error::Index(_)) => match self.rebuild_indexes() {
-                    Ok(_) => match self.search_text(conn, query, &request.filter, &request.kinds, limit, request.match_field) {
-                        Ok(hits) => Some(hits),
-                        Err(_) => { diagnostics.degraded.push(Degrade::TextIndexUnavailable); Some(Vec::new()) }
-                    },
-                    Err(_) => { diagnostics.degraded.push(Degrade::TextIndexUnavailable); Some(Vec::new()) }
-                },
+                // 派生索引查询失败：隔离文本路，不静默退回空文本。索引没有「重建」这条路——
+                // 它与主库的一致性由下一次对账收敛，失败只影响这一次结果。
+                Err(Error::Index(_)) => { diagnostics.degraded.push(Degrade::TextIndexUnavailable); Some(Vec::new()) }
                 // 库已关闭是调用错误，不该被降级吞掉。
                 Err(error) => return Err(error),
             };
@@ -593,8 +587,8 @@ mod tests {
     use crate::MemoryInput;
     use std::sync::atomic::Ordering;
 
-    /// 索引查询失败时，检索应触发一次重建并重试：恢复得了就照常出结果，
-    /// 连重建都失败才隔离文本路——不再静默退回空文本。
+    /// 索引查询失败时隔离文本路，不静默退回空文本；故障排除后重检索照常命中，
+    /// 无需任何重建——索引与主库的一致性由下一次对账收敛。
     /// token 计数按字符密度估算：ASCII ≈ 4 字符/token，非 ASCII ≈ 2 字符/token，向上取整。
     #[test]
     fn token_count_follows_character_density() {
@@ -612,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn index_query_failure_rebuilds_then_recovers() {
+    fn index_query_failure_degrades_without_rebuilding() {
         let dir = tempfile::tempdir().unwrap();
         let kb = KnowledgeBase::open(dir.path()).unwrap();
         kb.memories().upsert(MemoryInput::new("索引故障恢复的独有措辞")).unwrap();
@@ -624,9 +618,8 @@ mod tests {
 
         index.fail_search.store(true, Ordering::SeqCst);
         let degraded = kb.search(&request).unwrap();
-        assert!(index.rebuilds.load(Ordering::SeqCst) >= 1, "索引查询失败必须触发重建");
         assert!(degraded.diagnostics.degraded.contains(&Degrade::TextIndexUnavailable),
-            "重建之后仍失败，才隔离文本路");
+            "索引查询失败应隔离文本路");
 
         index.fail_search.store(false, Ordering::SeqCst);
         let recovered = kb.search(&request).unwrap();

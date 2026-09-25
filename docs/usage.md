@@ -134,7 +134,8 @@ kb.embeddings().register_embedder_with("e5", my_embed_fn, EmbedderOptions {
     max_batch: 50, max_tokens_per_text: Some(512),
 })?;
 
-// 批次结束后调一次：先追平索引，再把缺口补完，最后逐档核对并标成就绪（记忆 / 图谱 / 笔记各自记）。
+// 批次结束后调一次：按缺口分批补齐、逐档核对并标成就绪（记忆 / 图谱 / 笔记各自记）。
+// 它不提交索引、不碰主库：切片的正文要等写入侧 update_index 提交索引之后才读得到。
 kb.embeddings().sync("e5", 50)?;
 
 // 写入路径不产生向量：upsert 只入库、写索引，一行向量都不算。
@@ -159,14 +160,14 @@ kb.embeddings().set_vectorization("demo", "notes", false)?;
 let receipt = kb.memories().upsert(m)?;
 receipt.value;         // 写入结果
 receipt.revision;      // 提交后的库版本
-kb.update_index()?;    // 追平待办（写入不就地索引；批量导入后调用一次即可）
+kb.update_index()?;    // 提交写入攒下的增删并对账收敛索引（写入不就地索引；批量导入后调用一次即可）
 ```
 
 所有错误是 `p_memory::Error`，`err.code()` 给稳定字符串码，便于跨进程 / 跨语言处理。
 
 ## 存储与备份
 
-一个目录一个库：`store.sqlite3`（权威）+ `vectors.sqlite3`（向量外挂派生库）+ `text-v2/`（可重建的全文索引）+ `writer.lock`。
+一个目录一个库：`store.sqlite3`（权威）+ `vectors.sqlite3`（向量外挂派生库）+ `text-v2/`（派生全文索引，靠对账收敛到主库）+ `writer.lock`。
 
 ```rust
 kb.backup("./backup.sqlite3")?;                                  // 在线备份（同时生成 backup.sqlite3.vectors）

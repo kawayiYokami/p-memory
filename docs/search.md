@@ -257,9 +257,9 @@ struct GraphSection {
 | 纯全文 | 嵌入回调调用失败 | `embed_failed` |
 | 纯全文 | 该领域这一档向量未补齐（该档的 `vector_ready` 标记缺失） | `vector_not_ready` |
 | 按融合分排序 | 重排回调失败或产出不符 | `rerank_failed` |
-| 文本路不可用 | 索引查询失败，且当场重建仍未能恢复 | `text_index_unavailable` |
+| 文本路不可用 | 索引查询失败 | `text_index_unavailable` |
 
-任一档都返回结果、不抛错、不返回空；当前档位可从 `SearchResult.diagnostics.degraded` 与 `HealthReport.last_degraded` 读到。索引查询失败不是直接降级：检索会先按 `FORMAT` 与权威数据当场重建索引并重试，只有重建仍失败时才隔离文本路。
+任一档都返回结果、不抛错、不返回空；当前档位可从 `SearchResult.diagnostics.degraded` 与 `HealthReport.last_degraded` 读到。索引查询失败即隔离文本路（向量路照常），不触发任何重建——索引与主库的收敛只由对账承担。
 
 ## 事件流
 
@@ -274,7 +274,7 @@ kb.event_sink_registered();
 ```rust
 struct LogEvent {
     ts: String,                       // 本地时间 RFC3339，毫秒精度
-    kind: String,                     // "search" | "index_rebuild"
+    kind: String,                     // "search"
     ms: u64,                          // 本次执行的真实总耗时
     stages: Map<String, u64>,         // 各阶段耗时（毫秒）
     candidates: Option<usize>,        // 参与融合的候选条数
@@ -282,8 +282,6 @@ struct LogEvent {
     rerank_docs: Option<usize>,       // 实际送进重排回调的文档数
     rerank_tokens: Option<usize>,     // 实际送进重排回调的 token 数（含查询词）
     hits: Option<usize>,              // 最终返回的命中条数
-    documents: Option<usize>,         // index_rebuild：写入索引的文档数
-    format: Option<String>,           // index_rebuild：索引格式串
     degraded: Vec<Degrade>,           // 本次落在哪几档降级
 }
 ```
@@ -291,8 +289,6 @@ struct LogEvent {
 一次 `search` 产出一条 `search` 事件，阶段依次为：`prepare`（参数校验与图剪枝）、`embed`（向量路准备与嵌入回调）、`text`（全文召回）、`vector`（向量打分）、`fuse`（融合与候选排序）、`fold`（折叠与聚合）、`rerank`（重排候选截取与回调）、`count`（按笔记数命中片段数，只数最终返回的那几条；一次遍历匹配集、按 `note` 快字段分桶，不为每篇各发一次查询）、`load`（装配命中）。没走的阶段不出现，例如未启用向量路就没有 `embed` 与 `vector`。
 
 `rerank` 与 `embed` 是**等宿主回调返回**的时间，也就是模型推理时间，不是库的开销。一次 11.7 秒的请求落在哪一格，看 `stages` 就知道。`ms` 是本次执行的真实总耗时，可能略大于各阶段之和（收尾不计入阶段）。
-
-`index_rebuild` 只由 `rebuild_indexes()` 产出。开库时按 `FORMAT` 触发的自动重建发生在宿主注册回调之前，发不出事件。
 
 三条契约：
 
@@ -310,10 +306,9 @@ struct LogEvent {
 
 ## 索引一致性
 
-- `index_updates` 是待提交信号：写入事务里登记 `(revision, record_id)`，同一个调用把文档写进索引 writer。`update_index` 一趟提交、把 `indexed_revision` 记到本次实际覆盖的最大 revision，并删掉已覆盖的队列行。
-- 索引目录损坏时**隔离并重建**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再新建空索引，权威数据库不受影响。
-- 检索前若还有待处理更新，会先提交一次，保证结果与已提交数据一致。
-- 索引提交带 payload `<FORMAT>:<indexed_revision>`（`FORMAT` 是索引格式串，形如 `p-memory-text-v13`）；`open` 时若 payload 与 `indexed_revision` 不符、或队列里还压着未提交的待办，即整体重建。
-- 重建是唯一回读源文件的路径：切片正文没有第二份副本，按同一套切分规则重新读文件切一遍，文件缺失的那批切片正文退化为空。
-- 重建按 record id 分页流式进行，每批（`REBUILD_BATCH`）处理完就提交一次、并把「已处理到的 id」写进 `meta.rebuild_cursor`；因此内存只驻留单批文档，且中途被杀后 `recover` 能从游标续跑。重建进行中 payload 为 `<FORMAT>:rebuild`，收尾时才落回 `<FORMAT>:<indexed_revision>`。
-- 重建进度可从 `rebuild_indexes` 之外的只读接口 `rebuild_progress` 取到（`active` / `processed` / `total`），可在重建进行时从另一线程轮询。
+- 索引与主库的一致性只由**算差集**判定，没有任何待办账本。同步时扫索引里每个文档的 `key`（记录 id 快字段）成一个集合，对主库 `records.id` 求差集：索引里多出来的按 `key` term 摘掉，缺的就地补上。稳态差集为空，一次提交都不发生。
+- 删除只改主库：删记录不动索引、不动向量，只把索引标成「需要重新对账」。索引收敛只在明确调用的那一刻（`update_index`、`close`，或读取侧抢到写锁时的自愈）发生，删除这批记录之外的文档一动不动，且与库的大小无关。
+- 切片正文没有第二份副本，索引侧补切片文档时按同一套切分规则回源文件重切，文件缺失的那批切片正文退化为空；记忆、图谱等记录的正文由 `payload_json` 直接给出，不回源文件。
+- 索引目录打不开时**只隔离这一份派生索引**：把 `text-v2` 重命名为 `text-v2.corrupt-<uuid>`，再建空索引，权威数据库不受影响；随后由对账把缺的补齐。
+- 索引提交带 payload `<FORMAT>:<revision>`，`revision` 只作进度标记，不参与任何对账；`open` 时读到的 payload 与 `indexed_revision` 不一致，也只走一次对账，不触发整体重建。
+- 检索前若索引已标脏，会先尝试提交并收敛一次，保证结果与已提交数据一致；抢不到写锁就跳过、绝不排队，等下一次读取再补平。

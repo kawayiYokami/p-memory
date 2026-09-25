@@ -8,8 +8,8 @@ use serde_json::Value;
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
 /// 读路径自愈索引时最多试几次拿写锁（每次退避 1ms，合计约 1s）。
-/// 只在库内补向量那条线程正在补齐时才试：它提交的正是读者要看的待办，
-/// 而那份提交一落地待办就空了，循环随即结束。别的时候（例如批量导入的写者占着写锁）
+/// 只在库内补向量那条线程正在补齐时才试：它提交的正是读者要看的索引增删，
+/// 而那份提交一落地索引就干净了，循环随即结束。别的时候（例如批量导入的写者占着写锁）
 /// 一律不试，读路径绝不为索引排队——那正是当初吞吐塌方的成因。
 
 
@@ -107,7 +107,7 @@ pub(crate) struct Engine {
     pub writer: Mutex<Option<Writer>>,
     pub readers: Mutex<Option<Readers>>,
     /// 向量外挂库 `vectors.sqlite3` 的写连接与读连接池：与主库同目录、独立 WAL、独立锁。
-    /// 向量是派生检索索引，读写不走主库通道，补齐线程的写不会占用业务写的写锁。
+    /// 向量是派生检索索引，读写不走主库通道，向量的写不会占用业务写的写锁。
     pub vector_writer: Mutex<Option<Writer>>,
     pub vector_readers: Mutex<Option<Readers>>,
     /// `TextIndex` 自带内部写锁、`IndexReader` 可并发检索，用 `Arc` 共享给所有读线程。
@@ -120,8 +120,6 @@ pub(crate) struct Engine {
     pub rerankers: crate::search::RerankerRegistry,
     /// 宿主注册的事件接收位。不注册就什么都不产出。
     pub events: crate::events::EventRegistry,
-    /// 库内的向量化线程。它在 `open` 里启动，线程自己持弱引用，因此只能在这里设一次。
-    pub vectorizer: std::sync::OnceLock<Arc<crate::embeddings::Vectorizer>>,
     /// 最近观察到的降级档位，供健康检查读出「结果为什么变差」。
     pub degraded: Mutex<Vec<Degrade>>,
     pub root: PathBuf,
@@ -187,7 +185,8 @@ impl KnowledgeBase {
         // 向量库外挂：写路径的删除与指纹核对也要看得见它。
         write_conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
         let index = Arc::new(TextIndex::open(&root)?);
-        index.recover(&write_conn)?;
+        // 打开即对账：索引与主库对齐，缺的补、多的删。没有「重建」这条路。
+        index.reconcile(&write_conn)?;
         // 只读连接在 schema 建好之后再开，保证它看到的是完整结构。
         let reader = open_reader(&root)?;
         let vector_reader = open_vector_reader(&root)?;
@@ -200,11 +199,8 @@ impl KnowledgeBase {
             embedders: crate::embeddings::EmbedderRegistry::new(),
             rerankers: crate::search::RerankerRegistry::new(),
             events: crate::events::EventRegistry::default(),
-            vectorizer: std::sync::OnceLock::new(),
             degraded: Mutex::new(Vec::new()), root,
         });
-        // 向量化线程在开库时启动，由 `close` 停下并等它收尾。
-        engine.vectorizer.set(crate::embeddings::Vectorizer::start(&engine)?).unwrap_or_else(|_| unreachable!("vectorizer starts once"));
         Ok(Self { engine })
     }
 
@@ -218,12 +214,12 @@ impl KnowledgeBase {
     /// 把写入流程就地交过来的索引文档写进 Tantivy：此刻只是写进 writer，
     /// 对搜索不可见，commit 仍由 `update_index`（或关闭时的收尾）一次做完。
     pub(crate) fn index_documents(&self, docs: &[crate::index::IndexDocument]) -> Result<()> {
-        self.index()?.stage(docs)
+        if docs.is_empty() { return Ok(()); }
+        self.index()?.stage(docs)?;
+        Ok(())
     }
 
     pub fn close(&self) -> Result<()> {
-        // 先叫停向量化线程并等它收尾：它可能正在补一批向量，不能在库拆到一半时还在写。
-        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.stop(); }
         let mut guard = self.engine.writer.lock();
         let result = match guard.as_ref() {
             Some(writer) => self.index()?.sync(&writer.conn),
@@ -284,18 +280,15 @@ impl KnowledgeBase {
         Ok(loaded)
     }
 
-    /// 只在索引确实落后、且写者空闲时追平。
-    /// 稳态下待办队列是空的（写路径提交后已就地清空），这一次预检就让读完全不碰写锁。
-    /// 待办非空说明写入正在进行或上一次索引提交失败过：此时**只尝试、不等待**。
-    /// 抢不到写锁就说明写者正在提交索引，读路径绝不能为此排队——一次提交是二十毫秒量级，
-    /// 排队会把所有读都堵在门外。等待空闲时再补平，兼顾「上次提交失败后自愈」。
-    pub(crate) fn sync_index_if_behind(&self, conn: &Connection) -> Result<()> {
-        let pending: i64 = conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get(0))?;
-        if pending == 0 { return Ok(()); }
-        // 抢得到写锁就顺手追平；抢不到就走，不为任何写者排队。
-        // 向量补齐已拆到外挂库，不再占主库写锁，读者没有需要等的对象。
+    /// 索引可能落后时（写路径攒了增删、或删过记录）才尝试对齐。
+    /// 干净时这次预检让读完全不碰写锁；需要对齐时也**只尝试、不等待**——
+    /// 抢不到写锁说明写者正在提交，读路径绝不为它排队，等下一次读取再补平。
+    /// `conn` 只用于判定，不写任何东西；真正对齐走写连接。
+    pub(crate) fn sync_index_if_behind(&self, _conn: &Connection) -> Result<()> {
+        let index = self.index()?;
+        if !index.is_dirty() { return Ok(()); }
         if let Some(mut guard) = self.engine.writer.try_lock() {
-            if let Some(writer) = guard.as_mut() { self.index()?.sync(&writer.conn)?; }
+            if let Some(writer) = guard.as_mut() { index.sync(&writer.conn)?; }
         }
         Ok(())
     }
@@ -312,21 +305,20 @@ impl KnowledgeBase {
         tx.commit()?;
         let touched = log.take();
         drop(log);
-        // 索引不在写入路径上追平——写入只把待办记进 index_updates，
-        // 由使用方稍后调用 `update_index` 一趟索引完、只提交一次。
-        // 向量缓存按领域失效：动过的领域就地清掉，没动过的照旧留着。
-        if touched.is_empty() {
-            // 登记为空却确实改过行：有写路径没登记，或者记录已删、领域无从查起。
-            // 宁可整体失效，也不留下一个来源说不清的陈旧分区。
-            if writer.conn.total_changes() > changed_before { self.engine.vectors.invalidate(); }
-        } else {
-            self.engine.vectors.invalidate_namespaces(&touched);
+        // 索引不在写入路径上提交——写入只把文档/删除攒在 writer 里，
+        // 由使用方稍后调用 `update_index` 一趟对齐（提交 + 对账）。
+        let rows_changed = writer.conn.total_changes() > changed_before;
+        if rows_changed {
+            // 索引可能已落后主库（有记录增删）：标脏，等 `update_index` 或读取侧自愈时对账。
+            self.index()?.mark_dirty();
+            // 向量缓存按领域失效：动过的领域就地清掉，没动过的照旧留着。
+            if touched.is_empty() { self.engine.vectors.invalidate(); }
+            else { self.engine.vectors.invalidate_namespaces(&touched); }
+            // 记录一变，「应向量化集合」就变了：受影响领域的就绪标记就地作废，
+            // 等补齐核对过再重新标。这样检索侧读到的永远是「核对过的那一份」。
+            self.invalidate_readiness(&touched);
         }
-        // 记录一变，「应向量化集合」就变了：受影响领域的就绪标记就地作废，
-        // 等补齐核对过再重新标。这样检索侧读到的永远是「核对过的那一份」。
-        self.invalidate_readiness(&writer.conn);
-        // 也给库内线程说一声：切片更新了就有一批该补的，叫它起来干活。
-        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.notify_work(); }
+        drop(guard);
         Ok(WriteReceipt { value, revision })
     }
 
@@ -342,22 +334,14 @@ impl KnowledgeBase {
         Ok(WriteReceipt { value, revision })
     }
 
-    /// 作废待办记录所属领域的就绪标记。待办队列记着这次动了哪些记录，
-    /// 按记录所属领域取名字；已经删掉的记录查不到领域，不影响（删记录不会造出缺口）。
-    fn invalidate_readiness(&self, conn: &Connection) {
-        let Ok(mut stmt) = conn.prepare("SELECT DISTINCT s.text FROM index_updates u
-            JOIN records r ON r.id=u.record_id JOIN strings s ON s.id=r.namespace_id") else {
-            return;
-        };
-        let Ok(namespaces) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
-            return;
-        };
-        let namespaces: Vec<String> = namespaces.flatten().collect();
+    /// 作废这些领域（本次事务实际动过的）的向量就绪标记。
+    /// 领域集合由写路径就地登记，不再依赖任何待办表推算。
+    fn invalidate_readiness(&self, namespaces: &HashSet<String>) {
         if namespaces.is_empty() { return; }
         let mut guard = self.engine.vector_writer.lock();
         let Some(vector_writer) = guard.as_mut() else { return; };
         for namespace in namespaces {
-            let _ = crate::embeddings::clear_vector_ready(&vector_writer.conn, &namespace);
+            let _ = crate::embeddings::clear_vector_ready(&vector_writer.conn, namespace);
         }
     }
 
@@ -372,6 +356,8 @@ impl KnowledgeBase {
         let mut guard = self.engine.writer.lock();
         let value = f(guard.as_mut().ok_or(Error::Closed)?)?;
         self.engine.vectors.invalidate();
+        // 这条路径可能改了记录（例如导入进度回写），保守地把索引标脏，等下一次对账。
+        let _ = self.index().map(|index| index.mark_dirty());
         Ok(value)
     }
 
@@ -384,26 +370,19 @@ impl KnowledgeBase {
         }
     }
 
-    /// 追平待索引队列：把写入累积的待办一趟索引完、只提交一次。
+    /// 收敛索引：把写入攒下的增删提交一次，再对主库算差集对齐、只提交一次。
     /// 写入不再就地索引，使用方（尤其批量导入）在合适时机调用本方法即可；
     /// 期间读取走 `sync_index_if_behind` 自愈兜底。
     pub fn update_index(&self) -> Result<HealthReport> {
-        self.catch_up_index(true)?;
-        if let Some(vectorizer) = self.engine.vectorizer.get() { vectorizer.notify_work(); }
+        self.catch_up_index()?;
         self.health()
     }
 
-    /// 只追平索引、不做健康检查。向量化前必须走一次：
-    /// 切片正文只存在索引里，索引没追平就取不到正文，只能拿到空串。
-    /// 调用方主动 `sync` 时（blocking）追平是它语义的一部分，阻塞拿锁做完；
-    /// 后台线程（非 blocking）只在拿得到时顺手做，抢不到说明前台正在写，待办留给下一轮。
-    pub(crate) fn catch_up_index(&self, blocking: bool) -> Result<()> {
-        if blocking {
-            let mut guard = self.engine.writer.lock();
-            let Some(writer) = guard.as_mut() else { return Ok(()) };
-            return self.index()?.sync(&writer.conn);
-        }
-        let Some(mut guard) = self.engine.writer.try_lock() else { return Ok(()) };
+    /// 收敛索引：提交写入攒下的增删、再对主库算差集对齐，全程在写连接上一次做完。
+    /// 只由写入侧（`update_index`）触发——索引提交是写入路径的职责，
+    /// 读取侧的自愈走 `sync_index_if_behind`，向量化则完全不碰这里。
+    fn catch_up_index(&self) -> Result<()> {
+        let mut guard = self.engine.writer.lock();
         let Some(writer) = guard.as_mut() else { return Ok(()) };
         self.index()?.sync(&writer.conn)
     }
@@ -420,32 +399,6 @@ impl KnowledgeBase {
 
     /// 当前是否注册了事件接收回调。
     pub fn event_sink_registered(&self) -> bool { self.engine.events.is_registered() }
-
-    pub fn rebuild_indexes(&self) -> Result<HealthReport> {
-        let sink = self.engine.events.get();
-        let started = std::time::Instant::now();
-        {
-            let mut guard = self.engine.writer.lock();
-            let writer = guard.as_mut().ok_or(Error::Closed)?;
-            self.index()?.rebuild(&writer.conn)?;
-            self.engine.vectors.invalidate();
-        }
-        let ms = started.elapsed().as_millis() as u64;
-        let report = self.health()?;
-        if let Some(sink) = sink {
-            let mut event = crate::events::LogEvent::new("index_rebuild");
-            event.ms = ms;
-            event.documents = Some(report.index_document_count);
-            event.format = Some(crate::index::FORMAT.to_string());
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(&event)));
-        }
-        Ok(report)
-    }
-
-    /// 读一次全文索引重建的进度快照。纯原子读、不碰写锁，可在重建进行时从另一线程轮询。
-    pub fn rebuild_progress(&self) -> Result<RebuildProgressReport> {
-        Ok(self.index()?.rebuild_progress())
-    }
 
     pub fn health(&self) -> Result<HealthReport> {
         let state = self.read()?;
@@ -465,9 +418,9 @@ impl KnowledgeBase {
         Ok(HealthReport {
             schema_version: schema::SCHEMA_VERSION,
             revision: current_revision(conn)?,
-            indexed_revision: meta(conn, "indexed_revision")?, record_count,
+            indexed_revision: meta(conn, "indexed_revision")?,
             index_document_count: self.index()?.document_count(),
-            pending_index_updates: conn.query_row("SELECT COUNT(*) FROM index_updates", [], |r| r.get::<_, i64>(0))? as usize,
+            record_count,
             sqlite_integrity: conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?,
             foreign_key_errors, counts,
             embedder_spaces: self.engine.embedders.space_ids(),
@@ -505,7 +458,7 @@ impl KnowledgeBase {
         if version != schema::SCHEMA_VERSION { return Err(Error::SchemaVersion { found: version, supported: schema::SCHEMA_VERSION }); }
         std::fs::create_dir(directory.as_ref())?;
         source.backup(rusqlite::MAIN_DB, directory.as_ref().join("store.sqlite3"), None)?;
-        // 向量库备份在同目录、同名加 .vectors 后缀；有就恢复，没有就由补齐线程重建。
+        // 向量库备份在同目录、同名加 .vectors 后缀；有就恢复，没有就由使用方后续调 sync 重新生成。
         let vectors_snapshot = snapshot.with_file_name(format!("{}.vectors", snapshot.file_name().unwrap().to_string_lossy()));
         if vectors_snapshot.exists() {
             let vectors_source = Connection::open_with_flags(&vectors_snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -520,28 +473,11 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> Result<i64> {
     Ok(conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))?)
 }
 
-/// 读一个可能不存在的 meta 键；不存在返回 `None`。用于重建游标这类运行期临时状态。
-pub(crate) fn meta_opt(conn: &Connection, key: &str) -> Result<Option<i64>> {
-    Ok(conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
-}
-
-/// 写入（存在则更新）一个 meta 键。键值表结构固定，新增键不需要 schema 迁移。
-pub(crate) fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
-    conn.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
-    Ok(())
-}
-
-/// 删除一个运行时 meta 键，不存在时无副作用。
-pub(crate) fn clear_meta(conn: &Connection, key: &str) -> Result<()> {
-    conn.execute("DELETE FROM meta WHERE key=?1", [key])?;
-    Ok(())
-}
 pub(crate) fn current_revision(conn: &Connection) -> Result<i64> { meta(conn, "revision") }
-pub(crate) fn next_revision(conn: &Connection, record_id: i64) -> Result<i64> {
+pub(crate) fn next_revision(conn: &Connection, _record_id: i64) -> Result<i64> {
+    // 只推进全局修订号。索引与主库的一致性由「算差集」判定，不靠任何待办记录。
     conn.execute("UPDATE meta SET value=value+1 WHERE key='revision'", [])?;
-    let revision = current_revision(conn)?;
-    conn.execute("INSERT INTO index_updates(revision,record_id) VALUES (?1,?2)", params![revision, record_id])?;
-    Ok(revision)
+    current_revision(conn)
 }
 
 /// 登记一个开放标记并返回它的整数 id；字符串只在此表出现一次。
@@ -601,7 +537,7 @@ pub(crate) fn tags_prefix(kind: RecordKind, tags: &[String], exclude: &[String],
 }
 
 /// 笔记相对路径拆成「目录段」与「文件名（去扩展名）」。
-/// 目录段原样，只有最后一段去后缀（目录名里的点不是扩展名）。写入与重建共用同一套规则。
+/// 目录段原样，只有最后一段去后缀（目录名里的点不是扩展名）。写入与索引侧补文档共用同一套规则。
 pub(crate) fn split_note_path(relative: &str) -> (Vec<String>, String) {
     let segments: Vec<&str> = relative.split('/').filter(|segment| !segment.is_empty()).collect();
     let Some((last, dirs)) = segments.split_last() else { return (Vec::new(), String::new()); };

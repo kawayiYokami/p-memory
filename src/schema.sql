@@ -116,9 +116,6 @@ CREATE TABLE embedding_spaces (
 );
 -- 向量住进独立库 vectors.sqlite3，与 Tantivy 同级：派生索引、自包含路由、单向消费、零反写主库。
 -- 主库只留 embedding_spaces（空间定义），向量行本身在外挂库。
-CREATE TABLE index_updates (
-    revision INTEGER PRIMARY KEY, record_id INTEGER NOT NULL
-);
 CREATE TABLE import_runs (
     source_id TEXT PRIMARY KEY, source_fingerprint TEXT NOT NULL, report_json TEXT NOT NULL
 );

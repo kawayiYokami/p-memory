@@ -152,7 +152,7 @@ pub(crate) fn sync_file(conn: &Connection, input: &NoteFileInput) -> Result<(Not
         &json!({"chunk_chars":input.chunk_chars}), "")?;
     let mut documents = Vec::new();
     // 文件名在写入这一刻就从路径取好（`file_stem` 认平台分隔符），随笔记落库：
-    // 索引那一列直接读它，重建时也不必再拆一次路径。
+    // 索引那一列直接读它，索引侧补文档时也不必再拆一次路径。
     conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path,name) VALUES (?1,?2,?3,?4,?5)
         ON CONFLICT(record_id) DO UPDATE SET namespace_id=excluded.namespace_id,scope_id=excluded.scope_id,path=excluded.path,name=excluded.name",
         params![header.id, namespace_id, scope_id, source, title])?;
@@ -226,8 +226,8 @@ fn relative_note_path(root: &str, given: &str) -> Result<String> {
 pub struct NoteStore(pub(crate) KnowledgeBase);
 
 impl NoteStore {
-    /// 从索引取一批记录的正文。有取不到的记录说明索引还没追上这批写入，就提交一次再取；
-    /// 索引已追平时这条读路径一次都不碰写锁。
+    /// 从索引取一批记录的正文。有取不到的记录说明索引还没覆盖这批写入，就提交一次再取；
+    /// 索引已对齐时这条读路径一次都不碰写锁。
     fn bodies(&self, conn: &Connection, ids: &[i64]) -> Result<BTreeMap<i64, String>> {
         if ids.is_empty() { return Ok(BTreeMap::new()); }
         let mut bodies = self.0.index()?.bodies(ids)?;

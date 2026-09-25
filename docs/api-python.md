@@ -16,9 +16,7 @@ kb.search("关键词") # -> SearchResult
 kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_tokens_total=8192)
 kb.health()        # -> dict
-kb.update_index()  # 追平写入累积的索引待办（批量导入后调用一次）
-kb.rebuild_indexes()
-kb.rebuild_progress()  # -> {"active": bool, "processed": int, "total": int}，可轮询重建进度
+kb.update_index()  # 提交写入攒下的增删并对账收敛索引（批量导入后调用一次）
 kb.backup(target)
 kb.close()
 
@@ -71,7 +69,7 @@ kb.search_preset("rag", "朱樱和白露的同学是谁", embed_space="e5")
 ```python
 kb.embeddings.register_space({"id": "e5", "model": "e5-base", "dimension": 768})
 kb.embeddings.register_embedder("e5", my_embed_fn, max_batch=50)   # 注册即用样本校验
-kb.embeddings.sync("e5", batch=50)                                # 追平索引 → 补齐缺口 → 逐档核对并标记就绪
+kb.embeddings.sync("e5", batch=50)                                # 补缺口 → 逐档核对并标记就绪（切片正文要等 update_index 之后才补得上）
 kb.embeddings.vector_ready("demo", "e5", "memory")           # 记忆档补完了没有；未就绪的档不走向量
 kb.memories.upsert_by_judgment(judgment="……")                      # 写入不碰向量，向量留给批次结束的 sync
 kb.search("偏好", embed_space="e5")                                # 库嵌入查询词，宿主只给词

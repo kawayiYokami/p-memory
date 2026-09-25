@@ -26,7 +26,6 @@ impl KnowledgeBase {
     fn unregister_event_sink(&self) -> bool;
     fn event_sink_registered(&self) -> bool;
     fn health(&self) -> Result<HealthReport>;
-    fn rebuild_indexes(&self) -> Result<HealthReport>;
 
     fn backup(&self, target: impl AsRef<Path>) -> Result<()>;
     fn restore(snapshot: impl AsRef<Path>, directory: impl AsRef<Path>) -> Result<Self>;
@@ -43,7 +42,7 @@ impl KnowledgeBase {
 ### 并发语义
 
 - **一个数据目录在同一时刻只允许一个进程持有写锁**，同进程内可通过 `Clone` 共享句柄。
-- 所有写入走 `mutate`，事务失败即整体回滚；写入不就地索引，由 `update_index()` 一趟追平（见 [architecture](architecture.md)）。
+- 所有写入走 `mutate`，事务失败即整体回滚；写入不就地索引，由 `update_index()` 一趟提交并对账收敛（见 [architecture](architecture.md)）。
 - 写入提交后会清空向量缓存，保证后续检索看到最新向量。
 - **写是串行的，读是并发的**：所有写入共用一把写锁、按到达顺序排队；读取不经过写锁，
   每次从空闲池取一条只读连接（池空则新建），所以同一句柄上的多个读可以真正并行执行。
@@ -52,14 +51,12 @@ impl KnowledgeBase {
 ### 备份与恢复
 
 - `backup(target)`：SQLite 在线备份，主库与向量库分别备份为 `target` 与 `target.vectors`。目标文件已存在时拒绝覆盖（先 `create_new` 占位）。
-- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；同目录存在 `snapshot.vectors` 时一并还原向量库，否则向量路降级待补齐。全文索引从数据重建。目标目录已存在会失败。
+- `restore(snapshot, directory)`：只读打开快照，校验 `application_id` 与 `user_version` 后复制到**新目录**并打开；同目录存在 `snapshot.vectors` 时一并还原向量库，否则向量路降级待补齐。全文索引目录不随快照复制，打开后由对账从主库补齐。目标目录已存在会失败。
 
 ### 健康检查
 
-- `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、`pending_index_updates`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
-- `update_index()` 追平写入累积的待办、只提交一次，返回新的健康报告。写入路径不调用它；批量导入后调用一次即可，期间读取走自愈兜底。
-- `rebuild_indexes()` 强制重建全文索引并清空向量缓存，随后返回新的健康报告。重建按 record id 分页流式进行、逐批提交，内存不随语料规模增长；进程中途被杀后重开库会从持久游标续跑。
-- `rebuild_progress()` 返回一次重建进度快照 `RebuildProgressReport { active, processed, total }`，可在重建进行时从另一线程轮询。
+- `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
+- `update_index()` 把写入路径攒下的增删提交一次，再对主库算差集收敛索引，返回新的健康报告。写入路径不调用它；批量导入后调用一次即可，期间读取走自愈兜底。
 
 ### 注册模型回调
 
@@ -68,7 +65,7 @@ impl KnowledgeBase {
 
 ### 事件回调
 
-- `register_event_sink` 注册事件接收回调：进程内单例，库在关键执行点（一次检索、一次索引重建）产出一条 `LogEvent` 交给它。落盘、轮转、保留多久都由宿主负责，库不打开日志文件。
+- `register_event_sink` 注册事件接收回调：进程内单例，库在关键执行点（一次检索）产出一条 `LogEvent` 交给它。落盘、轮转、保留多久都由宿主负责，库不打开日志文件。
 - **回调必须非阻塞**：库在检索线程里同步调用它，做同步 IO 或网络上报会把检索拖住。回调 panic 被捕获，只丢这一条事件，检索照常返回。
 - 不注册就完全不产出事件，全程不构造、不格式化。
 - 事件形状与各阶段口径见 [search](search.md#事件流)。
@@ -244,7 +241,7 @@ impl NoteStore {
 - **相对路径拆成标签**：目录段原样、文件名去扩展名，与调用方给的标签合并去重，写到这一篇的每一条切片上（库里 `record_tags`，索引里标签文本与标签 id 各一列）。
 - **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。**笔记记录不进索引**，要文件列表按库里的标签翻笔记。
 - 正文替换在**同一事务**内重建切片，删除失效切片及其向量。
-- 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引还没提交就先提交一次）。写入时文件缺失直接报错；索引重建时文件缺失只让那批切片正文为空。
+- 切片 payload 只存 `note_id` 与行区间；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引还没提交就先提交一次）。写入时文件缺失直接报错；索引侧补切片文档时文件缺失只让那批切片正文为空。
 - `delete` 先删切片再删笔记。
 - `delete_by_filter`：删除过滤条件命中的全部笔记，返回删除条数（只计笔记本身，随笔记一起删掉的切片是级联产物、不单独计数）。空命中返回 0。每篇都先删切片再删笔记。
 - `chunk_text(content, target)` 是公开辅助函数，可脱离数据库单独调用。
@@ -271,10 +268,10 @@ impl EmbeddingStore {
 
 - 空间定义不可变；重复注册相同定义幂等。
 - `register_embedder_with` 把回调绑到一个空间，**注册即用样本真跑一遍校验**（维度、有限性、非零范数、条数），不符即拒绝绑定并报 `invalid_vector`。一个向量模型对应一个向量空间。
-- `sync(space_id, batch)` 是**批次结束后的补齐**，宿主不参与向量计算。它按固定顺序走完三件事：先追平索引（切片正文只存在索引里，不追平就取不到文本）→ 再按缺口分批补齐 → 最后逐档核对缺口，把缺口为 0 的档标成**就绪**。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
+- `sync(space_id, batch)` 是**批次结束后的补齐**，宿主不参与向量计算。它按固定顺序走完两件事：按缺口分批补齐 → 逐档核对缺口，把缺口为 0 的档标成**就绪**。它不提交索引、不碰主库写锁：切片正文要等写入侧 `update_index` 之后才读得到，未提交的这一轮计入缺口、该档停在未就绪。补齐循环严格三段式——取文本放锁 → 调回调不持锁 → 短事务写回；失败即中断，已写回的批次保留、未跑的批次不写。中断即未就绪。
 - `vector_ready(namespace, space_id, target)` 读的是「领域 × 向量空间 × 档位」的就绪标记（落盘在 `meta`），`target` 取 `memory` / `graph` / `notes`，三档各自独立记、各自放行：记忆补完了不表示图谱也补完了。未就绪的档在检索里被剔出向量路，其余已就绪的档照常走向量；三档全被剔才记 `vector_not_ready`。写入、删除记录、改总闸或改档位都会让标记当场作废，要重新走一次 `sync` 核对过才会再标。
-- 写入路径**不产生向量**：`upsert` 一条记忆或笔记只做两件事——入库与把文档写进索引 writer。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一留到批次结束调 `sync`。落库后没有人调用 `sync` 的情形由库内后台线程兜底。
-- 后台线程在开库时启动、关库时停下并等它收尾。它是**纯事件触发**，不轮询、不设定时：开库、注册或切换向量模型、改档位、写入提交后各叫它一次；一轮补齐跑完若还写出过向量，就接着再跑一轮收掉漏网的。线程没被叫时一直睡在条件变量上。
+- 写入路径**不产生向量**：`upsert` 一条记忆或笔记只做两件事——入库与把文档写进索引 writer。一行向量都不算、一次模型都不调，所以写入耗时与模型无关；向量统一由使用方在批次结束后显式调一次 `sync` 补齐。库里没有后台线程，没人调 `sync` 就一直是缺口、该档停在未就绪。
+- 补齐是**使用方主动叫一次**的同步动作，不做轮询、不设触发条件：调一次就把当前缺口按批补完，再逐档核对并标成就绪。
 - `namespace_vectorization` / `set_namespace_vectorization` 是某知识域的**总闸**；`vectorization(ns, target)` / `set_vectorization(ns, target, enabled)` 是域内的**档位开关**，`target` 取 `memory` / `graph` / `notes`，三者互不牵连。读数时没设置过的档位落到内置默认（记忆开、图谱开、笔记关），非法档位名报 `validation`。四者都落盘在 `meta` 表。
 - 开关只决定是否生成向量：已有向量保留，检索时按启用档位过滤；总闸关闭时该域既不生成向量、也不走向量路。
 

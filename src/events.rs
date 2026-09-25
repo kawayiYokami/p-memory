@@ -23,7 +23,7 @@ pub type EventSink = Arc<dyn Fn(&LogEvent) + Send + Sync>;
 pub struct LogEvent {
     /// 本地时间的 RFC3339 时间戳，毫秒精度。
     pub ts: String,
-    /// 事件类型：`search`、`index_rebuild`。
+    /// 事件类型：目前只有 `search`。
     pub kind: String,
     /// 本次执行的总耗时（毫秒）。
     pub ms: u64,
@@ -46,12 +46,6 @@ pub struct LogEvent {
     /// 最终返回的命中条数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hits: Option<usize>,
-    /// 重建写入索引的文档数。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub documents: Option<usize>,
-    /// 索引格式串。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
     /// 本次落在哪几档降级。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<Degrade>,
@@ -70,8 +64,6 @@ impl LogEvent {
             rerank_docs: None,
             rerank_tokens: None,
             hits: None,
-            documents: None,
-            format: None,
             degraded: Vec::new(),
         }
     }

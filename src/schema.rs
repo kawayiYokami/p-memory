@@ -1,7 +1,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+pub(crate) const SCHEMA_VERSION: i64 = 14;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// v3 -> v4：新增谓词元规则表并内置 `sys:same_as`。与 schema.sql 中同名段落保持一致。
@@ -162,7 +162,7 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             2 => { tx.execute_batch("ALTER TABLE embedding_spaces ADD COLUMN encoding TEXT NOT NULL DEFAULT 'f32'")?; }
             // v3 -> v4：谓词元规则表。
             3 => { tx.execute_batch(MIGRATION_3_TO_4)?; }
-            // v4 -> v5：可检索正文交给 Tantivy（索引侧重建即可），SQLite 删掉两条派生文本列，
+            // v4 -> v5：可检索正文交给 Tantivy（索引侧重新对账即可），SQLite 删掉两条派生文本列，
             // 切片 payload 里那副本正文一并摘除。
             4 => { tx.execute_batch(MIGRATION_4_TO_5)?; strip_chunk_payload_keys(&tx, &["content"])?; }
             // v5 -> v6：笔记 payload 不再留正文与派生字段（路径只在 notes 表，标题由路径派生），
@@ -186,6 +186,9 @@ fn migrate_steps(conn: &mut Connection, mut version: i64) -> Result<()> {
             // v12 -> v13：向量表整体搬到外挂库 vectors.sqlite3（自带路由字段与就绪标记），
             // 主库不再持有向量数据。搬迁由 KnowledgeBase::open 在打开时检测完成，这里只登记版本。
             12 => { /* 搬迁由打开流程做 */ }
+            // v13 -> v14：删掉索引待办账本。索引与主库之间改由「算差集」收敛，
+            // 不再记待办、也不再有任何「重建」路径。
+            13 => { tx.execute_batch("DROP TABLE IF EXISTS index_updates")?; }
             other => return Err(Error::SchemaVersion { found: other, supported: SCHEMA_VERSION }),
         }
         version += 1;
@@ -246,6 +249,10 @@ mod tests {
         // v12 之前向量表没有按 record_id 的索引；回退到旧版本时删掉，供 v11→v12 迁移验证。
         if version < 12 {
             conn.execute_batch("DROP INDEX embeddings_by_record;").unwrap();
+        }
+        // v14 之前还有索引待办账本；回退到旧版本时补回，供 v13→v14 迁移验证。
+        if version < 14 {
+            conn.execute_batch("CREATE TABLE index_updates (revision INTEGER PRIMARY KEY, record_id INTEGER NOT NULL);").unwrap();
         }
         conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -317,13 +324,25 @@ mod tests {
         assert!(!main_tables.contains(&"embeddings".to_string()), "主库不应再留 embeddings 表");
     }
 
+    /// v13 形态的库前滚到当前版本：索引待办账本被删掉，索引改由算差集收敛。
+    #[test]
+    fn rolls_v13_forward_dropping_the_index_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        legacy_db(dir.path(), 13, "");
+        let kb = crate::KnowledgeBase::open(dir.path()).unwrap();
+        assert_eq!(kb.health().unwrap().schema_version, SCHEMA_VERSION);
+        let conn = Connection::open(dir.path().join("store.sqlite3")).unwrap();
+        let has_ledger: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='index_updates'", [], |r| r.get(0)).unwrap();
+        assert_eq!(has_ledger, 0, "迁移后主库不应再有索引待办账本");
+    }
+
     /// v4 形态的笔记 + 切片（带 content 与两条派生列）前滚到当前版本：
     /// 两条派生列消失，切片 payload 不再留正文，也不留字符区间。
     #[test]
     fn rolls_v4_forward_dropping_derived_columns() {
         let dir = tempfile::tempdir().unwrap();
         legacy_db(dir.path(), 4, "");
-        // 迁移后会按权威数据全量重建索引，笔记正文从宿主文件取：造一个真实文件。
+        // 迁移后索引会按权威数据对账补齐，笔记正文从宿主文件取：造一个真实文件。
         let note_file = dir.path().join("a.md");
         std::fs::write(&note_file, "甲乙丙").unwrap();
         let source_path = note_file.to_string_lossy().replace('\\', "/");
