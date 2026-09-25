@@ -21,6 +21,8 @@ struct GraphId { id:i64, kind:RecordKind, #[serde(default)] filter:ReadFilter }
 pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
     match operation {
         "health"=>encode(kb.health()?),
+        "namespaces"=>encode(kb.namespaces()?),
+        "import_runs"=>encode(kb.import_runs()?),
         "update_index"=>encode(kb.update_index()?),
         "reconcile"=>encode(kb.reconcile_index()?),
         "backup"=>{kb.backup(field::<String>(&args,"path")?)?;Ok(Value::Null)},
@@ -44,6 +46,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "graph.delete_predicate_equivalents"=>{let namespace=field::<String>(&args,"namespace")?;let predicates=match args.get("predicates"){None|Some(Value::Null)=>None,Some(value)=>Some(decode::<Vec<String>>(value.clone())?)};encode(kb.graph().delete_predicate_equivalents(&namespace,predicates.as_deref())?)},
         "graph.predicate_equivalents"=>encode(kb.graph().predicate_equivalents(&field::<String>(&args,"namespace")?)?),
         "graph.set_predicate_rule"=>{let predicate=field::<String>(&args,"predicate")?;let inverse=args.get("inverse").cloned().map(decode::<String>).transpose()?;let symmetric=args.get("symmetric").cloned().map(decode::<bool>).transpose()?.unwrap_or(false);encode(kb.graph().set_predicate_rule(&predicate,inverse.as_deref(),symmetric)?)},
+        "graph.predicate_rules"=>encode(kb.graph().predicate_rules()?),
         "graph.delete_predicate_rule"=>encode(kb.graph().delete_predicate_rule(&field::<String>(&args,"predicate")?)?),
         "graph.expand_query"=>encode(kb.graph().expand_query(&field::<String>(&args,"namespace")?,&field::<String>(&args,"text")?)?),
         "graph.neighbors"=>encode(kb.graph().neighbors(field::<i64>(&args,"id")?,&optional::<ReadFilter>(&args,"filter")?,args.get("limit").cloned().map(decode).transpose()?.unwrap_or(50))?),

@@ -196,6 +196,18 @@ impl KnowledgeBase {
 
     pub fn directory(&self) -> &Path { &self.engine.root }
 
+    /// 库内出现过的知识领域与各自的记录统计（按类型分组），按领域名排序。
+    /// 纯读现有数据，不依赖任何登记。
+    pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
+        namespace_summaries(self.read()?.conn())
+    }
+
+    /// 已登记的全部导入记录（源标识、源指纹与那次导入的报告），按源标识排序。
+    /// 供幂等判断与巡检读取，不改变任何状态。
+    pub fn import_runs(&self) -> Result<Vec<ImportRun>> {
+        import_runs(self.read()?.conn())
+    }
+
     /// 取文本索引的共享句柄。只在这一瞬间持有索引锁，拿到 `Arc` 后即可并发使用。
     pub(crate) fn index(&self) -> Result<Arc<TextIndex>> {
         self.engine.index.read().clone().ok_or(Error::Closed)
@@ -537,6 +549,33 @@ pub(crate) fn record_namespaces(conn: &Connection) -> Result<Vec<String>> {
     let mut namespaces = Vec::new();
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? { namespaces.push(row?); }
     Ok(namespaces)
+}
+
+/// 库内出现过的知识领域与各自的记录统计（按类型分组）。只读现有数据，不依赖任何登记。
+pub(crate) fn namespace_summaries(conn: &Connection) -> Result<Vec<NamespaceInfo>> {
+    let mut grouped: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut stmt = conn.prepare("SELECT n.text, r.kind, COUNT(*) FROM records r JOIN strings n ON n.id=r.namespace_id \
+        GROUP BY n.text, r.kind ORDER BY n.text, r.kind")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+        let (namespace, code, count) = row?;
+        let name = RecordKind::from_code(code).map(|kind| kind.as_str().to_string()).unwrap_or_else(|| code.to_string());
+        grouped.entry(namespace).or_default().insert(name, count as usize);
+    }
+    Ok(grouped.into_iter().map(|(namespace, kinds)| NamespaceInfo {
+        records: kinds.values().sum(), namespace, kinds,
+    }).collect())
+}
+
+/// 已登记的全部导入记录，按源标识排序。用于幂等判断与巡检。
+pub(crate) fn import_runs(conn: &Connection) -> Result<Vec<ImportRun>> {
+    let mut stmt = conn.prepare("SELECT source_id,source_fingerprint,report_json FROM import_runs ORDER BY source_id")?;
+    let mut runs = Vec::new();
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (source_id, source_fingerprint, report_json) = row?;
+        let report = serde_json::from_str(&report_json).unwrap_or(Value::Null);
+        runs.push(ImportRun { source_id, source_fingerprint, report });
+    }
+    Ok(runs)
 }
 
 pub(crate) fn validate_identity(label: &str, value: &str) -> Result<()> {

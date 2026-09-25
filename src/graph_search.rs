@@ -200,6 +200,20 @@ impl GraphStore {
             Ok(removed > 0)
         })
     }
+
+    /// 已登记的全部谓词元规则，按谓词文本排序。内置的 `sys:same_as` 也在其中。纯读。
+    pub fn predicate_rules(&self) -> Result<Vec<crate::types::PredicateRule>> {
+        let state = self.0.read()?;
+        let conn = state.conn();
+        let mut stmt = conn.prepare("SELECT p.text, i.text, pr.is_symmetric FROM predicate_rules pr \
+            JOIN strings p ON p.id=pr.predicate_id LEFT JOIN strings i ON i.id=pr.inverse_predicate_id ORDER BY p.text")?;
+        let mut rules = Vec::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?)))? {
+            let (predicate, inverse, symmetric) = row?;
+            rules.push(crate::types::PredicateRule { predicate, inverse, symmetric: symmetric != 0 });
+        }
+        Ok(rules)
+    }
 }
 
 impl GraphView {

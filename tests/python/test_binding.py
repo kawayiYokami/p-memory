@@ -592,6 +592,23 @@ def test_note_with_many_chunks_deletes_in_one_batch(kb, tmp_path):
     assert removed == len(chunks) + 1, "笔记连同全部切片一次删净"
 
 
+def test_namespaces_and_predicate_rules_are_readable(kb):
+    """无害读取：领域清单、导入登记、谓词规则都能直接读，不需要任何登记。"""
+    kb.memories.upsert_by_judgment(judgment="本域的一条")
+    kb.memories.upsert_by_judgment(judgment="别域的一条", namespace="other")
+    kb.update_index()
+    namespaces = {item["namespace"]: item for item in kb.namespaces()}
+    assert namespaces["default"]["records"] == 1
+    assert namespaces["default"]["kinds"]["memory"] == 1
+    assert namespaces["other"]["records"] == 1
+    assert kb.import_runs() == []
+
+    kb.graph.set_predicate_rule("父亲", inverse="子女")
+    rules = {item["predicate"]: item for item in kb.graph.predicate_rules()}
+    assert rules["sys:same_as"]["symmetric"] is True
+    assert rules["父亲"]["inverse"] == "子女"
+
+
 def test_error_codes_map_to_exception_classes(open_kb, tmp_path):
     """锁定、未找到、参数非法、已关闭四类错误都映射到对应异常，并带稳定 code。"""
     kb = open_kb("locked")

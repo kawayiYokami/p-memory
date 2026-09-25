@@ -217,6 +217,30 @@ pub struct HealthReport {
     pub last_degraded: Vec<Degrade>,
 }
 
+/// 库内一个知识领域的记录统计：总数与按记录类型分组的条数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceInfo {
+    pub namespace: String,
+    pub records: usize,
+    pub kinds: std::collections::BTreeMap<String, usize>,
+}
+
+/// 一条谓词元规则。`symmetric` 为真时 `inverse` 必为 `None`（二者互斥）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateRule {
+    pub predicate: String,
+    pub inverse: Option<String>,
+    pub symmetric: bool,
+}
+
+/// 一次历史导入的登记：源标识、源指纹与那次导入的报告。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportRun {
+    pub source_id: String,
+    pub source_fingerprint: String,
+    pub report: Value,
+}
+
 /// 一次查询限定在哪一列命中。`All` 是既有行为：正文列与名字列任一命中都算，
 /// 名字命中另加固定加权；其余取值只认那一列，用于把「书名」「内容」「目录」分开取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

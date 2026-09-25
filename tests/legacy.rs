@@ -79,6 +79,14 @@ fn pai_import_memories_tags_and_repeat_guard() {
 
     let again = import_legacy(&req).unwrap();
     assert!(again.already_imported && !again.applied);
+
+    // 导入登记可读：一条源记录，指纹与本次一致，报告里带着计数。
+    let kb = p_memory::KnowledgeBase::open(&destination).unwrap();
+    let runs = kb.import_runs().unwrap();
+    assert_eq!(runs.len(), 1, "一次导入登记一条");
+    assert_eq!(runs[0].source_id, req.source_id);
+    assert_eq!(runs[0].report["counts"]["memory"], 3);
+    kb.close().unwrap();
 }
 
 #[test]

@@ -16,6 +16,8 @@ kb.search("关键词") # -> SearchResult
 kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_tokens_total=8192)
 kb.health()        # -> dict
+kb.namespaces()    # 库内出现过的全部知识领域与各自记录统计（总数 + 按类型分组），纯读
+kb.import_runs()   # 已登记的全部历史导入（源标识、源指纹、报告），纯读
 kb.update_index()  # 提交写入攒下的索引增删并清掉已落地的写标记（批量写入后调用一次）
 kb.reconcile_index()  # 显式对账：全文索引与主库求差集对齐（稳态下是空操作）
 kb.backup(target)
@@ -40,7 +42,7 @@ kb.notes.delete([note_id])             # 一批笔记，切片随笔记一起删
 主库查 id，命中才继续：非目标类型或不存在的 id 静默跳过，不算错误。删除的次序是写锁内主库标记先行 → 删向量行与主库行 → 出锁后摘索引词条；中途断电，主库上的「正在删除」标记让下次开机把没删完的做完。子记录（切片）先于笔记落库，RESTRICT 引用不会拦；若待删实体仍被关系引用，抛 `ConflictError`，标记留在主库，引用清掉之后的下次开机会把这条删除自动做完。
 
 各 Store 的方法与 Rust 侧同名同参，参数与返回值使用下列映射。图搜索暴露 `ego` / `path` / `strongly_connected` / `component_count`（`record_id` 为 `int`，不暴露 `GraphView` 对象）。
-谓词元规则与等价词在 Python 侧都可用：`kb.graph.set_predicate_rule(predicate, inverse=None, symmetric=False)` 登记对称/逆谓词、`kb.graph.delete_predicate_rule(predicate)` 撤销（内置 `sys:same_as` 同样可撤）；`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.delete_predicate_equivalents(namespace, predicates=None)` 撤销（不给词就清掉整域）、`kb.graph.expand_query(namespace, text)` 单独调用扩散。扩散也已在全文路与预设检索图谱路内部自动生效。
+谓词元规则与等价词在 Python 侧都可用：`kb.graph.set_predicate_rule(predicate, inverse=None, symmetric=False)` 登记对称/逆谓词、`kb.graph.predicate_rules()` 列出已登记的全部规则、`kb.graph.delete_predicate_rule(predicate)` 撤销（内置 `sys:same_as` 同样可撤）；`kb.graph.set_predicate_equivalents(namespace, groups)` 按领域登记等价组（持久化，上游提供，库不内置）、`kb.graph.predicate_equivalents(namespace)` 列出、`kb.graph.delete_predicate_equivalents(namespace, predicates=None)` 撤销（不给词就清掉整域）、`kb.graph.expand_query(namespace, text)` 单独调用扩散。扩散也已在全文路与预设检索图谱路内部自动生效。
 
 笔记多两个方法，用来登记领域根目录：
 

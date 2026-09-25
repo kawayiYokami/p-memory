@@ -316,6 +316,28 @@ fn sync_scoped_to_one_namespace_leaves_the_others_untouched() {
 }
 
 #[test]
+fn namespace_and_predicate_reads_reflect_stored_state() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    let mut other = memory("别域的一条", "public"); other.record.namespace = "other".into();
+    kb.memories().upsert(memory("本域的一条", "public")).unwrap();
+    kb.memories().upsert(other).unwrap();
+    kb.update_index().unwrap();
+    assert!(kb.import_runs().unwrap().is_empty(), "没有导入过就没有登记");
+    // 领域清单：按名排序，各自带总数与按类型分组的条数。
+    let namespaces = kb.namespaces().unwrap();
+    assert_eq!(namespaces.iter().map(|info| info.namespace.clone()).collect::<Vec<_>>(), vec!["default", "other"]);
+    let default = namespaces.iter().find(|info| info.namespace == "default").unwrap();
+    assert_eq!(default.records, 1);
+    assert_eq!(default.kinds.get("memory"), Some(&1));
+    // 谓词规则：内置的 sys:same_as 在列，新登记的这条带逆谓词。
+    kb.graph().set_predicate_rule("父亲", Some("子女"), false).unwrap();
+    let rules = kb.graph().predicate_rules().unwrap();
+    assert!(rules.iter().any(|rule| rule.predicate == "sys:same_as" && rule.symmetric), "内置对称规则可见");
+    assert!(rules.iter().any(|rule| rule.predicate == "父亲"
+        && rule.inverse.as_deref() == Some("子女") && !rule.symmetric), "新登记的逆谓词可见");
+}
+
+#[test]
 fn a_note_with_many_chunks_reads_and_deletes_in_one_batch() {
     let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
     kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();

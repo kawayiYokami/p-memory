@@ -168,6 +168,14 @@ class KnowledgeBase:
         （例如绕过 API 直改主库）由这里一次收敛；稳态下调用是空操作。"""
         return self.invoke("reconcile")
 
+    def namespaces(self) -> list[dict[str, Any]]:
+        """库内出现过的全部知识领域与各自的记录统计（总数 + 按类型分组），按领域名排序。纯读。"""
+        return self.invoke("namespaces")
+
+    def import_runs(self) -> list[dict[str, Any]]:
+        """已登记的全部历史导入（源标识、源指纹、那次导入的报告），按源标识排序。纯读。"""
+        return self.invoke("import_runs")
+
     def backup(self, path: str | os.PathLike) -> None:
         self.invoke("backup", {"path": os.fspath(path)})
 
@@ -300,6 +308,10 @@ class GraphStore(_Store):
     def delete_predicate_rule(self, predicate: str) -> WriteReceipt:
         """Remove a predicate rule. The built-in ``sys:same_as`` can be removed too."""
         return self._call("delete_predicate_rule", {"predicate": predicate})
+
+    def predicate_rules(self) -> list[dict[str, Any]]:
+        """已登记的全部谓词元规则（谓词、逆谓词、是否对称），按谓词文本排序。纯读。"""
+        return self._call("predicate_rules", {})
 
     def expand_query(self, namespace: str, text: str) -> list[str]:
         """Expand ``text`` with synonyms of any registered predicate it contains.
