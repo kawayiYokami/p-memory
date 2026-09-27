@@ -549,7 +549,7 @@ def test_health_exposes_core_counters(kb):
     kb.update_index()
     report = kb.health()
 
-    assert report["schema_version"] == 14
+    assert report["schema_version"] == 15
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
     assert kb.counts()["total"] == 1

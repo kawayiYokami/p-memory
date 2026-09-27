@@ -167,14 +167,13 @@ pub(crate) fn add_note(conn: &Connection, note: &PreparedNote) -> Result<(Note, 
         params![header.id, note.namespace_id, note.scope_id, note.source, note.title])?;
     let mut documents = Vec::new();
     for chunk in &note.split {
-        let content_digest = text::digest(&chunk.content);
         let payload = json!({"note_id":header.id,"ordinal":chunk.ordinal,"offset":chunk.offset,"limit":chunk.limit});
         let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(),
             tags: header.tags.clone(), evidence: vec![], metadata: header.metadata.clone(),
             created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
         let (chunk_header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content)?;
-        conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\",fingerprint) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![chunk_header.id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, content_digest])?;
+        conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\") VALUES (?1,?2,?3,?4,?5)",
+            params![chunk_header.id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64])?;
         documents.push(document);
     }
     Ok((Note { header, source: note.given.clone(), title: note.title.clone(), chunk_chars: note.chunk_chars }, documents))

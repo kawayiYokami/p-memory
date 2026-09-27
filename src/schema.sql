@@ -15,19 +15,19 @@ CREATE TABLE records (
     scope_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
     created_at_us INTEGER NOT NULL, updated_at_us INTEGER NOT NULL, revision INTEGER NOT NULL,
     metadata_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
-    fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
     status INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX records_kind ON records(kind, id);
 CREATE INDEX records_scope ON records(namespace_id, kind, scope_id, id);
 
 -- 标签关联只存整数 id；字符串只落在 strings。
+-- 主键即记录到标签的映射本身，WITHOUT ROWID 让同一对只需要一份 B-tree。
 CREATE TABLE record_tags (
     record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES strings(id) ON DELETE RESTRICT,
     PRIMARY KEY(record_id, tag_id)
-);
-CREATE INDEX record_tags_by_tag ON record_tags(tag_id, record_id);
+) WITHOUT ROWID;
 
 -- Domain payloads live once in records; relational projections enforce graph integrity.
 CREATE TABLE entities (
@@ -101,10 +101,8 @@ CREATE TABLE chunks (
     record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
     note_id INTEGER NOT NULL REFERENCES notes(record_id) ON DELETE RESTRICT,
     ordinal INTEGER NOT NULL, "offset" INTEGER NOT NULL, "limit" INTEGER NOT NULL,
-    fingerprint TEXT NOT NULL,
     UNIQUE(note_id, ordinal)
 );
-CREATE INDEX chunks_by_fingerprint ON chunks(note_id, fingerprint);
 
 -- 知识领域的笔记根目录。登记之后写进来的笔记路径减掉它、存相对路径，
 -- 相对路径按段拆出的标签挂到这篇的每一条切片上；没登记的领域维持原样。

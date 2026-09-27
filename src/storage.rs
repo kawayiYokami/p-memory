@@ -123,7 +123,7 @@ pub(crate) struct Engine {
 fn open_reader(root: &Path) -> Result<Connection> {
     let conn = Connection::open(root.join("store.sqlite3"))?;
     conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
-    // 向量库外挂：读路径也要看得见它（缺口核对、指纹比对都靠 ATTACH 读）。
+    // 向量库外挂：读路径也要看得见它（缺口核对通过 ATTACH 读取向量行）。
     conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
     Ok(conn)
 }
@@ -131,10 +131,45 @@ fn open_reader(root: &Path) -> Result<Connection> {
 /// 向量外挂库的连接：独立文件、独立 WAL；`foreign_keys` 关掉——它只存自己的路由快照，
 /// 不跟主库做任何外键级联。
 fn open_vector_writer(root: &Path) -> Result<Connection> {
-    let conn = Connection::open(root.join("vectors.sqlite3"))?;
+    let mut conn = Connection::open(root.join("vectors.sqlite3"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
+    migrate_vectors_v14(&mut conn)?;
     conn.execute_batch(include_str!("vectors_schema.sql"))?;
     Ok(conn)
+}
+
+/// 向量库没有独立版本号；旧版 embeddings 只有一列多余的 fingerprint。
+/// 这是派生库，迁移只保留向量与路由字段，不触碰主库。
+fn migrate_vectors_v14(conn: &mut Connection) -> Result<()> {
+    let has_embeddings: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings')",
+        [], |row| row.get(0))?;
+    if !has_embeddings { return Ok(()); }
+    let has_fingerprint: bool = conn.prepare("PRAGMA table_info(embeddings)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter().any(|name| name == "fingerprint");
+    if !has_fingerprint { return Ok(()); }
+    let tx = conn.transaction()?;
+    tx.execute_batch("CREATE TABLE embeddings_new (
+        space_id TEXT NOT NULL,
+        record_id INTEGER NOT NULL,
+        namespace TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        kind INTEGER NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        note_id INTEGER NOT NULL DEFAULT 0,
+        vector BLOB NOT NULL,
+        PRIMARY KEY(space_id, record_id)
+    );
+    INSERT INTO embeddings_new(space_id,record_id,namespace,scope,kind,tags_json,note_id,vector)
+        SELECT space_id,record_id,namespace,scope,kind,tags_json,note_id,vector FROM embeddings;
+    DROP TABLE embeddings;
+    ALTER TABLE embeddings_new RENAME TO embeddings;
+    CREATE INDEX embeddings_partition ON embeddings(space_id, namespace, scope);
+    CREATE INDEX embeddings_by_record ON embeddings(record_id);")?;
+    tx.commit()?;
+    Ok(())
 }
 fn open_vector_reader(root: &Path) -> Result<Connection> {
     let conn = Connection::open(root.join("vectors.sqlite3"))?;
@@ -169,7 +204,7 @@ impl KnowledgeBase {
         if !file_lock.try_lock_exclusive()? { return Err(Error::Locked(root.display().to_string())); }
         let mut write_conn = Connection::open(root.join("store.sqlite3"))?;
         schema::initialize(&mut write_conn)?;
-        // 向量外挂库：独立文件，建表后 ATTACH，写路径的删除与指纹核对都要看得见它。
+        // 向量外挂库：独立文件，建表后 ATTACH，写路径的删除要看得见它。
         let vector_writer = open_vector_writer(&root)?;
         // 向量库外挂：写路径的删除与指纹核对也要看得见它。
         write_conn.execute("ATTACH DATABASE ?1 AS vectors", [root.join("vectors.sqlite3").to_string_lossy().to_string()])?;
@@ -721,9 +756,8 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     let created = existing.as_ref().map(|v| v.0).unwrap_or(input.created_at_us.unwrap_or(now));
     let updated = input.updated_at_us.unwrap_or_else(|| now.max(existing.as_ref().map(|v| v.1).unwrap_or(created)));
     if updated < created { return Err(Error::Validation("updated_at_us precedes created_at_us".into())); }
-    // 指纹跟着「送进搜索的文本 + 标签」走：正文或标签一变，各空间的旧向量立即失效。
+    // 标签随正文一并写库；正文或标签一变，各空间的旧向量就作废。
     let tags = normalize_tags(&input.tags);
-    let fingerprint = record_fingerprint(text, &tags);
     let metadata_json = serde_json::to_string(&input.metadata)?;
     let evidence_json = serde_json::to_string(&input.evidence)?;
     let payload_json = serde_json::to_string(payload)?;
@@ -731,16 +765,16 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
         Some(id) => {
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET namespace_id=?2,kind=?3,scope_id=?4,updated_at_us=?5,revision=?6,metadata_json=?7,
-                evidence_json=?8,fingerprint=?9,payload_json=?10,status=1 WHERE id=?1",
+                evidence_json=?8,payload_json=?9,status=1 WHERE id=?1",
                 params![id, namespace_id, kind.code(), scope_id, updated, revision, metadata_json, evidence_json,
-                    fingerprint, payload_json])?;
-            // Updating text invalidates every space's embedding in the same transaction.
-            conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1 AND fingerprint<>?2", params![id, fingerprint])?;
+                    payload_json])?;
+            // 这条记录被改写，向量一律作废：向量只按 id 对账，id 在就该有向量，写后清掉由补齐重算。
+            conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1", params![id])?;
             (id, revision)
         }
         None => {
-            conn.execute("INSERT INTO records(namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,fingerprint,payload_json,status) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,?9,1)",
-                params![namespace_id, kind.code(), scope_id, created, updated, metadata_json, evidence_json, fingerprint, payload_json])?;
+            conn.execute("INSERT INTO records(namespace_id,kind,scope_id,created_at_us,updated_at_us,revision,metadata_json,evidence_json,payload_json,status) VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,1)",
+                params![namespace_id, kind.code(), scope_id, created, updated, metadata_json, evidence_json, payload_json])?;
             let id = conn.last_insert_rowid();
             let revision = next_revision(conn, id)?;
             conn.execute("UPDATE records SET revision=?2 WHERE id=?1", params![id, revision])?;
@@ -758,11 +792,6 @@ pub(crate) fn put_record(conn: &Connection, kind: RecordKind, input: &RecordInpu
     Ok((RecordHeader { id, namespace: input.namespace.clone(), kind, scope: input.scope.clone(),
         created_at_us: created, updated_at_us: updated, revision, tags,
         evidence: input.evidence.clone(), metadata: input.metadata.clone() }, document))
-}
-
-/// 记录指纹：正文 + 标签一起算。两者任一变，各空间的旧向量立即失效。
-pub(crate) fn record_fingerprint(text: &str, tags: &[String]) -> String {
-    text::digest(&format!("text-v1\n{text}\n{}", tags.join(" ")))
 }
 
 /// 换掉一条记录的标签，返回这次的 tag id（按标签文本排序，与 `normalize_tags` 同序）。
@@ -1203,6 +1232,25 @@ mod tests {
     }
 
     fn sample_ids() -> Vec<i64> { (1..=10).collect() }
+
+    #[test]
+    fn migrates_vector_rows_without_fingerprint() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE embeddings (
+            space_id TEXT NOT NULL, record_id INTEGER NOT NULL, namespace TEXT NOT NULL,
+            scope TEXT NOT NULL, kind INTEGER NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+            note_id INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL, vector BLOB NOT NULL,
+            PRIMARY KEY(space_id, record_id)
+        );
+        CREATE INDEX embeddings_partition ON embeddings(space_id, namespace, scope);
+        CREATE INDEX embeddings_by_record ON embeddings(record_id);
+        INSERT INTO embeddings VALUES ('v', 1, 'n', 's', 5, '[\"tag\"]', 0, 'old', X'0102');").unwrap();
+        migrate_vectors_v14(&mut conn).unwrap();
+        let columns: Vec<String> = conn.prepare("PRAGMA table_info(embeddings)").unwrap()
+            .query_map([], |row| row.get(1)).unwrap().map(|row| row.unwrap()).collect();
+        assert!(!columns.iter().any(|column| column == "fingerprint"));
+        assert_eq!(conn.query_row("SELECT record_id, vector FROM embeddings", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))).unwrap(), (1, vec![1, 2]));
+    }
 
     /// 手里已有 id 列表时，取回必须按主键点查。少了 `+`，优化器会去扫 records_scope 索引，
     /// 成本随库规模线性增长，而每一行都是额外的读放大。

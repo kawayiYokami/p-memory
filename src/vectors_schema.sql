@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
     kind INTEGER NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
     note_id INTEGER NOT NULL DEFAULT 0,
-    fingerprint TEXT NOT NULL,
     vector BLOB NOT NULL,
     PRIMARY KEY(space_id, record_id)
 );

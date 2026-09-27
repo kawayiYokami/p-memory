@@ -226,13 +226,10 @@ fn refresh_dependents(conn: &Connection, entities: &[Entity]) -> Result<Vec<crat
                     for (name, value) in extra { object.insert(name.clone(), value.clone()); }
                 }
             }
-            let tags: Vec<String> = value.get("tags").and_then(|v| v.as_array())
-                .map(|list| list.iter().filter_map(|v| v.as_str()).map(str::to_string).collect()).unwrap_or_default();
-            let fingerprint = storage::record_fingerprint(&body, &tags);
             let revision = storage::next_revision(conn, key.id)?;
             // 正文与向量都改了；标上「正在写入」，停电后按主库现状把这条的索引文档重折一遍。
-            conn.execute("UPDATE records SET payload_json=?2,fingerprint=?3,revision=?4,updated_at_us=MAX(updated_at_us,?5),status=1 WHERE id=?1",
-                params![key.id, serde_json::to_string(&payload)?, fingerprint, revision, storage::now_us()])?;
+            conn.execute("UPDATE records SET payload_json=?2,revision=?3,updated_at_us=MAX(updated_at_us,?4),status=1 WHERE id=?1",
+                params![key.id, serde_json::to_string(&payload)?, revision, storage::now_us()])?;
             conn.execute("DELETE FROM vectors.embeddings WHERE record_id=?1", [key.id])?;
             // 正文与向量都改了，这个领域的向量分区跟着变。
             storage::touch_record_namespace(conn, key.id)?;
