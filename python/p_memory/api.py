@@ -157,10 +157,15 @@ class KnowledgeBase:
         return self._native.event_sink_registered()
 
     def health(self) -> dict[str, Any]:
-        """库状态概览（轻量）：schema 版本、`revision` / `indexed_revision`、记录计数（按类型）、
-        索引文档数、已注册的向量空间与重排回调、最近降级档位。不含全库体检——体检是灾备级动作，
-        见 `integrity_check()` / `foreign_key_check()`。"""
+        """库状态概览（轻量）：schema 版本、`revision` / `indexed_revision`、索引文档数、
+        已注册的向量空间与重排回调、最近降级档位。不含记录计数（见 `counts()`），
+        也不含全库体检（见 `integrity_check()` / `foreign_key_check()`）。"""
         return self.invoke("health")
+
+    def counts(self) -> dict[str, Any]:
+        """记录计数快照：主库各类型记录的条数（`total` + `kinds`）。纯读，走覆盖索引，
+        大库也是亚秒级。数内容有多少用它，不要借 `health()`。"""
+        return self.invoke("counts")
 
     def integrity_check(self) -> str:
         """物理完整性体检（`PRAGMA quick_check`）：遍历全库页面校验 B-tree 结构。
@@ -541,6 +546,26 @@ class AsyncKnowledgeBase:
     async def health(self) -> dict:
         kb = await self._ensure_open()
         return await asyncio.to_thread(kb.health)
+
+    async def counts(self) -> dict:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.counts)
+
+    async def integrity_check(self) -> str:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.integrity_check)
+
+    async def foreign_key_check(self) -> int:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.foreign_key_check)
+
+    async def namespaces(self) -> list[dict[str, Any]]:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.namespaces)
+
+    async def import_runs(self) -> list[dict[str, Any]]:
+        kb = await self._ensure_open()
+        return await asyncio.to_thread(kb.import_runs)
 
     async def register_reranker(self, callback: Callable, **options: Any) -> None:
         kb = await self._ensure_open()

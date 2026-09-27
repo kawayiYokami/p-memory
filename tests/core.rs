@@ -130,7 +130,7 @@ fn transactions_scopes_pagination_and_persistence() {
     assert_eq!(kb.search(&req).unwrap().hits[0].key.id, a);
     let health = kb.health().unwrap();
     assert_eq!(kb.integrity_check().unwrap(), "ok"); assert_eq!(kb.foreign_key_check().unwrap(), 0);
-    assert_eq!(health.record_count, health.index_document_count);
+    assert_eq!(kb.counts().unwrap().total, health.index_document_count);
 }
 
 #[test]
@@ -1009,7 +1009,7 @@ fn concurrent_reads_are_isolated_and_agree_with_serial_results() {
     // 读线程全部结束后仍然可以正常写入。
     kb.memories().upsert(memory("收尾", "scope0")).unwrap();
     kb.update_index().unwrap();
-    assert_eq!(kb.health().unwrap().record_count, 9);
+    assert_eq!(kb.counts().unwrap().total, 9);
 }
 
 /// 在固定轮数下用 `threads` 个线程检索，返回耗时。
@@ -1115,7 +1115,7 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     assert!(kb.notes().get_chunk(tea.header.id, &ReadFilter::default()).is_err());
     assert_eq!(kb.memories().get(memory_id, &ReadFilter::default()).unwrap().header.evidence[0].quote, "上海喝茶");
     kb.notes().delete(&[new.header.id], &ReadFilter::default()).unwrap();
-    assert_eq!(kb.health().unwrap().record_count, 1);
+    assert_eq!(kb.counts().unwrap().total, 1);
     assert_eq!(kb.foreign_key_check().unwrap(), 0);
     let long = chunk_text(&"一".repeat(500), 220).unwrap();
     assert_eq!(long.len(), 3); assert!(long.iter().all(|c| c.offset == 1 && c.limit == 1));
@@ -1132,7 +1132,7 @@ fn explicit_lifecycle_has_no_hidden_deletion() {
     kb.update_index().unwrap();
     let result = kb.memories().decay(&ReadFilter::default(), &DecayPolicy::default(), Some(4*86_400_000_000)).unwrap().value;
     kb.update_index().unwrap();
-    assert_eq!(result.decayed,1); assert_eq!(result.retirement_candidates[0].id, weak_id); assert_eq!(kb.health().unwrap().record_count,2);
+    assert_eq!(result.decayed,1); assert_eq!(result.retirement_candidates[0].id, weak_id); assert_eq!(kb.counts().unwrap().total,2);
     let feedback = FeedbackRequest {recalled_ids:vec![weak_id],useful_ids:vec![weak_id],now_us:Some(5*86_400_000_000),..Default::default()};
     kb.memories().feedback(&feedback).unwrap(); assert_eq!(kb.memories().get(weak_id, &ReadFilter::default()).unwrap().state.strength,1);
     kb.update_index().unwrap();
@@ -1158,7 +1158,7 @@ fn backup_restore_and_derived_index_recovery() {
     reopened.reconcile_index().unwrap();
     assert_eq!(reopened.search(&SearchRequest {query:"recoverable".into(),..Default::default()}).unwrap().hits.len(),1);
     let restored=KnowledgeBase::restore(&backup,root.path().join("restored")).unwrap();
-    assert_eq!(restored.health().unwrap().record_count,2);
+    assert_eq!(restored.counts().unwrap().total,2);
     // 快照里带着 embeddings：恢复后重新注册同一回调，向量路立刻可用。
     space(&restored,"v",2);
     assert_eq!(restored.search(&vector_query("v", "带向量的记录", vec![RecordKind::Memory])).unwrap().hits[0].key.id, vector_id);
@@ -1485,7 +1485,7 @@ fn chunks_carry_their_own_text_and_only_the_first_one_carries_the_path_tags() {
     assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&bare_path)), Err(Error::Validation(_))),
         "没登记根目录就拒绝写入");
         kb.update_index().unwrap();
-    assert_eq!(kb.health().unwrap().record_count, 0, "被拒的笔记一条都不落库");
+    assert_eq!(kb.counts().unwrap().total, 0, "被拒的笔记一条都不落库");
     // 登记根目录后写入这一篇：文件名进名字列、目录段进目录列，都只挂第一片。
     kb.notes().set_root("default", &root).unwrap();
     let short_path = note_dir.join("雅.md");
@@ -1609,7 +1609,7 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     std::fs::write(&outside, "根目录之外的正文").unwrap();
     assert!(matches!(kb.notes().upsert_file(NoteFileInput::new(&outside)), Err(Error::Validation(_))));
     kb.update_index().unwrap();
-    assert_eq!(kb.health().unwrap().record_count, 0, "越界路径一条记录都不许落库");
+    assert_eq!(kb.counts().unwrap().total, 0, "越界路径一条记录都不许落库");
     // 正文里不出现路径词：它们只以拼在第一片前面的标签形态存在。
     let mut input = NoteFileInput::new(&note_path);
     input.record.tags = vec!["人物".into()];
@@ -1647,12 +1647,13 @@ fn domain_root_relative_paths_and_the_tag_set_ride_on_the_first_chunk() {
     assert_eq!(by_tag("库里没有的标签"), 0);
     // 笔记自己不占索引文档：文档数 = 记录数 − 笔记数。
     let before = kb.health().unwrap();
-    assert_eq!(before.index_document_count, before.record_count - 1);
+    let before_total = kb.counts().unwrap().total;
+    assert_eq!(before.index_document_count, before_total - 1);
     // 索引与主库对账之后同一批查询结果一致。
     let again = kb.search(&SearchRequest { query: "overview".into(), kinds: vec![RecordKind::Chunk], limit: 50, ..Default::default() }).unwrap().hits;
     assert_eq!(again.len(), hits.len(), "对账后命中条数一致");
     assert_eq!(again[0].key.id, hits[0].key.id, "对账后名次一致");
-    assert_eq!(kb.health().unwrap().index_document_count, before.record_count - 1);
+    assert_eq!(kb.health().unwrap().index_document_count, before_total - 1);
 }
 
 /// 同一篇笔记的多个命中片段折叠成一条：只留排名最高的一片，
@@ -2626,7 +2627,7 @@ fn upsert_with_an_unknown_id_is_rejected() {
     let mut input = MemoryInput::new("凭空插入的记忆");
     input.record.id = Some(999_999);
     assert!(matches!(kb.memories().upsert(input), Err(Error::NotFound(_))), "id 不存在必须报 NotFound");
-    assert_eq!(kb.health().unwrap().record_count, 0, "不许凭一个 id 凭空建出记录");
+    assert_eq!(kb.counts().unwrap().total, 0, "不许凭一个 id 凭空建出记录");
 }
 
 /// 稳态不做任何全库对账：绕过 API 直改主库造成的索引孤儿，开库与读取都不清理，

@@ -16,6 +16,7 @@ kb.search("关键词") # -> SearchResult
 kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_tokens_total=8192)
 kb.health()        # 轻量状态概览 -> dict
+kb.counts()        # 记录计数快照：{"total": N, "kinds": {"memory": .., "chunk": ..}}，纯读
 kb.integrity_check()   # 物理完整性体检（PRAGMA quick_check）：返回 "ok" 或异常描述
 kb.foreign_key_check() # 外键体检（PRAGMA foreign_key_check）：返回违规条数
 kb.namespaces()    # 库内出现过的全部知识领域与各自记录统计（总数 + 按类型分组），纯读

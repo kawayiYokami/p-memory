@@ -457,24 +457,31 @@ impl KnowledgeBase {
     pub fn health(&self) -> Result<HealthReport> {
         let state = self.read()?;
         let conn = state.conn();
-        let mut counts = BTreeMap::new();
-        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM records GROUP BY kind")?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-            let (code, count) = row?;
-            let name = RecordKind::from_code(code).map(|k| k.as_str().to_string()).unwrap_or_else(|| code.to_string());
-            counts.insert(name, count as usize);
-        }
-        let record_count = counts.values().sum();
         Ok(HealthReport {
             schema_version: schema::SCHEMA_VERSION,
             revision: current_revision(conn)?,
             indexed_revision: meta(conn, "indexed_revision")?,
             index_document_count: self.index()?.document_count(),
-            record_count, counts,
             embedder_spaces: self.engine.embedders.space_ids(),
             reranker_registered: self.engine.rerankers.is_registered(),
             last_degraded: self.engine.degraded.lock().clone(),
         })
+    }
+
+    /// 记录计数快照：主库各类型记录的条数。纯读，走 `records_kind` 覆盖索引，
+    /// 大库也是亚秒级；与 `health()` 分开——健康是「库好不好」，计数是「有什么内容」。
+    pub fn counts(&self) -> Result<RecordCounts> {
+        let state = self.read()?;
+        let conn = state.conn();
+        let mut kinds = BTreeMap::new();
+        let mut stmt = conn.prepare("SELECT kind, COUNT(*) FROM records GROUP BY kind")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (code, count) = row?;
+            let name = RecordKind::from_code(code).map(|k| k.as_str().to_string()).unwrap_or_else(|| code.to_string());
+            kinds.insert(name, count as usize);
+        }
+        let total = kinds.values().sum();
+        Ok(RecordCounts { total, kinds })
     }
 
     /// 物理完整性体检：`PRAGMA quick_check`，遍历全库页面校验 B-tree 结构。

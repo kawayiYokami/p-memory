@@ -74,7 +74,7 @@ def test_upsert_by_judgment_deduplicates_within_scope(kb):
     kb.update_index()
 
     assert first["value"]["id"] == second["value"]["id"]
-    assert kb.health()["record_count"] == 1
+    assert kb.counts()["total"] == 1
 
 
 def test_scope_filter_hides_records_written_to_other_scopes(open_kb):
@@ -512,7 +512,7 @@ def test_lifecycle_reports_candidates_without_deleting(kb):
     kb.update_index()
     pinned = kb.memories.upsert_by_judgment(judgment="固定保留的记忆", state={"pinned": True})["value"]["id"]
     kb.update_index()
-    before = kb.health()["record_count"]
+    before = kb.counts()["total"]
 
     far_future = 1_900_000_000_000_000  # 微秒
     report = kb.memories.decay(now_us=far_future)["value"]
@@ -520,7 +520,7 @@ def test_lifecycle_reports_candidates_without_deleting(kb):
     candidates = [c["id"] for c in report["retirement_candidates"]]
     assert ordinary in candidates
     assert pinned not in candidates
-    assert kb.health()["record_count"] == before, "衰减不得删除记录"
+    assert kb.counts()["total"] == before, "衰减不得删除记录"
     assert kb.memories.get(pinned)["state"]["strength"] == 1
     assert kb.memories.get(ordinary)["state"]["strength"] == 0
 
@@ -552,8 +552,8 @@ def test_health_exposes_core_counters(kb):
     assert report["schema_version"] == 14
     assert report["revision"] >= 1
     assert report["indexed_revision"] == report["revision"]
-    assert report["record_count"] == 1
-    assert report["counts"]["memory"] == 1
+    assert kb.counts()["total"] == 1
+    assert kb.counts()["kinds"]["memory"] == 1
     assert kb.integrity_check() == "ok"
     assert kb.foreign_key_check() == 0
 
@@ -572,7 +572,7 @@ def test_backup_and_restore_roundtrip(kb, tmp_path):
         # 快照只备份 SQLite：派生索引由显式对账从权威重建出来。
         restored.reconcile_index()
         assert [h["record"]["judgment"] for h in restored.search("备份")["hits"]] == ["备份里的记忆"]
-        assert restored.health()["record_count"] == 1
+        assert restored.counts()["total"] == 1
     finally:
         restored.close()
 
@@ -671,7 +671,7 @@ def test_async_facade_mirrors_the_sync_store(tmp_path):
             await kb.memories.upsert_by_judgment(judgment="异步写入的记忆")
             await kb.update_index()
             hits = await kb.search("异步")
-            assert (await kb.health())["record_count"] == 1
+            assert (await kb.counts())["total"] == 1
             return [h["record"]["judgment"] for h in hits["hits"]]
 
     assert asyncio.run(scenario()) == ["异步写入的记忆"]

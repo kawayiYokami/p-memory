@@ -205,14 +205,19 @@ pub struct HealthReport {
     pub schema_version: i64,
     pub revision: i64,
     pub indexed_revision: i64,
-    pub record_count: usize,
     pub index_document_count: usize,
-    pub counts: std::collections::BTreeMap<String, usize>,
     /// 已注册嵌入回调的向量空间。
     pub embedder_spaces: Vec<String>,
     pub reranker_registered: bool,
     /// 最近观察到的降级档位，去重后保留少量。
     pub last_degraded: Vec<Degrade>,
+}
+
+/// 主库记录计数快照：总数与按记录类型分组的条数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordCounts {
+    pub total: usize,
+    pub kinds: std::collections::BTreeMap<String, usize>,
 }
 
 /// 库内一个知识领域的记录统计：总数与按记录类型分组的条数。

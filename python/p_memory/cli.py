@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--embedding-model", help="Optional OpenAI-compatible embedding model")
     chat.add_argument("--embedding-dimension", type=int)
     chat.add_argument("--embedding-space", default="simple-agent-v1")
-    for name in ("health", "integrity-check", "foreign-key-check"):
+    for name in ("health", "counts", "integrity-check", "foreign-key-check"):
         p = commands.add_parser(name)
         p.add_argument("--data", required=True)
     migrate = commands.add_parser("import", help="Preview or apply a legacy snapshot to a new directory")
@@ -60,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "health":
             with KnowledgeBase(args.data) as kb:
                 _print(kb.health())
+            return 0
+        if args.command == "counts":
+            with KnowledgeBase(args.data) as kb:
+                _print(kb.counts())
             return 0
         if args.command == "integrity-check":
             with KnowledgeBase(args.data) as kb:

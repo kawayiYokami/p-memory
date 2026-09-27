@@ -21,6 +21,7 @@ struct GraphId { id:i64, kind:RecordKind, #[serde(default)] filter:ReadFilter }
 pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
     match operation {
         "health"=>encode(kb.health()?),
+        "counts"=>encode(kb.counts()?),
         "integrity_check"=>encode(kb.integrity_check()?),
         "foreign_key_check"=>encode(kb.foreign_key_check()?),
         "namespaces"=>encode(kb.namespaces()?),
