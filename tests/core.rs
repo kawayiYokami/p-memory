@@ -129,7 +129,7 @@ fn transactions_scopes_pagination_and_persistence() {
     let kb = KnowledgeBase::open(dir.path()).unwrap();
     assert_eq!(kb.search(&req).unwrap().hits[0].key.id, a);
     let health = kb.health().unwrap();
-    assert_eq!(health.sqlite_integrity, "ok"); assert_eq!(health.foreign_key_errors, 0);
+    assert_eq!(kb.integrity_check().unwrap(), "ok"); assert_eq!(kb.foreign_key_check().unwrap(), 0);
     assert_eq!(health.record_count, health.index_document_count);
 }
 
@@ -1116,7 +1116,7 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     assert_eq!(kb.memories().get(memory_id, &ReadFilter::default()).unwrap().header.evidence[0].quote, "上海喝茶");
     kb.notes().delete(&[new.header.id], &ReadFilter::default()).unwrap();
     assert_eq!(kb.health().unwrap().record_count, 1);
-    assert_eq!(kb.health().unwrap().foreign_key_errors, 0);
+    assert_eq!(kb.foreign_key_check().unwrap(), 0);
     let long = chunk_text(&"一".repeat(500), 220).unwrap();
     assert_eq!(long.len(), 3); assert!(long.iter().all(|c| c.offset == 1 && c.limit == 1));
 }
@@ -1163,7 +1163,7 @@ fn backup_restore_and_derived_index_recovery() {
     space(&restored,"v",2);
     assert_eq!(restored.search(&vector_query("v", "带向量的记录", vec![RecordKind::Memory])).unwrap().hits[0].key.id, vector_id);
     assert!(KnowledgeBase::restore(&backup,&data).is_err());
-    assert_eq!(json!(restored.health().unwrap())["sqlite_integrity"],"ok");
+    assert_eq!(restored.integrity_check().unwrap(), "ok");
 }
 
 #[test]

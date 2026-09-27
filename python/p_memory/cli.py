@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--embedding-model", help="Optional OpenAI-compatible embedding model")
     chat.add_argument("--embedding-dimension", type=int)
     chat.add_argument("--embedding-space", default="simple-agent-v1")
-    for name in ("health",):
+    for name in ("health", "integrity-check", "foreign-key-check"):
         p = commands.add_parser(name)
         p.add_argument("--data", required=True)
     migrate = commands.add_parser("import", help="Preview or apply a legacy snapshot to a new directory")
@@ -60,6 +60,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "health":
             with KnowledgeBase(args.data) as kb:
                 _print(kb.health())
+            return 0
+        if args.command == "integrity-check":
+            with KnowledgeBase(args.data) as kb:
+                _print(kb.integrity_check())
+            return 0
+        if args.command == "foreign-key-check":
+            with KnowledgeBase(args.data) as kb:
+                _print(kb.foreign_key_check())
             return 0
         if not args.model:
             parser.error("chat requires --model or P_MEMORY_MODEL / OPENAI_MODEL")

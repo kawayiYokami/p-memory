@@ -207,8 +207,6 @@ pub struct HealthReport {
     pub indexed_revision: i64,
     pub record_count: usize,
     pub index_document_count: usize,
-    pub sqlite_integrity: String,
-    pub foreign_key_errors: usize,
     pub counts: std::collections::BTreeMap<String, usize>,
     /// 已注册嵌入回调的向量空间。
     pub embedder_spaces: Vec<String>,

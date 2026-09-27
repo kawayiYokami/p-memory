@@ -157,7 +157,22 @@ class KnowledgeBase:
         return self._native.event_sink_registered()
 
     def health(self) -> dict[str, Any]:
+        """库状态概览（轻量）：schema 版本、`revision` / `indexed_revision`、记录计数（按类型）、
+        索引文档数、已注册的向量空间与重排回调、最近降级档位。不含全库体检——体检是灾备级动作，
+        见 `integrity_check()` / `foreign_key_check()`。"""
         return self.invoke("health")
+
+    def integrity_check(self) -> str:
+        """物理完整性体检（`PRAGMA quick_check`）：遍历全库页面校验 B-tree 结构。
+        与 `health()` 分开——大库上是分钟级（8.6 GB / 1400 万行约 163 秒），只在备份前后或定期
+        巡检时显式调用，不要放进请求路径。返回 `"ok"` 表示无异常。"""
+        return self.invoke("integrity_check")
+
+    def foreign_key_check(self) -> int:
+        """外键体检（`PRAGMA foreign_key_check`）：返回违规条数。写路径已由 SQLite 当场强制外键，
+        稳态下为 0；它抓的是「绕过 API 直改主库」这类外部破坏。大库上要全表扫外键（约 69 秒），
+        同样不要放进请求路径。"""
+        return self.invoke("foreign_key_check")
 
     def update_index(self) -> dict[str, Any]:
         """提交写入攒下的索引增删（批量写入后调用一次即可）。"""

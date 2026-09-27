@@ -15,7 +15,9 @@ kb.embeddings      # EmbeddingStore
 kb.search("关键词") # -> SearchResult
 kb.search_preset("rag", "关键词", embed_space="e5")   # 预设检索：memory / graph / notes / rag / broad
 kb.register_reranker(callback, max_tokens_total=8192)
-kb.health()        # -> dict
+kb.health()        # 轻量状态概览 -> dict
+kb.integrity_check()   # 物理完整性体检（PRAGMA quick_check）：返回 "ok" 或异常描述
+kb.foreign_key_check() # 外键体检（PRAGMA foreign_key_check）：返回违规条数
 kb.namespaces()    # 库内出现过的全部知识领域与各自记录统计（总数 + 按类型分组），纯读
 kb.import_runs()   # 已登记的全部历史导入（源标识、源指纹、报告），纯读
 kb.update_index()  # 提交写入攒下的索引增删并清掉已落地的写标记（批量写入后调用一次）

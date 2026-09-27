@@ -465,22 +465,36 @@ impl KnowledgeBase {
             counts.insert(name, count as usize);
         }
         let record_count = counts.values().sum();
-        let mut foreign = conn.prepare("PRAGMA foreign_key_check")?;
-        let mut foreign_key_errors = 0;
-        let mut rows = foreign.query([])?;
-        while rows.next()?.is_some() { foreign_key_errors += 1; }
         Ok(HealthReport {
             schema_version: schema::SCHEMA_VERSION,
             revision: current_revision(conn)?,
             indexed_revision: meta(conn, "indexed_revision")?,
             index_document_count: self.index()?.document_count(),
-            record_count,
-            sqlite_integrity: conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?,
-            foreign_key_errors, counts,
+            record_count, counts,
             embedder_spaces: self.engine.embedders.space_ids(),
             reranker_registered: self.engine.rerankers.is_registered(),
             last_degraded: self.engine.degraded.lock().clone(),
         })
+    }
+
+    /// 物理完整性体检：`PRAGMA quick_check`，遍历全库页面校验 B-tree 结构。
+    /// 与 `health()` 分开——这是灾备级动作，大库上耗时以分钟计（8.6 GB / 1400 万行约 163 秒），
+    /// 只应在备份前后或定期巡检时显式调用，不搭在日常读路径上。返回 `"ok"` 表示无异常。
+    pub fn integrity_check(&self) -> Result<String> {
+        let state = self.read()?;
+        Ok(state.conn().query_row("PRAGMA quick_check", [], |r| r.get(0))?)
+    }
+
+    /// 外键体检：`PRAGMA foreign_key_check`，返回违规条数。写路径已由 SQLite 当场强制外键，
+    /// 正常运行下恒为 0；它能抓的是「绕过 API 直改主库」这类外部破坏。与 `health()` 分开的
+    /// 理由同 `integrity_check`：大库上要全表扫外键（约 69 秒），不搭在日常读路径上。
+    pub fn foreign_key_check(&self) -> Result<usize> {
+        let state = self.read()?;
+        let mut stmt = state.conn().prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        let mut errors = 0usize;
+        while rows.next()?.is_some() { errors += 1; }
+        Ok(errors)
     }
 
     /// Consistent SQLite snapshot, including embeddings. Refuses to overwrite a file.

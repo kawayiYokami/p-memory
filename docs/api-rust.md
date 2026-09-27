@@ -57,7 +57,7 @@ impl KnowledgeBase {
 
 ### 健康检查
 
-- `health()` 返回 `HealthReport`：schema 版本、`revision` 与 `indexed_revision`、索引文档数、`PRAGMA quick_check`、外键错误数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。
+- `health()` 返回 `HealthReport`（轻量状态概览）：schema 版本、`revision` 与 `indexed_revision`、索引文档数、各类型记录计数，以及 `embedder_spaces` / `reranker_registered` / `last_degraded`。**不含全库体检**——体检拆成两个独立方法，各自只做一件事：`integrity_check()`（`PRAGMA quick_check`，校验 B-tree 物理结构，返回 `"ok"`）、`foreign_key_check()`（`PRAGMA foreign_key_check`，返回外键违规条数）。两者在大库上耗时以分钟计（8.6 GB / 1400 万行分别约 163 / 69 秒），是灾备级动作，只应在备份前后或定期巡检时显式调用，不搭在日常读路径上。
 - `namespaces()` 返回库内出现过的全部知识领域与各自的记录统计（总数 + 按类型分组），按领域名排序。纯读现有数据，不依赖任何登记。
 - `import_runs()` 返回已登记的全部历史导入（源标识、源指纹、那次导入的报告），按源标识排序，供幂等判断与巡检读取。
 - `update_index()` 把写入路径攒下的增删提交一次，并清掉「正在写入」标记（删除标记保留，它代表删除没做完），返回新的健康报告。索引提交是写入路径的职责，读取永不代劳。索引与主库的差集对齐只发生在下游显式调用 `reconcile_index()` 时（停电标记恢复覆盖不了的残余，例如绕过 API 直改主库）；稳态下对账是空操作。

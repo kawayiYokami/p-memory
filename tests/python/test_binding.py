@@ -554,8 +554,8 @@ def test_health_exposes_core_counters(kb):
     assert report["indexed_revision"] == report["revision"]
     assert report["record_count"] == 1
     assert report["counts"]["memory"] == 1
-    assert report["sqlite_integrity"] == "ok"
-    assert report["foreign_key_errors"] == 0
+    assert kb.integrity_check() == "ok"
+    assert kb.foreign_key_check() == 0
 
 
 def test_backup_and_restore_roundtrip(kb, tmp_path):
