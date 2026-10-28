@@ -370,7 +370,7 @@ fn a_note_with_many_chunks_reads_and_deletes_in_one_batch() {
     // 每段独立成块，切出来的片数远超内部切批粒度（SQL_BATCH）：整批操作必须内部分片。
     let body = (0..1100).map(|i| format!("段落{i} {}", "甲".repeat(240))).collect::<Vec<_>>().join("\n");
     std::fs::write(&path, body).unwrap();
-    let note = kb.notes().upsert_file(NoteFileInput::new(&path)).unwrap().value;
+    let note = kb.notes().upsert_file(NoteFileInput { chunk_chars: 220, ..NoteFileInput::new(&path) }).unwrap().value;
     kb.update_index().unwrap();
     let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
     assert!(chunks.len() > 999, "切片数应超过内部切批粒度，实际 {}", chunks.len());
@@ -2763,22 +2763,27 @@ fn a_record_can_change_scope() {
 }
 
 #[test]
-fn chunk_overlap_shares_the_boundary_and_zero_keeps_the_old_cut() {
-    // 一条没有空行的长行：整块按窗口滑，重叠部分由相邻窗口共享。
+fn chunk_overlap_shares_the_boundary_and_falls_back_to_five_chars() {
+    // 没有标点也没有换行：整块只能硬切，切不开的地方靠兜底重叠接上。
     let body = "甲乙丙丁戊己庚辛壬癸".repeat(30);
     let plain = chunk_text(&body, 100, 0).unwrap();
+    assert_eq!(plain[0].content, &body[..100 * 3], "每片仍是目标长度");
+    assert!(plain.len() > 3, "硬切时留了 5 字重叠，片数比纯窗口多");
+    for pair in plain.windows(2) {
+        let tail: String = pair[0].content.chars().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+        let head: String = pair[1].content.chars().take(5).collect();
+        assert_eq!(tail, head, "没有标点时，相邻两片共享 5 个字");
+    }
+
+    // 调用方要了更大重叠就按它来。
     let shared = chunk_text(&body, 100, 30).unwrap();
-    assert_eq!(plain[0].content, &body[..100 * 3], "不传重叠时与旧行为一致：每片 100 字");
-    assert_eq!(plain.len(), 3);
-    assert!(shared.len() > plain.len(), "步长从 100 缩到 70，片数变多");
-    assert_eq!(shared[0].content, &body[..100 * 3]);
+    assert_eq!(shared[0].content, &body[..100 * 3], "首片仍是目标长度");
     for pair in shared.windows(2) {
         let tail: String = pair[0].content.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
         let head: String = pair[1].content.chars().take(30).collect();
         assert_eq!(tail, head, "前一片结尾 30 字就是后一片开头 30 字");
         assert_eq!(pair[0].offset, 1, "共用同一行号仍按字符推进");
     }
-    // 尾巴那一片凑不满窗口也要收下，不能把剩下的字丢掉。
     let tail: String = shared.last().unwrap().content.clone();
     assert!(body.ends_with(&tail), "最后一片是原文的结尾");
 }
@@ -2846,5 +2851,35 @@ fn oversize_blocks_break_after_punctuation_or_newline() {
     assert!(chunks.len() > 1);
     for chunk in &chunks[..chunks.len() - 1] {
         assert!(chunk.content.ends_with('\n'), "换行处比标点更该优先，实际结尾 {:?}", chunk.content.chars().last());
+    }
+}
+
+#[test]
+fn hard_cuts_keep_five_chinese_chars_or_five_latin_letters() {
+    // 中文：硬切处留 5 个字，下一片从这 5 个字接上。
+    let zh = "臣亮言先帝创业未半而中道崩殂今天下三分益州疲弊此诚危急存亡之秋也".repeat(4);
+    let chunks = chunk_text(&zh, 60, 0).unwrap();
+    for pair in chunks.windows(2) {
+        let tail: String = pair[0].content.chars().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+        let head: String = pair[1].content.chars().take(5).collect();
+        assert_eq!(tail, head, "中文硬切处共享 5 个字");
+    }
+
+    // 英文长词（超过 10 个字母）：不整词回溯，只留 5 个字母。
+    let en = "abcdefghijk".repeat(40);
+    let chunks = chunk_text(&en, 50, 0).unwrap();
+    for pair in chunks.windows(2) {
+        let tail: String = pair[0].content.chars().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+        let head: String = pair[1].content.chars().take(5).collect();
+        assert_eq!(tail, head, "超长英文词只共享 5 个字母");
+    }
+
+    // 英文有空格时，空格本身就是断点，不触发兜底重叠。
+    let spaced = "alpha bravo charlie delta echo foxtrot golf hotel india juliett".repeat(6);
+    let chunks = chunk_text(&spaced, 60, 0).unwrap();
+    for pair in chunks.windows(2) {
+        let head = pair[1].content.chars().next().unwrap();
+        assert!(head != pair[0].content.chars().last().unwrap() || !head.is_alphanumeric(),
+            "空格断点处不额外共享，下一片从新词开始");
     }
 }

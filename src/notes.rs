@@ -82,7 +82,11 @@ pub fn chunk_text(content: &str, target: usize, overlap: usize) -> Result<Vec<Te
     if !(16..=100_000).contains(&target) { return Err(Error::Validation("chunk_chars must be between 16 and 100000".into())); }
     if overlap >= target { return Err(Error::Validation("chunk_overlap must be smaller than chunk_chars".into())); }
     let lines: Vec<&str> = content.lines().collect();
-    let mut blocks: Vec<(usize, usize, String, bool)> = Vec::new();
+    // 每行起点的字节偏移。切片正文最终从原文一次性取出，行号由字节位置二分得到；
+    // 只留每行一个 usize，不再把整个块展开成「字符 + 行号」，超长块的内存不随字符数放大。
+    let origin = content.as_ptr() as usize;
+    let line_at: Vec<usize> = lines.iter().map(|line| line.as_ptr() as usize - origin).collect();
+    let mut blocks: Vec<(usize, usize, bool)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if lines[i].trim().is_empty() { i += 1; continue; }
@@ -113,55 +117,142 @@ pub fn chunk_text(content: &str, target: usize, overlap: usize) -> Result<Vec<Te
                 i += 1;
             }
         }
-        blocks.push((start, i, lines[start..i].join("\n"), is_fence || is_table));
+        blocks.push((start, i, is_fence || is_table));
     }
     let mut chunks = Vec::new();
-    for (start, end, body, atomic) in blocks {
-        if atomic || body.chars().count() <= target {
-            chunks.push(TextChunk { ordinal: 0, offset: start + 1, limit: end - start, content: body, metadata: json!({}) });
+    for (start, end, atomic) in blocks {
+        let block_start = line_at[start];
+        let block_end = line_at[end - 1] + lines[end - 1].len();
+        // 块的字符数：换行算一个，`\r\n` 里的回车不算。
+        let total = content[block_start..block_end].chars().filter(|ch| *ch != '\r').count();
+        if atomic || total <= target {
+            chunks.push(TextChunk { ordinal: 0, offset: start + 1, limit: end - start,
+                                    content: lines[start..end].join("\n"), metadata: json!({}) });
             continue;
         }
-        // 先把块展开成「字符 + 所在行号」，换行符记在上一行的行尾。
-        // 之后按窗口滑过去，窗口末尾优先落在标点或换行之后，重叠部分由相邻窗口共享。
-        let mut marks: Vec<(char, usize)> = Vec::new();
-        for (line_no, line) in lines.iter().enumerate().take(end).skip(start) {
-            if line_no > start { marks.push(('\n', line_no)); }
-            for ch in line.chars() { marks.push((ch, line_no + 1)); }
-        }
-        let mut pos = 0;
-        while pos < marks.len() {
-            let hard = (pos + target).min(marks.len());
+        // 超长块直接在原文上按字节游标滑过去：窗口、断点、重叠都用字节坐标算，
+        // 内存里只留当前这一片的正文，块有多长都不额外开一份按字符展开的临时表。
+        let mut pos = block_start;
+        loop {
+            let hard = advance_chars(content, pos, target, block_end);
             // 收尾那片是剩下的全部，不需要再找断点。
-            let stop = if hard == marks.len() { hard } else { split_point(&marks, pos, hard, target) };
-            let first_line = marks[pos].1;
-            let last_line = marks[stop - 1].1;
-            let content: String = marks[pos..stop].iter().map(|(ch, _)| *ch).collect();
-            chunks.push(TextChunk { ordinal: 0, offset: first_line,
-                                    limit: last_line - first_line + 1, content, metadata: json!({}) });
-            if stop == marks.len() { break; }
+            let (stop, on_boundary) = if hard == block_end { (hard, true) }
+                                      else { split_point(content, block_start, hard, target) };
+            let first_line = line_index(&line_at, pos);
+            let last_line = line_index(&line_at, prev_char_byte(content, pos, stop));
+            chunks.push(TextChunk { ordinal: 0, offset: first_line + 1,
+                                    limit: last_line - first_line + 1,
+                                    content: content[pos..stop].to_string(), metadata: json!({}) });
+            if stop == block_end { break; }
             // 断点可能提前，下一片仍从「断点减去重叠」起。
-            let next = stop.saturating_sub(overlap);
-            pos = if next > pos { next } else { pos + 1 };
+            // 没找到标点只能硬切时，哪怕调用方没要重叠，也留一点上下文给下一片，
+            // 免得把词或半句劈在两片边界上。留多少看语言：中文留 5 个字，英文留 1 个词。
+            let shared = if on_boundary { overlap } else { overlap.max(fallback_overlap(content, block_start, stop)) };
+            let next = if shared == 0 { stop } else { rewind_chars(content, stop, shared, block_start) };
+            pos = if next > pos { next } else { advance_chars(content, pos, 1, block_end) };
         }
     }
     for (ordinal, chunk) in chunks.iter_mut().enumerate() { chunk.ordinal = ordinal; }
     Ok(chunks)
 }
 
-/// 一片该在哪里收尾：窗口尾部先找句读与换行，找不到再退到逗号一类弱断点，
-/// 都没有就按窗口硬切。断点只在窗口后半段里找，免得切出半截碎句。
-fn split_point(marks: &[(char, usize)], pos: usize, hard: usize, target: usize) -> usize {
+/// 从 `from` 往后数 `n` 个字符，返回位置（下一个字符的起点），到 `limit` 为止。
+/// 换行算一个字符，`\r\n` 里的回车不算——切片正文里行与行之间只有一个换行。
+fn advance_chars(content: &str, from: usize, n: usize, limit: usize) -> usize {
+    let mut left = n;
+    for (offset, ch) in content[from..limit].char_indices() {
+        if left == 0 { return from + offset; }
+        if ch != '\r' { left -= 1; }
+    }
+    limit
+}
+
+/// 从 `from` 往前数 `n` 个字符，返回最前面那个字符的起点；最多退到 `floor`。
+/// 用来把「重叠多少个字」从字符数换算回字节位置，不在切片副本上二次裁剪。
+fn rewind_chars(content: &str, from: usize, n: usize, floor: usize) -> usize {
+    let mut left = n;
+    let mut start = from;
+    for (offset, ch) in content[floor..from].char_indices().rev() {
+        if ch == '\r' { continue; }
+        start = floor + offset;
+        left -= 1;
+        if left == 0 { break; }
+    }
+    start
+}
+
+/// 收尾位置前最后一个有效字符的起点，用来定这一片结束在哪一行。
+fn prev_char_byte(content: &str, floor: usize, stop: usize) -> usize {
+    for (offset, ch) in content[floor..stop].char_indices().rev() {
+        if ch == '\r' { continue; }
+        return floor + offset;
+    }
+    floor
+}
+
+/// 字节位置落在第几行（0 起始）；换行符算在上一行。
+fn line_index(line_at: &[usize], byte: usize) -> usize {
+    line_at.partition_point(|start| *start <= byte).saturating_sub(1)
+}
+
+/// 硬切时兜底留给下一片的量：中文留 5 个字，英文留 1 个完整单词。
+/// 中文按字数算，是因为中文没有词边界，留几个字就够接上；
+/// 英文留一个词，切点落在词中间时下一片能从这个词的开头重来，不至于出现半截词。
+const FALLBACK_OVERLAP: usize = 5;
+
+/// 这个切点该给下一片留多少：先看它前面这几十个字符以哪种文字为主。
+/// 中文留 5 个字；英文留 1 个词，但词长超过 10 个字母就不再回溯整词，直接留 5 个字母——
+/// 长词（URL、拼接串）整词回溯会让重叠大得没道理。
+fn fallback_overlap(content: &str, block_start: usize, stop: usize) -> usize {
+    const MAX_WORD: usize = 10;
+    let start = rewind_chars(content, stop, 40, block_start);
+    let window = &content[start..stop];
+    let cjk = window.chars().filter(|ch| is_cjk(*ch)).count();
+    let latin = window.chars().filter(|ch| ch.is_ascii_alphanumeric()).count();
+    if cjk > 0 && cjk >= latin { return FALLBACK_OVERLAP; }
+    if latin == 0 { return FALLBACK_OVERLAP; }
+    // 退到这个词的第一个字符：重叠就是这一个词，下一片从词首开始。
+    let mut word = 0usize;
+    for ch in window.chars().rev() {
+        if ch == '\r' { continue; }
+        if !ch.is_ascii_alphanumeric() { break; }
+        word += 1;
+    }
+    if word <= MAX_WORD { word.max(1) } else { FALLBACK_OVERLAP }
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F
+        | 0x3040..=0x30FF | 0xAC00..=0xD7AF)
+}
+
+/// 一片该在哪里收尾。窗口尾部有 20% 的修正余量，就在这一段里挑一个标点：
+/// 先看句读与换行，再看 `，、：` 这类弱断点；多个候选取离余量中心最近的那个，
+/// 这样片长不会因为标点位置忽长忽短。都没找到就按窗口硬切。
+/// 返回 `(收尾位置, 是否停在断点上)`。位置是原文的绝对字符坐标，修正只改边界数字，
+/// 切片最后仍按这些坐标从原文取，不在半成品上二次裁剪。
+fn split_point(content: &str, block_start: usize, hard: usize, target: usize) -> (usize, bool) {
     const STRONG: &[char] = &['\n', '。', '！', '？', '；', '!', '?', ';', '…'];
     const WEAK: &[char] = &['，', '、', '：', ',', ':', ' '];
-    let floor = (pos + target / 2).min(hard);
+    // 余量是窗口的 20%，中心偏前 10%：片长够长，又不至于把余量用尽。
+    let span = (target / 5).max(1);
+    let floor = rewind_chars(content, hard, span, block_start);
+    let center = span - span / 2;
     for set in [STRONG, WEAK] {
-        let mut i = hard;
-        while i > floor {
-            i -= 1;
-            if set.contains(&marks[i].0) { return i + 1; }
+        let mut best: Option<usize> = None;
+        let mut best_gap = usize::MAX;
+        let mut count = 0usize;
+        for (offset, ch) in content[floor..hard].char_indices() {
+            if ch == '\r' { continue; }
+            count += 1;
+            if !set.contains(&ch) { continue; }
+            let gap = count.abs_diff(center);
+            if gap < best_gap { best_gap = gap; best = Some(floor + offset + ch.len_utf8()); }
         }
+        if let Some(stop) = best { return (stop, true); }
     }
-    hard
+    (hard, false)
 }
 
 /// 一篇笔记写入前的就绪形态：正文已读、切片已切、路径与标签已按库内规则解析。

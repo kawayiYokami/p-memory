@@ -73,6 +73,8 @@ kb.notes.upsert_chunks({"path": "./data/demo/notes/characters/overview.md", "chu
 
 登记之后库里存的是相对路径 `notes/characters/overview.md`，拆出的 `notes` / `characters` / `overview` 与调用方标签合并、挂到这一篇的每条切片上；根目录是写入前提，没登记就写 `upsert_file` 直接报 `ValidationError`，`path` 不在根目录之内同样报 `ValidationError`。
 
+`chunk_chars` 默认 512（16 到 100000），切片只在超长段落里才继续拆：窗口末尾往回 20% 的范围里先找句读和换行，再找逗号类弱断点，取离这段中心最近的一个，都没有就硬切，硬切处强制共享（中文 5 个字、英文 1 个单词，超过 10 个字母的词按 5 个字母算）——所以 `chunk_overlap` 传 0 并不等于片间零重叠。
+
 预设检索：
 
 ```python

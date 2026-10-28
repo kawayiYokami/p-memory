@@ -255,10 +255,10 @@ impl NoteStore {
 - **正文不进库**：笔记 payload 只留切片粒度，切片正文在写入时切好、随文档进全文索引。**笔记记录不进索引**，要文件列表按库里的标签翻笔记。
 - 更新后切片记录全部换代：旧切片连同向量在删除阶段消失，新切片以新记录 id 落库。
 - 切片 payload 只存 `note_id`、行区间与切片级 `chunk_metadata`；`get_chunk` / `chunks` 返回的 `Chunk.content` 按切片 ID 从索引取回（索引没提交就取不到，写入侧 `update_index` 之后再来）。写入时文件缺失直接报错；停电恢复重折切片文档时文件缺失折叠出空正文的文档，标记照样清掉。
-- **切片重叠**：`NoteFileInput.chunk_overlap` 是相邻两片共享的字符数，默认 0（与旧行为完全一致）。窗口步长是 `chunk_chars - chunk_overlap`，重叠部分由相邻窗口天然共享；约束 `chunk_overlap < chunk_chars`，否则报 `validation`。
+- **切片重叠**：`NoteFileInput.chunk_overlap` 是相邻两片共享的字符数，默认 0。窗口步长是 `chunk_chars - chunk_overlap`，重叠部分由相邻窗口天然共享；约束 `chunk_overlap < chunk_chars`，否则报 `validation`。**默认 0 不等于片间零重叠**：窗口末尾往回 20% 的范围里没找到句读或换行时只能硬切，硬切处强制共享——中文 5 个字，英文 1 个单词（词长超过 10 个字母就用 5 个字母），调用方传了更大的值就按大的来。
 - `upsert_chunks` / `upsert_chunks_batch` 让调用方自己给切片：每片带 `content`、可选的 `offset` / `limit`（给 0 时 offset 记 1、limit 按正文行数推算）和自定义 `metadata`。文件仍然必须存在——正文真相源是文件，切片只是它的投影，路径不存在的报 `validation`。自定义切片的正文没有文件重切这条路，落库时在笔记 payload 里存一份 `chunks` 数组，索引对账从它取；`Chunk.metadata` 序列化名是 `chunk_metadata`，避开摊平上来的 header 同名字段。
 - `delete`：按 id 批量删除笔记，返回实际删除的记录行数（一篇笔记连带它的切片逐行计）。每篇都先删切片再删笔记。删除按 id 直删，不受 `filter` 的 `namespace` / `scopes` 限制；`filter` 仅其 `tags` 参与附加筛选。
-- `chunk_text(content, target, overlap)` 是公开辅助函数，可脱离数据库单独调用；超长段落优先在句读与换行处断开，找不到才硬切；`overlap` 传 0 即不重叠。
+- `chunk_text(content, target, overlap)` 是公开辅助函数，可脱离数据库单独调用；超长段落只在窗口末尾往回 20% 的范围里找断点（句读/换行优先，`，、：` 次之，取离这段中心最近的一个），找不到就硬切，硬切处中文共享 5 个字、英文共享 1 个单词。
 
 ## EmbeddingStore
 
