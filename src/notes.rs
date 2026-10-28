@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-fn default_chunk_chars() -> usize { 220 }
+fn default_chunk_chars() -> usize { 512 }
 
 /// 按文件路径同步一篇笔记的入参：库自己读文件，标题取文件名（去扩展名）。
 /// 路径存为笔记自己的一列：领域登记过根目录时存减掉根目录的相对路径，否则逐字符原样存。

@@ -319,7 +319,7 @@ impl TextIndex {
                 .collect();
         }
         let Ok(content) = std::fs::read_to_string(storage::absolute_note_path(conn, namespace_id, &path)) else { return Vec::new() };
-        let chunk_chars = payload.get("chunk_chars").and_then(|v| v.as_u64()).unwrap_or(220) as usize;
+        let chunk_chars = payload.get("chunk_chars").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
         let chunk_overlap = payload.get("chunk_overlap").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         crate::notes::chunk_text(&content, chunk_chars, chunk_overlap)
             .map(|chunks| chunks.into_iter().map(|chunk| chunk.content).collect()).unwrap_or_default()
