@@ -65,6 +65,10 @@ kb.notes.set_root("demo", "./data/demo")   # 必须是已存在的目录
 kb.notes.root("demo")                                  # -> "./data/demo"，没登记为 None
 kb.notes.unset_root("demo")                            # 注销登记，返回是否命中
 kb.notes.upsert_file(path="./data/demo/notes/characters/overview.md")
+kb.notes.upsert_file(path="./data/demo/notes/characters/overview.md", chunk_overlap=50)   # 相邻两片共享 50 字
+kb.notes.upsert_chunks({"path": "./data/demo/notes/characters/overview.md", "chunks": [
+    {"content": "T001 | user: …", "offset": 1, "limit": 1, "metadata": {"message_id": "T001"}},
+]})   # 切片自己切好交给库，文件仍须存在
 ```
 
 登记之后库里存的是相对路径 `notes/characters/overview.md`，拆出的 `notes` / `characters` / `overview` 与调用方标签合并、挂到这一篇的每条切片上；根目录是写入前提，没登记就写 `upsert_file` 直接报 `ValidationError`，`path` 不在根目录之内同样报 `ValidationError`。

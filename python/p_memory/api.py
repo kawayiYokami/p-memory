@@ -10,7 +10,7 @@ from typing import Any
 from . import _native
 from .errors import ClosedError, ValidationError, from_native
 from .models import (EmbeddingSpace, EntityInput, EventInput, MemoryInput,
-                     NoteFileInput, Page, ReadFilter, RecordKind, RelationInput,
+                     NoteChunksInput, NoteFileInput, Page, ReadFilter, RecordKind, RelationInput,
                      SearchResult, WriteReceipt)
 
 
@@ -391,6 +391,18 @@ class NoteStore(_Store):
         else:
             payload = self._kb._input(data, fields)
         return self._call("upsert_file", payload)
+
+    def upsert_chunks(self, data: NoteChunksInput | Sequence[NoteChunksInput] | None = None,
+                      **fields: Any) -> WriteReceipt:
+        """按文件路径写笔记，切片由调用方给：每片带正文、定位和自定义 metadata。
+
+        文件必须存在（正文真相源仍是文件），库不再解析文件内容；传列表即批量。
+        要重叠、要按消息边界切，都在调用方切好再交进来。"""
+        if isinstance(data, (list, tuple)):
+            payload = [self._kb._input(item) for item in data]
+        else:
+            payload = self._kb._input(data, fields)
+        return self._call("upsert_chunks", payload)
 
     def set_root(self, namespace: str, root: str | os.PathLike) -> None:
         """登记该知识领域的笔记根目录：之后写入的路径必须是它的子路径，库里存相对路径。"""

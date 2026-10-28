@@ -307,15 +307,22 @@ impl TextIndex {
     }
 
     /// 读一篇笔记的源文件并重跑切分，返回每片正文（按 ordinal 顺序）。
+    /// 自定义切片的正文没有文件重切这条路，落库那份直接取。
     fn note_file_chunks(&self, conn: &Connection, note_id: i64) -> Vec<String> {
-        let Ok((path, namespace_id)) = conn.query_row("SELECT n.path,n.namespace_id FROM notes n WHERE n.record_id=?1",
-            [note_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else { return Vec::new() };
+        let Ok((path, namespace_id, payload_json)) = conn.query_row(
+            "SELECT n.path,n.namespace_id,r.payload_json FROM notes n JOIN records r ON r.id=n.record_id WHERE n.record_id=?1",
+            [note_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))) else { return Vec::new() };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else { return Vec::new() };
+        if let Some(rows) = payload.get("chunks").and_then(|value| value.as_array()) {
+            return rows.iter()
+                .map(|row| row.get("content").and_then(|value| value.as_str()).unwrap_or_default().to_string())
+                .collect();
+        }
         let Ok(content) = std::fs::read_to_string(storage::absolute_note_path(conn, namespace_id, &path)) else { return Vec::new() };
-        let chunk_chars = conn.query_row("SELECT payload_json FROM records WHERE id=?1", [note_id], |r| r.get::<_, String>(0))
-            .ok().and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|value| value.get("chunk_chars").and_then(|v| v.as_u64()))
-            .unwrap_or(220) as usize;
-        crate::notes::chunk_text(&content, chunk_chars).map(|chunks| chunks.into_iter().map(|chunk| chunk.content).collect()).unwrap_or_default()
+        let chunk_chars = payload.get("chunk_chars").and_then(|v| v.as_u64()).unwrap_or(220) as usize;
+        let chunk_overlap = payload.get("chunk_overlap").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        crate::notes::chunk_text(&content, chunk_chars, chunk_overlap)
+            .map(|chunks| chunks.into_iter().map(|chunk| chunk.content).collect()).unwrap_or_default()
     }
 
     fn exact_u64(field: Field, value: i64) -> Box<dyn Query> {

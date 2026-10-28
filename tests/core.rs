@@ -1,6 +1,6 @@
 use p_memory::*;
 use p_memory::graph::{EntityInput, EventInput, RelationInput};
-use p_memory::notes::chunk_text;
+use p_memory::notes::{chunk_text, NoteChunkInput, NoteChunksInput};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -1117,7 +1117,7 @@ fn note_replacement_keeps_evidence_and_removes_stale_chunks() {
     kb.notes().delete(&[new.header.id], &ReadFilter::default()).unwrap();
     assert_eq!(kb.counts().unwrap().total, 1);
     assert_eq!(kb.foreign_key_check().unwrap(), 0);
-    let long = chunk_text(&"一".repeat(500), 220).unwrap();
+    let long = chunk_text(&"一".repeat(500), 220, 0).unwrap();
     assert_eq!(long.len(), 3); assert!(long.iter().all(|c| c.offset == 1 && c.limit == 1));
 }
 
@@ -2760,4 +2760,66 @@ fn a_record_can_change_scope() {
     assert!(kb.graph().apply_batch(&GraphBatch { entities: vec![linked], ..Default::default() }).is_err(),
         "被关系引用的实体不能直接换域");
         kb.update_index().unwrap();
+}
+
+#[test]
+fn chunk_overlap_shares_the_boundary_and_zero_keeps_the_old_cut() {
+    // 一条没有空行的长行：整块按窗口滑，重叠部分由相邻窗口共享。
+    let body = "甲乙丙丁戊己庚辛壬癸".repeat(30);
+    let plain = chunk_text(&body, 100, 0).unwrap();
+    let shared = chunk_text(&body, 100, 30).unwrap();
+    assert_eq!(plain[0].content, &body[..100 * 3], "不传重叠时与旧行为一致：每片 100 字");
+    assert_eq!(plain.len(), 3);
+    assert!(shared.len() > plain.len(), "步长从 100 缩到 70，片数变多");
+    assert_eq!(shared[0].content, &body[..100 * 3]);
+    for pair in shared.windows(2) {
+        let tail: String = pair[0].content.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+        let head: String = pair[1].content.chars().take(30).collect();
+        assert_eq!(tail, head, "前一片结尾 30 字就是后一片开头 30 字");
+        assert_eq!(pair[0].offset, 1, "共用同一行号仍按字符推进");
+    }
+    // 尾巴那一片凑不满窗口也要收下，不能把剩下的字丢掉。
+    let tail: String = shared.last().unwrap().content.clone();
+    assert!(body.ends_with(&tail), "最后一片是原文的结尾");
+}
+
+#[test]
+fn chunk_overlap_must_stay_below_the_target() {
+    assert!(chunk_text("正文", 100, 100).is_err(), "重叠等于片长会让窗口原地踏步");
+    assert!(chunk_text("正文", 100, 140).is_err());
+    assert!(chunk_text("正文", 15, 0).is_err(), "片长下限仍是 16");
+    assert!(chunk_text("正文", 100, 0).is_ok());
+}
+
+#[test]
+fn custom_chunks_round_trip_content_metadata_and_stay_searchable() {
+    let dir = tempfile::tempdir().unwrap(); let kb = KnowledgeBase::open(dir.path()).unwrap();
+    kb.notes().set_root("default", &dir.path().to_string_lossy()).unwrap();
+    let path = dir.path().join("会话.md");
+    std::fs::write(&path, "T001 | user: 甲的独有措辞\nT002 | assistant: 乙的另一段").unwrap();
+    let input = NoteChunksInput { record: RecordInput::default(), path: path.clone(), chunks: vec![
+        NoteChunkInput { content: "T001 | user: 甲的独有措辞".into(), offset: 1, limit: 1,
+                         metadata: serde_json::json!({"message_id": "T001", "speaker": "user"}) },
+        NoteChunkInput { content: "T002 | assistant: 乙的另一段".into(), offset: 2, limit: 1,
+                         metadata: serde_json::json!({"message_id": "T002", "speaker": "assistant"}) },
+    ]};
+    let note = kb.notes().upsert_chunks(input).unwrap().value;
+    kb.update_index().unwrap();
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].content, "T001 | user: 甲的独有措辞");
+    assert_eq!(chunks[1].metadata["message_id"], "T002");
+    assert_eq!(chunks[0].metadata["speaker"], "user");
+    assert_eq!(chunks[1].offset, 2, "调用方给的定位原样存下");
+    // 索引对账只能从笔记 payload 那份取正文：删掉源文件后正文仍然读得回来。
+    std::fs::remove_file(&path).unwrap();
+    let chunks = kb.notes().chunks(note.header.id, &ReadFilter::default()).unwrap();
+    assert_eq!(chunks[1].content, "T002 | assistant: 乙的另一段");
+    let hits = kb.search(&SearchRequest { query: "独有措辞".into(), kinds: vec![RecordKind::Chunk], ..Default::default() }).unwrap().hits;
+    assert!(!hits.is_empty(), "自定义切片照常进全文索引");
+    // 正文真相源仍是文件：文件不在就别想写。
+    let missing = dir.path().join("不存在.md");
+    let bad = NoteChunksInput { record: RecordInput::default(), path: missing, chunks: vec![
+        NoteChunkInput { content: "x".into(), offset: 1, limit: 1, metadata: serde_json::Value::Null }]};
+    assert!(kb.notes().upsert_chunks(bad).is_err(), "自定义切片也要求文件存在");
 }

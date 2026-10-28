@@ -75,6 +75,7 @@ pub fn dispatch(kb:&KnowledgeBase,operation:&str,args:Value)->Result<Value>{
         "notes.delete"=>{let r:IdsRequest=decode(args)?;encode(kb.notes().delete(&r.ids,&r.filter)?)},
         "notes.chunks"=>{let r:IdRequest=decode(args)?;encode(kb.notes().chunks(r.id,&r.filter)?)},
         "notes.get_chunk"=>{let r:IdRequest=decode(args)?;encode(kb.notes().get_chunk(r.id,&r.filter)?)},
+        "notes.upsert_chunks"=>{let inputs:Vec<crate::notes::NoteChunksInput>=decode(args)?;encode(kb.notes().upsert_chunks_batch(&inputs)?)},
         "embeddings.register_space"=>encode(kb.embeddings().register_space(decode(args)?)?),
         "embeddings.spaces"=>encode(kb.embeddings().spaces()?),
         "embeddings.embedder_space"=>encode(kb.embeddings().embedder_space(&field::<String>(&args,"space_id")?)?),

@@ -221,10 +221,12 @@ struct Neighborhood { entities: Vec<Entity>, relations: Vec<Relation> }
 ## 领域三：笔记与切片（Note / Chunk）
 
 ```rust
-struct NoteFileInput { record, path, chunk_chars }   // 库自己读 path
+struct NoteFileInput { record, path, chunk_chars, chunk_overlap }   // 库自己读 path
+struct NoteChunksInput { record, path, chunks: [NoteChunkInput] }   // 切片由调用方给，文件仍须存在
+struct NoteChunkInput { content, offset, limit, metadata }
 struct Note   { header, source, title, chunk_chars }
-struct Chunk  { header, note_id, ordinal, offset, limit, content }
-struct TextChunk { ordinal, offset, limit, content }
+struct Chunk  { header, note_id, ordinal, offset, limit, content, metadata }   // metadata 序列化为 chunk_metadata
+struct TextChunk { ordinal, offset, limit, content, metadata }
 ```
 
 - `path` 必填。领域必须在 `namespace_roots` 里登记过根目录（`set_root`），写入路径必须是它的子路径：库里存的是**减掉根目录的相对路径**（`notes/characters/overview.md`），路径不在根目录之内直接报校验错，不做猜测；**没登记根目录的领域不允许写入笔记**。`UNIQUE(namespace_id, scope_id, path)` 用来「同一文件重复同步定位到同一条」——路径一变身份就变，登记根目录前后同一个文件会被当成两篇，旧记录不自动改写。
@@ -241,6 +243,8 @@ struct TextChunk { ordinal, offset, limit, content }
 ### 笔记切片
 
 - 按段落切分，目标 `chunk_chars`（范围 16..=100000，默认 220）。
+- **相邻两片可重叠**：`chunk_overlap` 是共享字符数，默认 0 即旧行为；窗口步长 `chunk_chars - chunk_overlap`，必须小于 `chunk_chars`，否则报校验错。
+- **切片也可以由调用方自己给**：`upsert_chunks` 每片带正文、定位和自定义 `metadata`，库不再解析文件内容，但文件必须存在（正文真相源仍是文件）。自定义切片的正文在笔记 payload 里存一份 `chunks` 数组，索引对账从它取，不回源文件。
 - **围栏代码块与表格整体保留**，即使超过目标大小也不拆分。
 - `offset` 从 **1** 开始（起始行），`limit` 为行数；两者的计数单位都是**行**。
 - 超长段落按字符边界切分，同一物理行可能被多个切片共享行号；切片正文自己带在索引里，行号只用于定位，不需要额外记字符区间。

@@ -343,7 +343,7 @@ fn import_notes(req:&ImportRequest,plan:&mut Plan,index_rows:Vec<Row>,raw:&[Row]
         let sid=format!("{ns}:{relative}");
         let mut rec=record(req,"notes",&sid,&row,&domain)?;
         rec.tags=strings(row.get("tags"));
-        let note=NoteFileInput{record:rec,path:path.clone(),chunk_chars:220};
+        let note=NoteFileInput{record:rec,path:path.clone(),chunk_chars:220,chunk_overlap:0};
         plan.notes.push(NoteDraft{table:"notes".into(),source_id:sid,input:note});
     }
     Ok(())
@@ -389,8 +389,8 @@ fn apply(conn:&Connection,plan:&Plan,mappings:&mut Vec<IdMapping>,conflicts:&mut
             params![namespace_id, root])?;
     }
     for draft in &plan.notes {
-        let split=notes::chunk_text(&std::fs::read_to_string(&draft.input.path)?,draft.input.chunk_chars)?;
-        let prepared=notes::prepare_note(conn,&draft.input,split)?;
+        let split=notes::chunk_text(&std::fs::read_to_string(&draft.input.path)?,draft.input.chunk_chars,draft.input.chunk_overlap)?;
+        let prepared=notes::prepare_note(conn,&draft.input.record,&draft.input.path,split,draft.input.chunk_chars,draft.input.chunk_overlap,false)?;
         let (note,staged)=notes::add_note(conn,&prepared)?; documents.extend(staged);
         mappings.push(IdMapping{source_table:draft.table.clone(),source_id:draft.source_id.clone(),target_id:note.header.id});
     }

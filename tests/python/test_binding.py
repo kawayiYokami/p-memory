@@ -253,6 +253,26 @@ def test_note_upsert_file_uses_file_stem_and_keeps_raw_text(kb, tmp_path):
         kb.update_index()
 
 
+def test_upsert_chunks_takes_caller_slices_with_metadata(kb, tmp_path):
+    """自定义切片：正文、定位与 metadata 原样落库，文件不在就拒绝。"""
+    path = tmp_path / "会话.md"
+    path.write_text("T001 | user: 甲的独有措辞\nT002 | assistant: 乙的另一段", encoding="utf-8", newline="")
+    note = kb.notes.upsert_chunks({"path": str(path), "chunks": [
+        {"content": "T001 | user: 甲的独有措辞", "offset": 1, "limit": 1, "metadata": {"message_id": "T001"}},
+        {"content": "T002 | assistant: 乙的另一段", "offset": 2, "limit": 1, "metadata": {"message_id": "T002"}},
+    ]})["value"]
+    kb.update_index()
+    kb.update_index()
+    chunks = kb.notes.chunks(note["id"])
+    assert [c["content"] for c in chunks] == ["T001 | user: 甲的独有措辞", "T002 | assistant: 乙的另一段"]
+    assert chunks[1]["chunk_metadata"]["message_id"] == "T002"
+    assert kb.search("独有措辞", kinds=["chunk"])["hits"], "自定义切片照常进全文索引"
+
+    with pytest.raises(ValidationError):
+        kb.notes.upsert_chunks({"path": str(tmp_path / "nope.md"), "chunks": [{"content": "x"}]})
+        kb.update_index()
+
+
 def test_notes_get_many_batches_and_skips_missing(kb, tmp_path):
     """批量读：一次取回多篇，字段与逐条 get 一致；不存在的 id 静默跳过。"""
     a = tmp_path / "甲.md"

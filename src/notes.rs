@@ -17,11 +17,33 @@ pub struct NoteFileInput {
     /// 要读取的文件路径，同时作为 `(namespace, scope, path)` 的定位键。
     pub path: PathBuf,
     #[serde(default = "default_chunk_chars")] pub chunk_chars: usize,
+    /// 相邻两片共享的字符数，0 表示不重叠。必须小于 `chunk_chars`。
+    #[serde(default)] pub chunk_overlap: usize,
 }
 impl NoteFileInput {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { record: RecordInput::default(), path: path.into(), chunk_chars: default_chunk_chars() }
+        Self { record: RecordInput::default(), path: path.into(), chunk_chars: default_chunk_chars(), chunk_overlap: 0 }
     }
+}
+
+/// 调用方自己切好的一片：正文、定位、元数据都由它给，库不再解析文件。
+/// 文件仍然必须在领域根目录之内——正文真相源照旧是文件，切片只是它的投影。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteChunkInput {
+    pub content: String,
+    /// 1 起始的起始行；调用方不关心行号时可以给 0。
+    #[serde(default)] pub offset: usize,
+    /// 行数；给 0 表示按正文行数推算，正文只有一行时也记 1。
+    #[serde(default)] pub limit: usize,
+    #[serde(default)] pub metadata: serde_json::Value,
+}
+
+/// 自定义切片的入参：笔记照样按文件路径写，切片由 `chunks` 直接给。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteChunksInput {
+    #[serde(flatten)] pub record: RecordInput,
+    pub path: PathBuf,
+    pub chunks: Vec<NoteChunkInput>,
 }
 
 /// 笔记的对外形态：库内只留路径，正文读时按 `source` 读文件，标题由文件名派生。
@@ -41,16 +63,24 @@ pub struct Chunk {
     #[serde(flatten)] pub header: RecordHeader,
     pub note_id: i64, pub ordinal: usize, pub offset: usize, pub limit: usize,
     #[serde(default)] pub content: String,
+    /// 切片级元数据：调用方自定义切片时给什么就存什么，检索命中时原样带回。
+    /// 序列化名避开 `metadata`：`header` 是摊平的，两处同名会让摊平字段取不到值。
+    #[serde(default, rename = "chunk_metadata")] pub metadata: serde_json::Value,
 }
 /// `offset` 为 1 起始的起始行，`limit` 为行数。切片正文由 `content` 自带，
 /// 超长段落被多个切片共享同一行号也不影响取回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TextChunk { pub ordinal: usize, pub offset: usize, pub limit: usize, pub content: String }
+pub struct TextChunk {
+    pub ordinal: usize, pub offset: usize, pub limit: usize, pub content: String,
+    #[serde(default)] pub metadata: serde_json::Value,
+}
 
 /// Paragraph-aware chunking. Fenced code and tables are atomic, even above the
 /// target size. A long prose line may span chunks sharing that same line number.
-pub fn chunk_text(content: &str, target: usize) -> Result<Vec<TextChunk>> {
+/// `overlap` 是相邻两片共享的字符数，0 表示不重叠；必须小于 `target`，否则窗口不前进。
+pub fn chunk_text(content: &str, target: usize, overlap: usize) -> Result<Vec<TextChunk>> {
     if !(16..=100_000).contains(&target) { return Err(Error::Validation("chunk_chars must be between 16 and 100000".into())); }
+    if overlap >= target { return Err(Error::Validation("chunk_overlap must be smaller than chunk_chars".into())); }
     let lines: Vec<&str> = content.lines().collect();
     let mut blocks: Vec<(usize, usize, String, bool)> = Vec::new();
     let mut i = 0;
@@ -88,30 +118,28 @@ pub fn chunk_text(content: &str, target: usize) -> Result<Vec<TextChunk>> {
     let mut chunks = Vec::new();
     for (start, end, body, atomic) in blocks {
         if atomic || body.chars().count() <= target {
-            chunks.push(TextChunk { ordinal: 0, offset: start + 1, limit: end - start, content: body });
+            chunks.push(TextChunk { ordinal: 0, offset: start + 1, limit: end - start, content: body, metadata: json!({}) });
             continue;
         }
-        let mut current = String::new();
-        let mut count = 0;
-        let mut first_line = start + 1;
-        let mut last_line = first_line;
+        // 先把块展开成「字符 + 所在行号」，换行符记在上一行的行尾。
+        // 之后按固定窗口滑过去，窗口步长是 target - overlap，重叠部分天然由相邻窗口共享。
+        let mut marks: Vec<(char, usize)> = Vec::new();
         for (line_no, line) in lines.iter().enumerate().take(end).skip(start) {
-            if !current.is_empty() {
-                if count + 1 >= target {
-                    chunks.push(TextChunk { ordinal: 0, offset: first_line, limit: last_line - first_line + 1, content: std::mem::take(&mut current) });
-                    count = 0;
-                } else { current.push('\n'); count += 1; }
-            }
-            for ch in line.chars() {
-                if count == target {
-                    chunks.push(TextChunk { ordinal: 0, offset: first_line, limit: last_line - first_line + 1, content: std::mem::take(&mut current) });
-                    count = 0;
-                }
-                if current.is_empty() { first_line = line_no + 1; }
-                current.push(ch); count += 1; last_line = line_no + 1;
-            }
+            if line_no > start { marks.push(('\n', line_no)); }
+            for ch in line.chars() { marks.push((ch, line_no + 1)); }
         }
-        if !current.is_empty() { chunks.push(TextChunk { ordinal: 0, offset: first_line, limit: last_line - first_line + 1, content: current }); }
+        let step = target - overlap;
+        let mut pos = 0;
+        while pos < marks.len() {
+            let stop = (pos + target).min(marks.len());
+            let first_line = marks[pos].1;
+            let last_line = marks[stop - 1].1;
+            let content: String = marks[pos..stop].iter().map(|(ch, _)| *ch).collect();
+            chunks.push(TextChunk { ordinal: 0, offset: first_line,
+                                    limit: last_line - first_line + 1, content, metadata: json!({}) });
+            if stop == marks.len() { break; }
+            pos += step;
+        }
     }
     for (ordinal, chunk) in chunks.iter_mut().enumerate() { chunk.ordinal = ordinal; }
     Ok(chunks)
@@ -123,27 +151,35 @@ pub(crate) struct PreparedNote {
     pub record: RecordInput,
     pub namespace_id: i64, pub scope_id: i64, pub source: String,
     pub given: String, pub title: String, pub split: Vec<TextChunk>,
-    pub chunk_chars: usize,
+    pub chunk_chars: usize, pub chunk_overlap: usize,
+    /// 切片来自调用方时，正文没有文件可回源重切，落库那份要留着给索引对账用。
+    pub custom: bool,
 }
 
 /// 读文件、切切片、解析领域与路径。term_id 的字典登记随调用方的事务提交。
-pub(crate) fn prepare_note(conn: &Connection, input: &NoteFileInput, split: Vec<TextChunk>) -> Result<PreparedNote> {
-    let given = input.path.to_string_lossy().into_owned();
+pub(crate) fn prepare_note(conn: &Connection, record_in: &RecordInput, path: &std::path::Path,
+                           split: Vec<TextChunk>, chunk_chars: usize, chunk_overlap: usize,
+                           custom: bool) -> Result<PreparedNote> {
+    let given = path.to_string_lossy().into_owned();
     storage::validate_identity("source", &given)?;
-    let namespace_id = storage::term_id(conn, &input.record.namespace)?;
-    let scope_id = storage::term_id(conn, &input.record.scope)?;
+    let namespace_id = storage::term_id(conn, &record_in.namespace)?;
+    let scope_id = storage::term_id(conn, &record_in.scope)?;
     // 领域必须登记根目录：写入路径与它比对前缀，不重合直接拒绝、重合的部分裁掉。
     // 库里存的永远是相对路径——项目从头到尾不知道前面的绝对路径是什么。
     let root = storage::namespace_root(conn, namespace_id)?.ok_or_else(|| Error::Validation(
-        format!("namespace {} has no registered domain root; call notes.set_root before upserting notes", input.record.namespace)))?;
+        format!("namespace {} has no registered domain root; call notes.set_root before upserting notes", record_in.namespace)))?;
     let source = relative_note_path(&root, &given)?;
-    let title = input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    // 自定义切片也要文件在：正文真相源照旧是文件，切片只是它的投影。
+    if custom && !path.is_file() {
+        return Err(Error::Validation(format!("note path {given} does not exist")));
+    }
+    let title = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     let (dirs, split_stem) = storage::split_note_path(&source);
     // 文件名以写入时取好的 `title`（`file_stem`）为准，与落库的 `notes.name` 同源；
     // `split_note_path` 只用来取目录段。
     let stem = if title.is_empty() { split_stem } else { title.clone() };
     // 这一份标签挂到这篇的每一条切片上：调用方给的 + 路径拆出来的。
-    let mut record = input.record.clone();
+    let mut record = record_in.clone();
     // 笔记的身份就是 `(namespace, scope, path)`，下游给的 id 一律忽略：
     // 记录 id 由库自己分配，下游不能凭一个 id 凭空插一条笔记（那会让「笔记属于哪条路径」失守）。
     record.id = None;
@@ -151,15 +187,24 @@ pub(crate) fn prepare_note(conn: &Connection, input: &NoteFileInput, split: Vec<
     tags.extend(dirs.iter().cloned());
     if !stem.is_empty() { tags.push(stem.clone()); }
     record.tags = tags.clone();
-    Ok(PreparedNote { record, namespace_id, scope_id, source, given, title, split, chunk_chars: input.chunk_chars })
+    Ok(PreparedNote { record, namespace_id, scope_id, source, given, title, split,
+                      chunk_chars, chunk_overlap, custom })
 }
 
 /// 新增路径（内部方法）：笔记与切片连同「正在写入」标记一次落主库，索引文档就地折好交回。
 /// 身份是 `(namespace, scope, path)`；调用方保证同一位要么是空的、要么刚被删除流程腾空。
 /// 切片记录全部新开——旧切片的向量已随删除流程作废，由向量对账照主库重算。
 pub(crate) fn add_note(conn: &Connection, note: &PreparedNote) -> Result<(Note, Vec<crate::index::IndexDocument>)> {
-    let (header, _) = storage::put_record(conn, RecordKind::Note, &note.record,
-        &json!({"chunk_chars": note.chunk_chars}), "")?;
+    let mut payload = json!({"chunk_chars": note.chunk_chars, "chunk_overlap": note.chunk_overlap});
+    if note.custom {
+        // 自定义切片的正文没有文件重切这条路，落库存一份，索引对账时从它取。
+        let rows: Vec<serde_json::Value> = note.split.iter().map(|chunk| json!({
+            "offset": chunk.offset, "limit": chunk.limit,
+            "content": chunk.content, "metadata": chunk.metadata
+        })).collect();
+        payload["chunks"] = serde_json::Value::Array(rows);
+    }
+    let (header, _) = storage::put_record(conn, RecordKind::Note, &note.record, &payload, "")?;
     // 文件名在写入这一刻就从路径取好（`file_stem` 认平台分隔符），随笔记落库：
     // 索引那一列直接读它，索引侧补文档时也不必再拆一次路径。
     conn.execute("INSERT INTO notes(record_id,namespace_id,scope_id,path,name) VALUES (?1,?2,?3,?4,?5)
@@ -167,13 +212,16 @@ pub(crate) fn add_note(conn: &Connection, note: &PreparedNote) -> Result<(Note, 
         params![header.id, note.namespace_id, note.scope_id, note.source, note.title])?;
     let mut documents = Vec::new();
     for chunk in &note.split {
-        let payload = json!({"note_id":header.id,"ordinal":chunk.ordinal,"offset":chunk.offset,"limit":chunk.limit});
+        // 对象里已经先摊平了 header（它自带 `metadata`），切片这份必须换个键名，否则摊平取不到值。
+        let payload = json!({"note_id":header.id,"ordinal":chunk.ordinal,"offset":chunk.offset,
+                             "limit":chunk.limit,"chunk_metadata":chunk.metadata});
         let chunk_input = RecordInput { id: None, namespace: header.namespace.clone(), scope: header.scope.clone(),
             tags: header.tags.clone(), evidence: vec![], metadata: header.metadata.clone(),
             created_at_us: Some(header.created_at_us), updated_at_us: Some(header.updated_at_us), expected_revision: None };
         let (chunk_header, document) = storage::put_record(conn, RecordKind::Chunk, &chunk_input, &payload, &chunk.content)?;
-        conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\") VALUES (?1,?2,?3,?4,?5)",
-            params![chunk_header.id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64])?;
+        let metadata_json = serde_json::to_string(&chunk.metadata).unwrap_or_else(|_| "{}".into());
+        conn.execute("INSERT INTO chunks(record_id,note_id,ordinal,\"offset\",\"limit\",metadata_json) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![chunk_header.id, header.id, chunk.ordinal as i64, chunk.offset as i64, chunk.limit as i64, metadata_json])?;
         documents.push(document);
     }
     Ok((Note { header, source: note.given.clone(), title: note.title.clone(), chunk_chars: note.chunk_chars }, documents))
@@ -190,6 +238,16 @@ fn relative_note_path(root: &str, given: &str) -> Result<String> {
     };
     if relative.is_empty() { return Err(Error::Validation("note path must name a file below the domain root".into())); }
     Ok(relative.to_string())
+}
+
+/// 一篇笔记写入前的原始输入：文件切分与自定义切片最后都汇聚成它。
+struct NotePending {
+    record: RecordInput,
+    path: PathBuf,
+    split: Vec<TextChunk>,
+    chunk_chars: usize,
+    chunk_overlap: usize,
+    custom: bool,
 }
 
 #[derive(Clone)]
@@ -211,16 +269,50 @@ impl NoteStore {
     pub fn upsert_files(&self, inputs: &[NoteFileInput]) -> Result<WriteReceipt<Vec<Note>>> {
         let split = inputs.iter().map(|input| -> Result<Vec<TextChunk>> {
             let content = std::fs::read_to_string(&input.path)?;
-            chunk_text(&content, input.chunk_chars)
+            chunk_text(&content, input.chunk_chars, input.chunk_overlap)
         }).collect::<Result<Vec<_>>>()?;
+        let pending: Vec<NotePending> = inputs.iter().zip(split).map(|(input, split)| NotePending {
+            record: input.record.clone(), path: input.path.clone(), split,
+            chunk_chars: input.chunk_chars, chunk_overlap: input.chunk_overlap, custom: false,
+        }).collect();
+        self.write_notes(pending)
+    }
+
+    /// 自定义切片版：笔记照旧按文件路径写，切片由调用方给，不再解析文件内容。
+    /// 文件必须存在（正文真相源仍是文件），切片正文与元数据原样落库。
+    pub fn upsert_chunks(&self, input: NoteChunksInput) -> Result<WriteReceipt<Note>> {
+        let mut receipts = self.upsert_chunks_batch(&[input])?;
+        let value = receipts.value.pop().ok_or_else(|| Error::Validation("empty upsert batch".into()))?;
+        Ok(WriteReceipt { value, revision: receipts.revision })
+    }
+
+    /// 批量版：与 `upsert_files` 同一套先删后加，只是切片来自调用方。
+    pub fn upsert_chunks_batch(&self, inputs: &[NoteChunksInput]) -> Result<WriteReceipt<Vec<Note>>> {
+        let pending: Vec<NotePending> = inputs.iter().map(|input| {
+            let split = input.chunks.iter().enumerate().map(|(ordinal, chunk)| TextChunk {
+                ordinal,
+                offset: if chunk.offset == 0 { 1 } else { chunk.offset },
+                limit: if chunk.limit == 0 { chunk.content.lines().count().max(1) } else { chunk.limit },
+                content: chunk.content.clone(),
+                metadata: if chunk.metadata.is_null() { json!({}) } else { chunk.metadata.clone() },
+            }).collect::<Vec<_>>();
+            Ok(NotePending { record: input.record.clone(), path: input.path.clone(), split,
+                              chunk_chars: 0, chunk_overlap: 0, custom: true })
+        }).collect::<Result<Vec<_>>>()?;
+        self.write_notes(pending)
+    }
+
+    /// 一批已备齐的笔记写入：先删后加，索引操作在写锁外。
+    fn write_notes(&self, pending: Vec<NotePending>) -> Result<WriteReceipt<Vec<Note>>> {
         let mut notes: Vec<Note> = Vec::new();
         let (stale, documents) = self.0.with_writer_lock(|writer| {
             let mut documents: Vec<crate::index::IndexDocument> = Vec::new();
             let mut stale: Vec<i64> = Vec::new();
-            for (input, split) in inputs.iter().zip(split) {
+            for entry in pending {
                 // 解析与定位在标记事务里做：term_id 的字典登记随事务提交。
                 let tx = writer.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let prepared = prepare_note(&tx, input, split)?;
+                let prepared = prepare_note(&tx, &entry.record, &entry.path, entry.split,
+                                            entry.chunk_chars, entry.chunk_overlap, entry.custom)?;
                 let by_path: Option<i64> = tx.query_row("SELECT record_id FROM notes WHERE namespace_id=?1 AND scope_id=?2 AND path=?3",
                     params![prepared.namespace_id, prepared.scope_id, prepared.source], |r| r.get(0)).optional()?;
                 // 笔记只按 (namespace, scope, path) 定位：同路径就是同一篇，先删后加。

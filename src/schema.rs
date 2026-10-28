@@ -1,14 +1,14 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-pub(crate) const SCHEMA_VERSION: i64 = 15;
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 pub(crate) const APPLICATION_ID: i64 = 0x5041494d;
 
 /// 建库或识别既有库。schema.sql 是最新结构定义；已发布的旧版本只保留一次性前滚迁移。
 /// 库版本非 0 且不等于 `SCHEMA_VERSION` 一律拒绝打开。
 pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION && version != 14 {
+    if version != 0 && version != SCHEMA_VERSION && version != 14 && version != 15 {
         return Err(Error::SchemaVersion { found: version, supported: SCHEMA_VERSION });
     }
     let application: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
@@ -25,9 +25,19 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<()> {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
-        14 => migrate_v14_to_v15(conn)?,
+        14 => { migrate_v14_to_v15(conn)?; migrate_v15_to_v16(conn)? }
+        15 => migrate_v15_to_v16(conn)?,
         _ => {}
     }
+    Ok(())
+}
+
+/// 切片级元数据：调用方自定义切片时随切片落库，旧切片补默认空对象。
+fn migrate_v15_to_v16(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch("ALTER TABLE chunks ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';")?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -45,7 +55,7 @@ fn migrate_v14_to_v15(conn: &mut Connection) -> Result<()> {
     INSERT INTO record_tags_new(record_id, tag_id) SELECT record_id, tag_id FROM record_tags;
     DROP TABLE record_tags;
     ALTER TABLE record_tags_new RENAME TO record_tags;")?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 15)?;
     tx.commit()?;
     Ok(())
 }
@@ -73,7 +83,8 @@ mod tests {
 
         initialize(&mut conn).unwrap();
 
-        assert_eq!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 15);
+        assert_eq!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        assert!(conn.prepare("SELECT metadata_json FROM chunks").is_ok());
         assert!(!conn.prepare("SELECT fingerprint FROM records").is_ok());
         assert!(!conn.prepare("SELECT fingerprint FROM chunks").is_ok());
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('chunks_by_fingerprint','record_tags_by_tag')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);

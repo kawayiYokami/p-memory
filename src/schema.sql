@@ -101,6 +101,8 @@ CREATE TABLE chunks (
     record_id INTEGER PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
     note_id INTEGER NOT NULL REFERENCES notes(record_id) ON DELETE RESTRICT,
     ordinal INTEGER NOT NULL, "offset" INTEGER NOT NULL, "limit" INTEGER NOT NULL,
+    -- 切片级元数据：调用方自定义切片时随切片一起存，检索命中时原样带回。
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(note_id, ordinal)
 );
 

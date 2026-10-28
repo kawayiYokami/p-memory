@@ -1,5 +1,5 @@
 """JSON-shaped public types. All inputs are validated by the shared Rust core."""
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Sequence, TypedDict
 
 RecordKind = Literal["memory", "entity", "relation", "event", "note", "chunk"]
 
@@ -82,6 +82,23 @@ class NoteFileInput(RecordInput, total=False):
 
     path: str
     chunk_chars: int
+    chunk_overlap: int
+
+
+class NoteChunkInput(TypedDict, total=False):
+    """调用方自己切好的一片：正文必填，定位与元数据可选，库不再解析文件。"""
+
+    content: str
+    offset: int
+    limit: int
+    metadata: dict
+
+
+class NoteChunksInput(RecordInput, total=False):
+    """按文件路径写笔记、切片由调用方给：文件必须存在，切片正文与元数据原样落库。"""
+
+    path: str
+    chunks: Sequence[NoteChunkInput]
 
 
 class EmbeddingSpace(TypedDict):
