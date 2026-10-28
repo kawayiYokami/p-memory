@@ -13,6 +13,7 @@ exclude = ["/.github", "/.env.sample", "/pyproject.toml", "/python", "/tests/pyt
 
 [workspace]
 members = ["bindings/python"]
+exclude = [".pai/temp/hnsw_bench"]
 default-members = ["."]
 resolver = "2"
 
