@@ -122,27 +122,46 @@ pub fn chunk_text(content: &str, target: usize, overlap: usize) -> Result<Vec<Te
             continue;
         }
         // 先把块展开成「字符 + 所在行号」，换行符记在上一行的行尾。
-        // 之后按固定窗口滑过去，窗口步长是 target - overlap，重叠部分天然由相邻窗口共享。
+        // 之后按窗口滑过去，窗口末尾优先落在标点或换行之后，重叠部分由相邻窗口共享。
         let mut marks: Vec<(char, usize)> = Vec::new();
         for (line_no, line) in lines.iter().enumerate().take(end).skip(start) {
             if line_no > start { marks.push(('\n', line_no)); }
             for ch in line.chars() { marks.push((ch, line_no + 1)); }
         }
-        let step = target - overlap;
         let mut pos = 0;
         while pos < marks.len() {
-            let stop = (pos + target).min(marks.len());
+            let hard = (pos + target).min(marks.len());
+            // 收尾那片是剩下的全部，不需要再找断点。
+            let stop = if hard == marks.len() { hard } else { split_point(&marks, pos, hard, target) };
             let first_line = marks[pos].1;
             let last_line = marks[stop - 1].1;
             let content: String = marks[pos..stop].iter().map(|(ch, _)| *ch).collect();
             chunks.push(TextChunk { ordinal: 0, offset: first_line,
                                     limit: last_line - first_line + 1, content, metadata: json!({}) });
             if stop == marks.len() { break; }
-            pos += step;
+            // 断点可能提前，下一片仍从「断点减去重叠」起。
+            let next = stop.saturating_sub(overlap);
+            pos = if next > pos { next } else { pos + 1 };
         }
     }
     for (ordinal, chunk) in chunks.iter_mut().enumerate() { chunk.ordinal = ordinal; }
     Ok(chunks)
+}
+
+/// 一片该在哪里收尾：窗口尾部先找句读与换行，找不到再退到逗号一类弱断点，
+/// 都没有就按窗口硬切。断点只在窗口后半段里找，免得切出半截碎句。
+fn split_point(marks: &[(char, usize)], pos: usize, hard: usize, target: usize) -> usize {
+    const STRONG: &[char] = &['\n', '。', '！', '？', '；', '!', '?', ';', '…'];
+    const WEAK: &[char] = &['，', '、', '：', ',', ':', ' '];
+    let floor = (pos + target / 2).min(hard);
+    for set in [STRONG, WEAK] {
+        let mut i = hard;
+        while i > floor {
+            i -= 1;
+            if set.contains(&marks[i].0) { return i + 1; }
+        }
+    }
+    hard
 }
 
 /// 一篇笔记写入前的就绪形态：正文已读、切片已切、路径与标签已按库内规则解析。

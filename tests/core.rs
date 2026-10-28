@@ -2823,3 +2823,28 @@ fn custom_chunks_round_trip_content_metadata_and_stay_searchable() {
         NoteChunkInput { content: "x".into(), offset: 1, limit: 1, metadata: serde_json::Value::Null }]};
     assert!(kb.notes().upsert_chunks(bad).is_err(), "自定义切片也要求文件存在");
 }
+
+#[test]
+fn oversize_blocks_break_after_punctuation_or_newline() {
+    // 一整块中文长句：不按字符硬切，片尾落在句读上。
+    let sentence = "这是一句用来验证切分位置的中文句子，它应该停在标点后面。";
+    let body = sentence.repeat(20);
+    let chunks = chunk_text(&body, 100, 0).unwrap();
+    assert!(chunks.len() > 1);
+    for chunk in &chunks[..chunks.len() - 1] {
+        assert!(chunk.content.chars().count() <= 100, "每片不超过目标长度");
+        let tail = chunk.content.chars().last().unwrap();
+        assert!(matches!(tail, '。' | '！' | '？' | '；' | '，' | '、' | '：' | '\n'),
+            "片尾应当落在标点或换行上，实际 {:?}", tail);
+    }
+    let rejoined: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
+    assert_eq!(rejoined, body, "不重叠时拼回去就是原文，一个字都不丢");
+
+    // 每行都短、整块超过目标长度：断在换行处，而不是把行劈开。
+    let lines = (0..40).map(|i| format!("第{i}行内容")).collect::<Vec<_>>().join("\n");
+    let chunks = chunk_text(&lines, 100, 0).unwrap();
+    assert!(chunks.len() > 1);
+    for chunk in &chunks[..chunks.len() - 1] {
+        assert!(chunk.content.ends_with('\n'), "换行处比标点更该优先，实际结尾 {:?}", chunk.content.chars().last());
+    }
+}
