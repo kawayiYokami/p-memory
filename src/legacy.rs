@@ -68,7 +68,7 @@ fn rows(conn: &Connection, table: &str) -> Result<Vec<Row>> {
     if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return Err(Error::Validation("invalid source table".into())); }
     if !has_table(conn,table)? { return Ok(vec![]); }
     let mut stmt=conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
-    let names:Vec<_>=stmt.column_names().into_iter().map(String::from).collect();
+    let names:Vec<_>=stmt.column_names().map(String::from).collect();
     let mut query=stmt.query([])?;let mut result=Vec::new();
     while let Some(row)=query.next()? {
         let mut object=Row::new();

@@ -545,13 +545,13 @@ impl KnowledgeBase {
         let state = self.read()?;
         let reservation = OpenOptions::new().write(true).create_new(true).open(target)?;
         drop(reservation);
-        if let Err(err) = state.conn().backup(rusqlite::MAIN_DB, target, None) {
+        if let Err(err) = state.conn().backup(rusqlite::MAIN_DB, target, rusqlite::backup::NO_PROGRESS) {
             let _ = std::fs::remove_file(target);
             return Err(err.into());
         }
         // 向量外挂库也备份：它是派生索引，但备份恢复后不该要求重新跑模型。
         let vectors_target = target.with_file_name(format!("{}.vectors", target.file_name().unwrap().to_string_lossy()));
-        if let Err(err) = state.conn().backup("vectors", &vectors_target, None) {
+        if let Err(err) = state.conn().backup("vectors", &vectors_target, rusqlite::backup::NO_PROGRESS) {
             let _ = std::fs::remove_file(&vectors_target);
             return Err(err.into());
         }
@@ -567,12 +567,12 @@ impl KnowledgeBase {
         if app != schema::APPLICATION_ID { return Err(Error::Validation("snapshot is not a p-memory database".into())); }
         if version != schema::SCHEMA_VERSION { return Err(Error::SchemaVersion { found: version, supported: schema::SCHEMA_VERSION }); }
         std::fs::create_dir(directory.as_ref())?;
-        source.backup(rusqlite::MAIN_DB, directory.as_ref().join("store.sqlite3"), None)?;
+        source.backup(rusqlite::MAIN_DB, directory.as_ref().join("store.sqlite3"), rusqlite::backup::NO_PROGRESS)?;
         // 向量库备份在同目录、同名加 .vectors 后缀；有就恢复，没有就由使用方后续调 sync 重新生成。
         let vectors_snapshot = snapshot.with_file_name(format!("{}.vectors", snapshot.file_name().unwrap().to_string_lossy()));
         if vectors_snapshot.exists() {
             let vectors_source = Connection::open_with_flags(&vectors_snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            vectors_source.backup(rusqlite::MAIN_DB, directory.as_ref().join("vectors.sqlite3"), None)?;
+            vectors_source.backup(rusqlite::MAIN_DB, directory.as_ref().join("vectors.sqlite3"), rusqlite::backup::NO_PROGRESS)?;
         }
         Self::open(directory)
     }
