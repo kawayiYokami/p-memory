@@ -16,7 +16,6 @@ from p_memory import (
     ConflictError,
     InvalidVectorError,
     KnowledgeBase,
-    LockedError,
     NotFoundError,
     PMemoryError,
     ValidationError,
@@ -654,12 +653,13 @@ def test_namespaces_and_predicate_rules_are_readable(kb):
 
 
 def test_error_codes_map_to_exception_classes(open_kb, tmp_path):
-    """锁定、未找到、参数非法、已关闭四类错误都映射到对应异常，并带稳定 code。"""
-    kb = open_kb("locked")
+    """未找到、参数非法、已关闭三类错误映射到对应异常，并带稳定 code。
 
-    with pytest.raises(LockedError) as locked:
-        KnowledgeBase(str(tmp_path / "locked"))
-    assert locked.value.code == "locked"
+    同一路径不再抛 LockedError：句柄在进程内共享，第二个实例拿到的是同一个
+    句柄（见 `test_shared_handle.py`）。LockedError 只在**另一个进程**占着
+    目录时出现，单进程测试里造不出来。
+    """
+    kb = open_kb("locked")
 
     with pytest.raises(NotFoundError) as missing:
         kb.memories.get(424242)

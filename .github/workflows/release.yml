@@ -23,10 +23,14 @@ jobs:
             target: aarch64
           - os: macos-15-intel
             target: x86_64
-          - os: macos-14
-            target: aarch64
           - os: windows-latest
             target: x86_64
+          # macOS arm64 暂时缺席：这个仓库拿不到 macos-14 的 arm64 runner，
+          # 报 "configuration 'macos-14-arm64-us-default' is not supported"。
+          # 该 job 失败会让 publish 整个被跳过（标 continue-on-error 也不行），
+          # 所以先从矩阵里去掉。等 runner 权限恢复后加回：
+          #   - os: macos-14
+          #     target: aarch64
     steps:
       - uses: actions/checkout@v7
 

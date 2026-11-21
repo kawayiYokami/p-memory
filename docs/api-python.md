@@ -31,6 +31,7 @@ p_memory.KnowledgeBase.restore(snapshot, directory)  # 类方法
 
 构造器签名：`KnowledgeBase(path, *, namespace="default", scopes=("public",), write_scope="public")`。
 `namespace`、`scopes`、`write_scope` 在实例上固定，读写时自动带入，不必每次传 `filter`。
+同一路径在**同一进程内**只打开一次：再次构造返回同一个句柄并累加引用计数，`close()` 只减计数，最后一个归还时才真正关闭并释放 `writer.lock`；另一个进程仍会拿到 `LockedError`。宿主重建自己的模块时不会撞锁。
 `filter` 支持 `namespace` / `scopes` / `tags` / `note_ids` 四个维度，彼此取交集。`note_ids` 给出一批笔记的记录 id 后，候选只在这批笔记的切片内产生，其余记录不参与命中，空表示不限定——这是把宿主的「书内搜索」迁进 p-memory 的入口。
 异步封装 `AsyncKnowledgeBase` 才提供 `open(path, **options)` 类方法（`async def`）。
 

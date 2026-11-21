@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -12,6 +13,17 @@ from .errors import ClosedError, ValidationError, from_native
 from .models import (EmbeddingSpace, EntityInput, EventInput, MemoryInput,
                      NoteChunksInput, NoteFileInput, Page, ReadFilter, RecordKind, RelationInput,
                      SearchResult, WriteReceipt)
+
+# 数据目录 -> [native 句柄, 引用计数]。
+#
+# 目录锁是进程级的：同一目录在进程里只能打开一次，第二次会抛 LockedError。
+# 所以这里做共享——同路径的多个 KnowledgeBase 拿同一个句柄，各自 close 只减
+# 计数，减到零才真正关闭。
+#
+# 这张表挂在包模块上而不是调用方：宿主应用（比如插件框架）重载自己的模块时，
+# 不会重载 p_memory，表就还在，新的调用方拿到的仍是同一个句柄，不会撞锁。
+_HANDLES: dict[str, list] = {}
+_HANDLES_LOCK = threading.Lock()
 
 
 def _json(value: Any) -> str:
@@ -44,7 +56,12 @@ def _native_call(factory: Callable, *args: Any) -> Any:
 
 
 class KnowledgeBase:
-    """An embedded database with an exclusive process lock on its directory.
+    """An embedded database over a local directory.
+
+    One directory is opened at most once per process: opening the same path again
+    returns the same handle and increments a reference count, and the handle is
+    closed only when the last owner releases it. Another process still gets
+    ``LockedError``.
 
     Scopes are explicit. Public records are not implicitly included when reading
     a private scope. A host must enforce its own authorization before passing
@@ -54,7 +71,19 @@ class KnowledgeBase:
     def __init__(self, path: str | os.PathLike, *, namespace: str = "default",
                  scopes: Sequence[str] = ("public",), write_scope: str = "public"):
         self._configure(namespace, scopes, write_scope)
-        self._native = _open_native(_native.NativeKnowledgeBase, os.fspath(path))
+        key = os.path.realpath(os.fspath(path))
+        self._path_key: str | None = key
+        self._closed = False
+        with _HANDLES_LOCK:
+            entry = _HANDLES.get(key)
+            if entry is None:
+                native = _open_native(_native.NativeKnowledgeBase, os.fspath(path))
+                _HANDLES[key] = [native, 1]
+                self._native = native
+            else:
+                # 同路径已有句柄：共用，计数加一。不再去抢目录锁。
+                entry[1] += 1
+                self._native = entry[0]
 
     def _configure(self, namespace: str, scopes: Sequence[str], write_scope: str) -> None:
         if isinstance(scopes, str) or not scopes:
@@ -80,6 +109,8 @@ class KnowledgeBase:
 
     def invoke(self, operation: str, payload: Any = None) -> Any:
         """Call the version 1 JSON protocol directly. Normal users use stores."""
+        if getattr(self, "_closed", False):
+            raise ClosedError("knowledge base is closed")
         return _unwrap(self._native.call(operation, _json({} if payload is None else payload)))
 
     def _filter(self, filter: ReadFilter | None = None) -> dict:
@@ -200,7 +231,42 @@ class KnowledgeBase:
         self.invoke("backup", {"path": os.fspath(path)})
 
     def close(self) -> None:
-        self.invoke("close")
+        """归还句柄。计数减到零才真正关闭 native 库并释放目录锁。"""
+        if getattr(self, "_closed", False):
+            return
+        key = getattr(self, "_path_key", None)
+        if key is None:
+            # restore() 造出来的实例不走注册表，独占一份，直接关
+            self._closed = True
+            self._shutdown_native()
+            return
+        with _HANDLES_LOCK:
+            entry = _HANDLES.get(key)
+            if entry is None:
+                self._closed = True
+                return
+            if entry[1] > 1:
+                entry[1] -= 1
+                self._closed = True
+                return
+            del _HANDLES[key]
+        self._closed = True
+        self._shutdown_native()
+
+    def _shutdown_native(self) -> None:
+        """真正关闭 native 句柄。此时注册表里已经没有它，不会再有人拿到。"""
+        _unwrap(self._native.call("close", _json({})))
+
+    def __del__(self) -> None:
+        """对象被回收时归还句柄。
+
+        宿主可能没来得及 close（模块重载、异常退出）。没有这一层，引用计数只增
+        不减，目录锁会跟着泄漏到进程结束——下一个打开同一路径的调用方直接撞锁。
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> KnowledgeBase:
         return self

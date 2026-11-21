@@ -1,6 +1,6 @@
 [package]
 name = "p-memory"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Embedded memory, knowledge graph, and note storage for Rust and Python"
@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/kawayiYokami/p-memory"
 keywords = ["memory", "knowledge-graph", "search", "embeddings", "sqlite"]
 categories = ["database", "data-structures", "text-processing"]
-exclude = ["/.github", "/.env.sample", "/pyproject.toml", "/python", "/tests/python", "/uv.lock"]
+exclude = ["/.github", "/.env.sample", "/pyproject.toml", "/python", "/tests/python", "/uv.lock", "/target-win", "/.pai"]
 
 [workspace]
 members = ["bindings/python"]
